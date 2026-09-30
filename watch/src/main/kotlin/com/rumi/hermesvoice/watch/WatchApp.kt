@@ -13,7 +13,9 @@ import android.os.VibratorManager
 import android.util.Log
 import com.google.android.gms.wearable.CapabilityClient
 import com.google.android.gms.wearable.Wearable
+import com.rumi.hermesvoice.core.settings.ReplicaUpdate
 import com.rumi.hermesvoice.core.settings.WatchSettings
+import com.rumi.hermesvoice.core.settings.WatchSettingsReplica
 import com.rumi.hermesvoice.core.watchlink.HapticEvent
 import com.rumi.hermesvoice.core.watchlink.HapticUsage
 import com.rumi.hermesvoice.core.watchlink.PlayRequest
@@ -74,22 +76,31 @@ class WatchApp : Application() {
     @Volatile var lastPlaybackEndedAtMs: Long = 0L
         private set
 
+    private lateinit var replica: WatchSettingsReplica
+
     override fun onCreate() {
         super.onCreate()
-        _settings.value = WatchSettings.fromJson(getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_SETTINGS, null))
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val stored = prefs.getString(KEY_SETTINGS, null)
+        replica = WatchSettingsReplica(stored)
+        // Durable migration: a copy from before the wake-location selector (or an unreadable one) is rewritten once.
+        if (stored != null && stored != replica.current.toJson()) prefs.edit().putString(KEY_SETTINGS, replica.current.toJson()).apply()
+        _settings.value = replica.current
     }
 
-    /** Applies a Phone-owned settings snapshot unless it is stale or conflicts with an equal revision. */
+    /**
+     * Offers a Phone-owned settings snapshot to the replica: an invalid one (bad type, NaN, out of
+     * range, unknown mode) is rejected whole, a stale or equal-revision one is ignored.
+     */
     fun applySettings(json: String) {
-        val incoming = WatchSettings.fromJson(json)
-        val current = _settings.value
-        if (!WatchSettings.shouldApply(current, incoming)) {
-            Log.i(TAG, "settings ignored revision=${incoming.revision} current=${current.revision}")
-            return
+        val result = replica.offer(json)
+        val current = replica.current
+        if (result == ReplicaUpdate.APPLIED) {
+            getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_SETTINGS, current.toJson()).apply()
+            _settings.value = current
         }
-        getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_SETTINGS, incoming.toJson()).apply()
-        _settings.value = incoming
-        Log.i(TAG, "settings applied revision=${incoming.revision} wake=${incoming.wakePhraseEnabled} haptics=${incoming.hapticsEnabled}")
+        Log.i(TAG, "settings $result revision=${current.revision} wake_location=${current.wakeLocation} " +
+            "watch_listens=${current.watchWakeEnabled} vad_silence_s=${current.vadSilenceSeconds} haptics=${current.hapticsEnabled}")
     }
 
     private val _phoneReachable = MutableStateFlow<Boolean?>(null)

@@ -7,6 +7,7 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaPlayer
 import android.media.MediaRecorder
+import android.os.SystemClock
 import com.rumi.hermesvoice.core.HermesPlaybackException
 import com.rumi.hermesvoice.core.SpokenAudio
 import com.rumi.hermesvoice.core.voice.PlaybackCue
@@ -133,6 +134,7 @@ class PhoneSpeakerSink(private val context: Context) : PlaybackSink {
             }
         } finally {
             file.delete()
+            PhoneApp.from(context).lastPhonePlaybackEndedAtMs = SystemClock.elapsedRealtime()
         }
     }
 }

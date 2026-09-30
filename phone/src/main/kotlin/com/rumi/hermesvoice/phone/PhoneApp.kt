@@ -42,6 +42,17 @@ class PhoneApp : Application() {
     })
 
     val settings: AppSettings by lazy { AppSettings(SharedPreferencesKeyValueStore(prefs(AppSettings.PREFERENCES_NAME))) }
+
+    /** Elapsed-realtime millis when Phone speaker playback last ended (wake-phrase cooldown). */
+    @Volatile var lastPhonePlaybackEndedAtMs: Long = 0L
+
+    override fun onCreate() {
+        super.onCreate()
+        // Durable, idempotent: the wake location from the old Watch opt-in, and the default trailing silence.
+        val migrated = settings.migrate()
+        Log.i("HermesVoice", "voice settings wake_location=${settings.wakeLocation} vad_silence_s=${settings.vadSilenceSeconds} " +
+            "revision=${settings.watchSettingsRevision} migrated=$migrated")
+    }
     val tokens: KeystoreTokenStore by lazy { KeystoreTokenStore(this) }
 
     val http: OkHttpClient by lazy {

@@ -29,29 +29,27 @@ enum class AudioInputVerdict {
  *
  * - [AudioInputVerdict.INVALID]: unreadable, not 16-bit PCM, or under [MIN_AUDIO_MS];
  * - [AudioInputVerdict.SILENT]: peak below [MIN_PEAK] (about −44 dBFS), far below soft speech;
- * - [AudioInputVerdict.NO_SPEECH_ENERGY]: less than [MIN_VOICED_MS] of 100 ms frames louder than
- *   [VOICED_RATIO] × the recording's own background (its 10th-percentile frame level, capped at
- *   [FLOOR_CAP] so a recording that is speech from start to end is not mistaken for background)
- *   and at least [MIN_VOICED_RMS].
+ * - [AudioInputVerdict.NO_SPEECH_ENERGY]: the shared [EnergyVad] ([VadProfile.ELIGIBILITY], 20 ms
+ *   frames, floor seeded from the recording's 10th-percentile frame level) never qualifies speech:
+ *   nothing at least twice the background for [VadProfile.MIN_SPEECH_MS] (short dips tolerated).
  *
  * It is an energy test, not a speech detector: loud non-speech sound passes it (and may still be
- * mis-transcribed), and it deliberately leans towards letting soft and short speech through.
+ * mis-transcribed), and it deliberately leans towards letting soft and short speech through. A
+ * hands-free request that its endpoint ended as speech always has frames 3× its background, so it
+ * passes this 2× check on the same frames.
  */
 object AudioInputGate {
     const val MIN_AUDIO_MS = 100L
     const val MIN_PEAK = 200
-    const val MIN_VOICED_MS = 150L
-    const val MIN_VOICED_RMS = 100.0
-    const val VOICED_RATIO = 1.8
-    const val FLOOR_CAP = 400.0
-    private const val FRAME_MS = 100L
 
     /** Recordings in formats this gate cannot read (none today) are left to the dashboard. */
     fun assess(audio: ByteArray, mimeType: String): AudioInputVerdict {
         if (!mimeType.substringBefore(';').trim().equals("audio/wav", ignoreCase = true)) return AudioInputVerdict.USABLE
         val pcm = PcmWav.parse(audio) ?: return AudioInputVerdict.INVALID
-        val frameSamples = (pcm.sampleRate * FRAME_MS / 1000).toInt() * pcm.channels
-        if (frameSamples <= 0 || pcm.sampleCount < frameSamples) return AudioInputVerdict.INVALID
+        val frameSamples = (pcm.sampleRate * PcmFramer.FRAME_MS / 1000) * pcm.channels
+        if (frameSamples <= 0 || pcm.sampleCount.toLong() * 1000 < MIN_AUDIO_MS * pcm.sampleRate * pcm.channels) {
+            return AudioInputVerdict.INVALID
+        }
         var peak = 0
         val levels = DoubleArray(pcm.sampleCount / frameSamples) { frame ->
             var sum = 0.0
@@ -63,11 +61,13 @@ object AudioInputGate {
             sqrt(sum / frameSamples)
         }
         if (peak < MIN_PEAK) return AudioInputVerdict.SILENT
-        val sorted = levels.sorted()
-        val floor = min(sorted[(sorted.size - 1) / 10], FLOOR_CAP)
-        val threshold = max(MIN_VOICED_RMS, floor * VOICED_RATIO)
-        val voicedMs = levels.count { it >= threshold } * FRAME_MS
-        return if (voicedMs >= MIN_VOICED_MS) AudioInputVerdict.USABLE else AudioInputVerdict.NO_SPEECH_ENERGY
+        val vad = EnergyVad(VadProfile.ELIGIBILITY, levels.sorted()[(levels.size - 1) / 10])
+        val frameMs = PcmFramer.FRAME_MS.toLong()
+        for (level in levels) {
+            vad.observe(level, frameMs)
+            if (vad.qualified) return AudioInputVerdict.USABLE
+        }
+        return AudioInputVerdict.NO_SPEECH_ENERGY
     }
 }
 

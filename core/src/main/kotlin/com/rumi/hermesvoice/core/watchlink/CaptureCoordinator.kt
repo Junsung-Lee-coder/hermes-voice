@@ -2,6 +2,8 @@ package com.rumi.hermesvoice.core.watchlink
 
 import com.rumi.hermesvoice.core.audio.AudioInputGate
 import com.rumi.hermesvoice.core.audio.AudioInputVerdict
+import com.rumi.hermesvoice.core.audio.CaptureEnd
+import com.rumi.hermesvoice.core.audio.PcmCaptureLoop
 
 /** What the Watch's capture lifecycle does to the device: the microphone, haptics, prompt and upload. */
 interface CapturePort {
@@ -20,10 +22,22 @@ interface CapturePort {
 /**
  * Why a Watch capture stopped. There is deliberately no duration limit: push-to-talk ends only
  * when the user taps, and a wake-phrase request on trailing silence or the no-speech timeout.
- * [SIZE_LIMIT] is the Data Layer frame bound (about 13 minutes of audio), a storage failure: the
- * recording is not sent rather than sent truncated.
+ * [SIZE_LIMIT] is the recorder's storage bound (on the Watch the Data Layer frame, about 13 minutes
+ * of audio), a storage failure: the recording is not sent rather than sent truncated.
  */
-enum class CaptureStop { TAP_SEND, SILENCE, NO_SPEECH, SIZE_LIMIT, MIC_ERROR, LIFECYCLE, START_FAILED }
+enum class CaptureStop {
+    TAP_SEND, SILENCE, NO_SPEECH, SIZE_LIMIT, MIC_ERROR, LIFECYCLE, START_FAILED;
+
+    companion object {
+        /** How a recorder's own end ([PcmCaptureLoop]) stops the capture, on either device. */
+        fun of(end: CaptureEnd): CaptureStop = when (end) {
+            CaptureEnd.SILENCE -> SILENCE
+            CaptureEnd.NO_SPEECH -> NO_SPEECH
+            CaptureEnd.LIMIT -> SIZE_LIMIT
+            CaptureEnd.MIC_ERROR -> MIC_ERROR
+        }
+    }
+}
 
 /**
  * The Watch capture lifecycle, independent of Android. One capture at a time; every callback
@@ -86,7 +100,7 @@ class CaptureCoordinator(
                 else -> port.upload(captureId, turnTrigger, wav)
             }
             CaptureStop.NO_SPEECH -> port.discard("Didn't hear a request")
-            CaptureStop.SIZE_LIMIT -> port.discard("Recording too long for the watch link; nothing was sent")
+            CaptureStop.SIZE_LIMIT -> port.discard("Recording too long; nothing was sent")
             CaptureStop.MIC_ERROR, CaptureStop.START_FAILED -> port.discard("Microphone unavailable")
             CaptureStop.LIFECYCLE -> port.discard("Cancelled")
         }

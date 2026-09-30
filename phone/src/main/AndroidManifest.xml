@@ -4,6 +4,14 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
+    <!-- Package visibility (Android 11+) for the platform speech recognizer used by the foreground
+         wake phrase; without it SpeechRecognizer reports no recognition service. Not a permission. -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+    </queries>
+
     <!-- Cleartext is allowed at the platform level only because network security config cannot
          express 100.64.0.0/10; HermesDashboardEndpoint.parse refuses plain http except to loopback
          and Tailscale addresses. -->

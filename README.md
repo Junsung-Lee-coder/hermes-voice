@@ -147,21 +147,24 @@ each, which keeps base64 frames under the 16 MiB WebSocket frame limit of older 
 
 The flow is the same whether a turn starts on the Phone or the Watch:
 
-1. **Record a WAV.** On the Phone, the Talk button toggles recording; the Phone recorder keeps at
-   most the first 2 minutes of a recording (a Phone-only limit). On the Watch, use push-to-talk,
-   which records until you tap Send with no time limit, or the optional
-   [wake phrase](#watch-wake-phrase). The Watch sends the recording to the Phone over the Data
-   Layer (`/hv/v1/turn/<id>`). One Data Layer frame holds about 13 minutes of audio; a longer Watch
-   recording is not sent, and the Watch says so.
+1. **Record a WAV.** On the Phone, the Talk button toggles push-to-talk recording; the Phone
+   push-to-talk recorder keeps at most the first 2 minutes of a recording (a Phone-only limit). On
+   the Watch, push-to-talk records until you tap Send with no time limit. On either device the
+   optional [wake phrase](#wake-phrase-phone-and-watch) starts a hands-free recording that is sent
+   when you stop talking. The Watch sends its recording to the Phone over the Data Layer
+   (`/hv/v1/turn/<id>`). One Data Layer frame holds about 13 minutes of audio; a longer Watch
+   recording is not sent, and the Watch says so (a Phone hands-free recording has the same bound).
 2. **Check, then transcribe.** A recording with no usable audio (unreadable, digital silence or a
    dead microphone, or only steady background noise) ends right away as "No speech detected": it
    isn't sent, transcribed, routed or delivered, and it doesn't change where replies play. The Watch
-   checks before uploading and the Phone checks again before accepting. This is a coarse loudness
-   check, not speech recognition: it is tuned to let soft and short speech through, so loud
-   non-speech sound still reaches speech-to-text, which can mistake it for words. Otherwise the
-   Phone calls `POST /api/audio/transcribe`. If that finds no speech, the turn ends without routing
-   or delivering anything. A wake-phrase request the Watch's recognizer
-   already heard arrives as text instead and skips this step; it is treated exactly like a
+   checks before uploading and the Phone checks again before accepting. The check runs the same
+   voice-activity detector as the hands-free ending (see [Hands-free ending](#hands-free-ending-shared-vad)),
+   with a lower bar: it only refuses a recording in which nothing was at least twice as loud as its
+   own background for 140 ms. It is a loudness check, not speech recognition: it lets soft and
+   short speech through, so loud non-speech sound still reaches speech-to-text, which can mistake
+   it for words. Otherwise the Phone calls `POST /api/audio/transcribe`. If that finds no speech,
+   the turn ends without routing or delivering anything. A wake-phrase request the recognizer
+   already heard in full arrives as text instead and skips this step; it is treated exactly like a
    transcript.
 3. **Route.** The transcript goes to a **persistent routing session**. It is created hidden
    (`source = "recorder-phone-router"`) on first use, then reused, and never appears in lists. The
@@ -230,44 +233,77 @@ The Watch shows the app's conversations without ever calling Hermes itself:
   feedback rather than touch feedback (how each watch treats that is up to the watch); none of them
   overrides Do Not Disturb or the watch's vibration settings. The Phone's Watch **Haptics** setting turns them all off.
 
-## Watch wake phrase
+## Wake phrase (Phone and Watch)
 
-Off by default and edited only on the Phone (Settings → Watch). The Phone sends all Watch settings
-as one snapshot with an increasing revision; the Watch ignores older or equal-revision snapshots.
-Patterns are space-separated whole words; `*` matches any letters inside one word, and nothing
-else is special. A blank field restores the defaults.
+Off by default and edited only on the Phone (Settings → Wake phrase). **Listen on** chooses where
+it works: **Off**, **Watch**, **Phone** or **Both**. Settings saved before this selector existed
+migrate once: a Watch wake phrase that was on becomes **Watch**, anything else **Off**. The wake
+phrases themselves are one list shared by both devices: space-separated whole words, where `*`
+matches any letters inside one word and nothing else is special. A blank field restores the
+defaults. The Phone sends all voice settings to the Watch as one snapshot with an increasing
+revision (the `/hv/v1/settings` data item). The Watch refuses a snapshot with any invalid value
+(an unknown mode, a silence that isn't a number from 0.5 to 10 on the 0.5 grid, a wrong type) and
+ignores older or equal-revision ones, so a stale snapshot can't switch a listener back on; after
+it is opened, the Watch reads the synced snapshot before it listens. Settings shows each device's
+status: off, listening, or why it can't (no speech recognizer, no microphone permission, not
+signed in, Watch not reachable).
 
-It works only while the Watch app is visible (foreground). Each time the app is shown, or the
-screen turns back on with the app shown, the platform `SpeechRecognizer` listens for 5 seconds
-(on-device recognition when available). It never runs while recording, sending, waiting on the
-Phone, playing audio, or for 4 seconds after playback. The recognizer and the app's recorder never
-use the microphone at the same time.
+It works only while that device's app is open on screen (foreground), never in the background,
+and needs no permission beyond the microphone. Each time the app is shown, or the screen turns
+back on with the app shown, the platform `SpeechRecognizer` listens for 5 seconds (on-device
+recognition when available). It never runs while recording, sending, waiting for a reply, playing
+audio, or for 4 seconds after playback. A device the setting excludes doesn't listen or respond;
+turning it off, leaving the app or the screen going off closes the recognizer and stops a
+hands-free recording without sending it. The recognizer and the app's recorder never use the
+microphone at the same time. The Watch never holds credentials: its requests always go through the
+Phone.
 
 The wake phrase must come first: at the start of what you say, or right after one short greeting
 ("hey", "hi", "hello", "ok", "okay", "안녕", "저기"). A mention in the middle of a sentence is
 ignored. What happens next depends on how you say it:
 
-- **Wake phrase, then pause:** the recognizer is released, the Watch's own recorder starts and
-  measures the room, and a buzz means "speak now". The request ends after about 2 seconds of
-  silence (up to about 4 seconds if background noise got louder after you spoke); short pauses
-  between words don't end it, and there is no time limit while you keep talking. If you don't
-  start within 8 seconds, nothing is sent. This is the way to make a long request. The ending is
-  based on loudness: loud ongoing sound, such as a TV or other people talking, keeps it open, so
-  tap Send; and speech that stays very soft, close to the background level, may be taken as the
-  end of your request.
+- **Wake phrase, then pause:** the recognizer is released, the app's own recorder starts and
+  measures the room, and a buzz (a haptic on the Watch and on the Phone; no sound, which would be
+  recorded) means "speak now". The request is sent after the **trailing silence** you set (see
+  below); short pauses don't end it, and there is no time limit while you keep talking. Tap Send
+  (Watch) or "Send now" (Phone) to send it sooner. If you don't start within 8 seconds, nothing is
+  sent. This is the way to make a long request.
 - **Wake phrase and request in one breath:** only the recognizer's **final** result is used, and
-  it's sent whole as the request. While partial results keep changing, the Watch keeps waiting
-  (up to 8 seconds after the last new partial). Nothing is sent, and the Watch shows "Didn't catch
-  that. Tap or say it again", when the recognizer stops or fails before a final result, or when
-  its final result is empty or no longer starts with the wake phrase it heard. A request longer
-  than 4,000 characters is refused, not cut.
+  it's sent whole as the request. While partial results keep changing, the device keeps waiting
+  (up to 8 seconds after the last new partial). Nothing is sent, and the device shows "Didn't
+  catch that", when the recognizer stops or fails before a final result, or when its final result
+  is empty or no longer starts with the wake phrase it heard. A request longer than 4,000
+  characters is refused, not cut.
 - **The system recognizer has its own limits.** It decides when you've finished (its own pause
-  detection) and may end a session on its own, so a pause in a one-breath request can end it
-  early, and what you say after that isn't captured. The Watch asks it to wait for 2 seconds of
-  silence, but that is only a hint many recognizers ignore. For a long request, say the wake
-  phrase, wait for the buzz, then speak.
+  detection, separate from the app's trailing-silence setting) and may end a session on its own,
+  so a pause in a one-breath request can end it early, and what you say after that isn't captured.
+  For a long request, say the wake phrase, wait for the buzz, then speak.
 
-The recognized text is never logged; only counts and outcomes are.
+A request spoken on the Phone plays its replies on the Phone, one spoken on the Watch on the Watch
+(the latest accepted voice sender, as for push-to-talk). The recognized text is never logged; only
+counts and outcomes are.
+
+### Hands-free ending (shared VAD)
+
+Both devices end a hands-free request with the same voice-activity detector (VAD), in `:core`:
+
+- **Trailing silence** (Settings → Wake phrase): 0.5 to 10 seconds in 0.5-second steps, 2 seconds
+  by default. The request is sent that long after you stop talking. A recording keeps the value it
+  started with; a change applies from the next request. Short values end at natural pauses between
+  phrases (0.5 s ends in a 0.7 s pause); long values wait through them.
+- **How it listens:** in 20 ms frames, it compares loudness with the room's background, which it
+  measures for 0.4 s before the "speak now" buzz. Speech is three times the background or louder
+  for at least 140 ms, with gaps between syllables of up to 200 ms tolerated; a click or knock of
+  100 ms or less never counts. A fading syllable stays "speech" for at most 200 ms. The background
+  estimate follows the room only during real pauses, never during speech; if the room gets louder
+  and stays steady (a fan starting), the detector adopts the new level within a second or two, so
+  it can't keep a request open. The timing is the same on the Phone and the Watch and doesn't
+  depend on how the microphone delivers audio.
+- **What it can't do:** it measures loudness, not speech. Loud changing sound (music, TV, other
+  people talking) keeps a request open until you tap Send. Speech that stays very soft, close to
+  the background, may count as silence and end the request early. A steady sound held for more
+  than about a second (a hum, a sung note) is treated as background. A burst of noise longer than
+  140 ms, like a cough, can start a request, which speech-to-text may then find empty.
 
 ## Text chat and history
 
@@ -281,8 +317,9 @@ turn completes. Replies to text chat aren't spoken.
   (Dark by default, Light, or System), **Play first response** (off by default) and **Play middle
   responses** (off by default). There's deliberately no setting for the ack or the final reply.
   Settings also shows whether the Watch app is reachable.
-- **Watch settings** (edited on the Phone, synced as the `/hv/v1/settings` data item): wake phrase
-  on/off (off by default), the wake phrases and haptics. There is no Watch recording time limit.
+- **Voice settings** (edited on the Phone, synced to the Watch as the `/hv/v1/settings` data
+  item): where the wake phrase listens (Off by default), the shared wake phrases, the hands-free
+  trailing silence (2 s by default), and Watch haptics. There is no Watch recording time limit.
 - **Dark by default.** On the Phone, sign-in, lists, chat, Settings and dialogs follow the
   Appearance setting. The Watch is always dark and shows whether the Phone is reachable.
 - **Full-width Talk bar.** The Phone's Talk button is a full-width bar above the navigation bar,
@@ -290,26 +327,34 @@ turn completes. Replies to text chat aren't spoken.
 
 **Emulator QA input (debuggable builds only).** A debuggable build accepts an `hv_qa_wav` string
 extra naming a `<name>.wav` file in the app's private `files/qa/` directory, and submits that file
-through the normal voice path in place of a recording. The Watch also accepts
+through the normal voice path in place of a recording. Both apps accept
 `hv_qa_wake_handoff=second_utterance` (runs the wake handoff as a match would, to test the
-recorder, not recognition) and `hv_qa_seed_reader=<n>` (shows synthetic reader rows, to test the
-reader UI without a paired Phone). Each extra is honoured once, for a fresh launch intent only, and
-non-debuggable builds ignore them.
+recorder on the real microphone, not recognition; a device the wake setting excludes ignores it).
+The Phone accepts `hv_qa_wake_location=<OFF|WATCH|PHONE|BOTH>` and `hv_qa_vad_silence=<seconds>`
+(saved and sent to the Watch exactly as from Settings; invalid values are refused). The Watch
+accepts `hv_qa_seed_reader=<n>` (shows synthetic reader rows, to test the reader UI without a
+paired Phone). Each extra is honoured once, for a fresh launch intent only, and non-debuggable
+builds ignore them.
 
 ## Validation
 
 Only the following has been run:
 
-- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **179 JUnit tests**, all
+- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **214 JUnit tests**, all
   passing. They use an in-process fake dashboard and cover sign-in, session ownership, chat and
   attachments, routing, playback routing, the Watch link and reader contracts, the wake contract
   (final-only, leading wake phrase, contradicted or empty finals, 30/60/120-second recognizer
-  streams), silence endpointing (30, 60 and 120 seconds of continuous and of speech-like audio with
-  short pauses are not cut; background noise rising after speech still ends a request), the
-  recording input check (silent, near-silent, empty, invalid and background-only recordings are
-  refused before speech-to-text on Phone and Watch; soft, short and normal speech passes),
-  haptic timing, gesture arbitration, the Watch capture, wake-window, microphone-handoff and bezel
-  scrolling logic the Android adapters delegate to, and source checks of the Android wiring.
+  streams), the shared VAD (every trailing-silence choice ends exactly that long after the last
+  speech; identical timing at 8/16/32/48 kHz and 20–160 ms reads; all-zero, peak-2, clicks at any
+  alignment and four background levels give no speech; 30, 60 and 120 seconds of modulated speech
+  are never cut and never raise the background estimate; background rises of 2.5× and 2.9× after
+  speech still end a request; short words and soft speech count; whenever the ending finds speech
+  the recording check accepts the same audio), the voice settings (0.5–10 s validation, the
+  wake-location modes, durable migration from the old Watch switch, strict Watch-side validation,
+  stale snapshots), the per-device wake flow both apps delegate to (which device listens for each
+  mode, turning a device off mid-window or mid-recording, the silence snapshot, same-breath
+  requests), the recording loop of both recorders (Phone and Watch read sizes), the recording input
+  check, haptic timing, gesture arbitration, bezel scrolling, and source checks of the Android wiring.
 - **Paired debug build:** `gradle :phone:assembleDebug :watch:assembleDebug` succeeded with
   Gradle 8.13 and JDK 17. Both APKs have the same package and are v2-signed by the same debug
   certificate.
@@ -349,8 +394,11 @@ been tested on physical devices, including audio routing, haptic strength and a 
   already queued, the message is still delivered, but its reply isn't spoken or shown inline.
 - **Server-to-client requests aren't answered.** A turn that needs a tool approval or a
   clarification ends at the 15-minute timeout.
-- **Wake phrase is foreground-only** and depends on the Watch's speech recognition service. Where
-  none is installed, the Watch says the wake phrase is unavailable. There's no always-on hotword.
+- **Wake phrase is foreground-only** and depends on each device's speech recognition service.
+  Where none is installed, the device says the wake phrase is unavailable. There's no always-on
+  hotword.
+- **Hands-free ending is loudness-based**, not speech understanding (see
+  [Hands-free ending](#hands-free-ending-shared-vad)).
 - **Watch reader history is a window.** The Watch keeps at most 200 messages per conversation;
   older ones are shown on the Phone.
 - **Unverified:** whether the agent reads an attached `@file:` reference during a turn.

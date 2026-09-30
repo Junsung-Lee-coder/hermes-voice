@@ -1,6 +1,7 @@
 package com.rumi.hermesvoice.core
 
 import com.rumi.hermesvoice.core.settings.WakePhrasePatterns
+import com.rumi.hermesvoice.core.settings.WakeLocation
 import com.rumi.hermesvoice.core.settings.WatchSettings
 import com.rumi.hermesvoice.core.wake.WakeArmGate
 import com.rumi.hermesvoice.core.wake.WakeArmInputs
@@ -42,7 +43,7 @@ class WakeContractTest {
         assertFalse("regex metacharacters are literal", WakePhrasePatterns.matches("a.b", "axb"))
         // A legacy settings payload without the new fields keeps wake OFF and the default patterns.
         val legacy = WatchSettings.fromJson("""{"wake_patterns":"루미 hey*","max_turn_seconds":45}""")
-        assertFalse(legacy.wakePhraseEnabled)
+        assertFalse(legacy.watchWakeEnabled)
         assertEquals("루미 hey*", legacy.wakePatterns)
         assertEquals(0L, legacy.revision)
         // A legacy Watch recording cap is ignored: Watch recordings have no total duration limit.
@@ -51,12 +52,12 @@ class WakeContractTest {
 
     @Test
     fun `phone-owned settings snapshots reject stale and equal-revision conflicts`() {
-        val current = WatchSettings(wakePhraseEnabled = true, wakePatterns = "루미", revision = 200)
-        assertFalse(WatchSettings.shouldApply(current, current.copy(wakePhraseEnabled = false, revision = 100)))
-        assertFalse(WatchSettings.shouldApply(current, current.copy(wakePhraseEnabled = false, revision = 200)))
-        assertTrue(WatchSettings.shouldApply(current, current.copy(wakePhraseEnabled = false, revision = 201)))
+        val current = WatchSettings(wakeLocation = WakeLocation.WATCH, wakePatterns = "루미", revision = 200)
+        assertFalse(WatchSettings.shouldApply(current, current.copy(wakeLocation = WakeLocation.OFF, revision = 100)))
+        assertFalse(WatchSettings.shouldApply(current, current.copy(wakeLocation = WakeLocation.OFF, revision = 200)))
+        assertTrue(WatchSettings.shouldApply(current, current.copy(wakeLocation = WakeLocation.OFF, revision = 201)))
         // An unsynced Watch (or a legacy Phone payload) accepts whatever the Phone sends.
-        assertTrue(WatchSettings.shouldApply(WatchSettings(), WatchSettings(wakePhraseEnabled = true)))
+        assertTrue(WatchSettings.shouldApply(WatchSettings(), WatchSettings(wakeLocation = WakeLocation.WATCH)))
         val round = WatchSettings.fromJson(current.toJson())
         assertEquals(current, round)
     }

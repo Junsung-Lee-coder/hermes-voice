@@ -1,76 +1,90 @@
 package com.rumi.hermesvoice.core.audio
 
 import kotlin.math.max
-import kotlin.math.sqrt
 
-enum class EndpointDecision { CONTINUE, END_OF_SPEECH, NO_SPEECH, MAX_DURATION }
+enum class EndpointDecision { CONTINUE, END_OF_SPEECH, NO_SPEECH }
 
 /**
- * Noise-relative end-of-speech detector for hands-free (wake phrase) requests, fed 16-bit
- * little-endian mono PCM frames that the microphone actually delivered.
+ * End-of-request detector for hands-free (wake phrase) requests on the Phone and the Watch, fed
+ * the 16-bit little-endian mono PCM the microphone actually delivered, in any chunk size. It runs
+ * the shared [EnergyVad] ([VadProfile.HANDS_FREE]) on exact 20 ms frames, so its timing depends on
+ * audio time only, not on the device's read size or sample rate.
  *
- * - The first [calibrationMs] estimate the noise floor; [calibrated] then turns true, which is when
- *   the Watch gives its "speak now" cue, so the request itself is never part of the calibration.
- * - Voiced audio is energy above `floor × onsetRatio`. Speech is qualified after [minSpeechMs] of
- *   voiced audio in which no dip lasts longer than [maxDipMs], so syllables separated by short dips
- *   count, while isolated clicks never do. Until then the floor adapts slowly, and
- *   [noSpeechTimeoutMs] (counted from the cue) ends a request that never started.
- * - Once speech started there is NO duration cap. Trailing silence counts fully on frames below
- *   `floor × releaseRatio` and at half rate on louder frames that are still below the onset (noise
- *   that rose after the speech, e.g. a fan starting), so such a tail still ends the request, within
- *   2 × [silenceMs]. Voiced frames pause the count, and [respeechMs] of renewed voiced audio (again
- *   tolerating short dips) resets it. The request ends after [silenceMs] of counted silence.
- * Push-to-talk does not use this.
+ * - The first [calibrationMs] estimate the background (their 25th-percentile frame level);
+ *   [calibrated] then turns true, which is when the device cues "speak now", so the request itself
+ *   is never part of the calibration.
+ * - Until speech qualifies ([VadProfile.minSpeechMs]), [noSpeechTimeoutMs] counted from the cue
+ *   ends a request that never started ([EndpointDecision.NO_SPEECH]: nothing is sent).
+ * - Once speech started there is NO duration cap. The request ends after [silenceMs] (the user's
+ *   "trailing silence" setting) of counted non-voice: background frames count fully, frames a
+ *   little above it ([VadClass.GRAY], e.g. a fan that started) at half rate while the floor adapts
+ *   to them, so such a tail still ends the request, within 2 × [silenceMs]. Voiced frames pause
+ *   the count; [respeechMs] of renewed speech (dips tolerated) restarts it.
+ * Push-to-talk does not use this: it ends only when the user taps.
  */
 class SilenceEndpoint(
     private val sampleRate: Int = 16_000,
-    private val calibrationMs: Long = 400,
-    private val minSpeechMs: Long = 300,
-    private val maxDipMs: Long = 200,
-    private val silenceMs: Long = 2_000,
+    val silenceMs: Long = 2_000,
     private val noSpeechTimeoutMs: Long = 8_000,
+    private val calibrationMs: Long = 400,
     private val respeechMs: Long = 200,
-    private val onsetRatio: Double = 3.0,
-    private val releaseRatio: Double = 2.0,
+    private val profile: VadProfile = VadProfile.HANDS_FREE,
 ) {
     private enum class Phase { CALIBRATING, ARMED, SPEECH, SILENCE, DONE }
 
+    private val framer = PcmFramer(sampleRate)
+    private val frameMs = PcmFramer.FRAME_MS.toLong()
     private var phase = Phase.CALIBRATING
-    private var calibrationElapsedMs = 0L
-    private var armedMs = 0L
     private val calibration = ArrayList<Double>()
-    private var floor = MIN_FLOOR
-    private var voicedMs = 0L
-    private var dipMs = 0L
+    private var vad: EnergyVad? = null
+    private var armedMs = 0L
     private var quietMs = 0L
+
+    /** Audio time processed so far, in ms. */
+    var elapsedMs: Long = 0
+        private set
+
+    /** Audio time at the end of the last voiced frame, or -1 before any speech. */
+    var lastVoicedEndMs: Long = -1
+        private set
 
     var speechDetected: Boolean = false
         private set
 
-    /** True once the noise floor is known: the moment to cue the user. */
+    /** True once the background is known: the moment to cue the user. */
     val calibrated: Boolean get() = phase != Phase.CALIBRATING
 
-    fun accept(frame: ByteArray): EndpointDecision {
-        val samples = frame.size / 2
-        if (samples == 0 || phase == Phase.DONE) return EndpointDecision.CONTINUE
-        val durationMs = samples * 1000L / sampleRate
-        val level = rms(frame)
-        val voiced = level >= floor * onsetRatio
-        when (phase) {
-            Phase.CALIBRATING -> {
-                calibration += level
-                calibrationElapsedMs += durationMs
-                if (calibrationElapsedMs >= calibrationMs) {
-                    val sorted = calibration.sorted()
-                    floor = max(MIN_FLOOR, sorted[(sorted.size - 1) / 2])
-                    phase = Phase.ARMED
-                }
+    /** The adaptive background floor (RMS), or NaN while calibrating. */
+    val floor: Double get() = vad?.floor ?: Double.NaN
+
+    fun accept(chunk: ByteArray): EndpointDecision {
+        if (phase == Phase.DONE) return EndpointDecision.CONTINUE
+        var decision = EndpointDecision.CONTINUE
+        framer.push(chunk) { level ->
+            decision = frame(level)
+            decision == EndpointDecision.CONTINUE
+        }
+        return decision
+    }
+
+    private fun frame(level: Double): EndpointDecision {
+        elapsedMs += frameMs
+        if (phase == Phase.CALIBRATING) {
+            calibration += level
+            if (calibration.size * frameMs >= calibrationMs) {
+                val sorted = calibration.sorted()
+                vad = EnergyVad(profile, max(profile.minFloor, sorted[(sorted.size - 1) / 4]))
+                phase = Phase.ARMED
             }
+            return EndpointDecision.CONTINUE
+        }
+        val vad = vad!!
+        val cls = vad.observe(level, frameMs)
+        if (cls == VadClass.VOICED) lastVoicedEndMs = elapsedMs
+        when (phase) {
             Phase.ARMED -> {
-                armedMs += durationMs
-                track(voiced, durationMs)
-                if (!voiced && voicedMs == 0L) adapt(level)
-                if (voicedMs >= minSpeechMs) {
+                armedMs += frameMs
+                if (vad.qualified) {
                     phase = Phase.SPEECH
                     speechDetected = true
                 } else if (armedMs >= noSpeechTimeoutMs) {
@@ -78,65 +92,35 @@ class SilenceEndpoint(
                     return EndpointDecision.NO_SPEECH
                 }
             }
-            Phase.SPEECH -> if (!voiced) {
+            Phase.SPEECH -> if (cls != VadClass.VOICED) {
                 phase = Phase.SILENCE
-                quietMs = silenceWeight(level, durationMs)
-                voicedMs = 0
-                dipMs = 0
+                quietMs = weight(cls)
+                vad.resetRun()
             }
             Phase.SILENCE -> {
-                if (!voiced) quietMs += silenceWeight(level, durationMs)
-                track(voiced, durationMs)
-                if (voicedMs >= respeechMs) {
+                if (cls != VadClass.VOICED) quietMs += weight(cls)
+                if (vad.runMs >= respeechMs) {
                     phase = Phase.SPEECH
                     quietMs = 0
-                } else if (quietMs >= silenceMs) {
-                    phase = Phase.DONE
-                    return EndpointDecision.END_OF_SPEECH
                 }
             }
-            Phase.DONE -> Unit
+            else -> Unit
+        }
+        if (phase == Phase.SILENCE && quietMs >= silenceMs) {
+            phase = Phase.DONE
+            return EndpointDecision.END_OF_SPEECH
         }
         return EndpointDecision.CONTINUE
     }
 
-    /** Voiced time accumulated across dips of at most [maxDipMs]; a longer dip starts over. */
-    private fun track(voiced: Boolean, durationMs: Long) {
-        if (voiced) {
-            voicedMs += durationMs
-            dipMs = 0
-        } else if (voicedMs > 0) {
-            dipMs += durationMs
-            if (dipMs > maxDipMs) {
-                voicedMs = 0
-                dipMs = 0
-            }
-        }
-    }
-
-    /** Quiet frames count fully; non-voiced frames above the release level count at half rate. */
-    private fun silenceWeight(level: Double, durationMs: Long): Long =
-        if (level < floor * releaseRatio) durationMs else durationMs / 2
-
-    /** Slow floor tracking for stationary noise, only from non-speech frames. */
-    private fun adapt(level: Double) {
-        floor = max(MIN_FLOOR, floor * (1 - ADAPTATION) + level * ADAPTATION)
-    }
+    private fun weight(cls: VadClass): Long = if (cls == VadClass.QUIET) frameMs else frameMs / 2
 
     companion object {
-        private const val MIN_FLOOR = 60.0
-        private const val ADAPTATION = 0.02
+        /** A hands-free endpoint for a validated trailing-silence setting (see VadSilence). */
+        fun forSilenceSeconds(seconds: Double, sampleRate: Int = 16_000): SilenceEndpoint =
+            SilenceEndpoint(sampleRate = sampleRate, silenceMs = Math.round(seconds * 1000))
 
-        fun rms(frame: ByteArray): Double {
-            var sum = 0.0
-            var i = 0
-            while (i + 1 < frame.size) {
-                val sample = ((frame[i + 1].toInt() shl 8) or (frame[i].toInt() and 0xff)).toShort().toDouble()
-                sum += sample * sample
-                i += 2
-            }
-            return sqrt(sum / (frame.size / 2).coerceAtLeast(1))
-        }
+        fun rms(frame: ByteArray): Double = PcmFramer.rms(frame)
     }
 }
 

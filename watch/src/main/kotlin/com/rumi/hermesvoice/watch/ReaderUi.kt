@@ -245,7 +245,7 @@ fun SessionsSurface(
 
 /** Big Talk/Send button used when no conversation is open. */
 @Composable
-fun TalkHome(phone: Boolean?, talk: WatchTalkState, wakeEnabled: Boolean, wakeListening: Boolean, onTalk: () -> Unit) {
+fun TalkHome(phone: Boolean?, talk: WatchTalkState, wakeEnabled: Boolean, wakeListening: Boolean, wakeUnavailable: Boolean, onTalk: () -> Unit) {
     Column(Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 14.dp),
         horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
         Text(
@@ -262,6 +262,7 @@ fun TalkHome(phone: Boolean?, talk: WatchTalkState, wakeEnabled: Boolean, wakeLi
             talk.line.ifBlank {
                 when {
                     wakeListening -> "Listening for the wake phrase…"
+                    wakeEnabled && wakeUnavailable -> "Wake phrase unavailable on this watch. Tap to talk"
                     wakeEnabled -> "Say the wake phrase or tap"
                     else -> "Tap to talk"
                 }

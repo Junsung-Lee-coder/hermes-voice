@@ -79,7 +79,7 @@ class WatchAdaptersTest {
             CaptureStop.TAP_SEND to "upload:c:WAKE_PHRASE",
             CaptureStop.SILENCE to "upload:c:WAKE_PHRASE",
             CaptureStop.NO_SPEECH to "discard:Didn't hear a request",
-            CaptureStop.SIZE_LIMIT to "discard:Recording too long for the watch link; nothing was sent",
+            CaptureStop.SIZE_LIMIT to "discard:Recording too long; nothing was sent",
             CaptureStop.MIC_ERROR to "discard:Microphone unavailable",
             CaptureStop.LIFECYCLE to "discard:Cancelled",
         )

@@ -52,11 +52,16 @@ class AndroidWiringGateTest {
         assertTrue(activity.substringAfter("override fun onLive()").substringBefore("override fun onCalibrated()").contains("captures.onLive(turnId)"))
         assertTrue(activity.substringAfter("override fun onCalibrated()").substringBefore("override fun onEnd(").contains("captures.onCalibrated(turnId)"))
         assertTrue(activity.substringAfter("override fun onPause()").substringBefore("super.onPause()").contains("CaptureStop.LIFECYCLE"))
-        assertTrue("handoff is cancellable and generation-bound",
-            activity.contains("handoffGate.claim(handoffGeneration, wake.generation") && activity.contains("removeCallbacks(handoffRunnable)"))
+        assertTrue("handoff is cancellable and generation-bound (WakeDeviceController)",
+            activity.contains("wake.wake.onHandoffDue(captureIdle = captures.activeId == null)") && activity.contains("removeCallbacks(handoffRunnable)"))
         assertFalse("no duration cap", activity.contains("maxTurnSeconds") || source("$watch/WatchCapture.kt").contains("limitFor"))
         val capture = source("$watch/WatchCapture.kt")
         assertTrue("start is confirmed by the recorder state", capture.contains("recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING"))
+        assertTrue("the shared recording loop", capture.contains("PcmCaptureLoop({ recorder.read(it, 0, it.size) }, limitBytes, endpoint, listener"))
+        assertTrue("the silence snapshot the wake flow passed in",
+            activity.contains("SilenceEndpoint(sampleRate = WatchCapture.SAMPLE_RATE, silenceMs = silenceMs)") &&
+                activity.contains("startCapture(TurnTrigger.WAKE_PHRASE, silenceMs)"))
+        assertTrue(activity.contains("end(turnId, CaptureStop.of(reason))"))
         assertFalse("no buzz on phone stage updates or timers", source("$watch/WatchApp.kt").contains("fun buzz("))
         val app = source("$watch/WatchApp.kt")
         assertTrue("usage comes from the tested policy", app.contains("WatchHapticPolicy.usageFor(event)") &&
@@ -66,12 +71,47 @@ class AndroidWiringGateTest {
     }
 
     @Test
-    fun `wake recognizer adapter delegates to the window coordinator`() {
-        val wake = source("$watch/WakeController.kt")
-        assertTrue(wake.contains("WakeWindowCoordinator(recognizerPort, timerPort, hostPort"))
-        assertFalse("receiver never touches the microphone", wake.substringAfter("override fun onReceive").substringBefore("override fun onStart")
-            .contains("startListening"))
-        assertFalse(wake.contains("EXTRA_PREFER_OFFLINE"))
+    fun `both wake adapters delegate to the shared device controller, foreground only`() {
+        for ((path, device) in listOf("$watch/WakeController.kt" to "WATCH", "$phone/PhoneWakeController.kt" to "PHONE")) {
+            val wake = source(path)
+            assertTrue(path, wake.contains("WakeDeviceController(VoiceOrigin.$device, recognizerPort, timerPort, port, SystemClock::elapsedRealtime, initial)"))
+            assertFalse("receiver never touches the microphone", wake.substringAfter("override fun onReceive").substringBefore("override fun onStart")
+                .contains("startListening"))
+            assertFalse(wake.contains("EXTRA_PREFER_OFFLINE"))
+            assertTrue("pause closes the window", wake.contains("override fun onPause(owner: LifecycleOwner) = wake.onPause()"))
+            assertTrue(wake.contains("wake.onResults(gen, heard, final)"))
+        }
+        assertTrue("the Watch waits for its synced settings", source("$watch/WakeController.kt").contains("wake.onResume(settingsPending = true)"))
+        val watchActivity = source("$watch/WatchActivity.kt")
+        assertTrue(watchActivity.contains("app.settings.collect { wake.wake.onSettings(it) }") && watchActivity.contains("wake.wake.onSettingsCurrent()"))
+        val phoneActivity = source("$phone/MainActivity.kt")
+        assertTrue(phoneActivity.contains("collect { phoneWake.wake.onSettings(it) }"))
+        assertTrue("the Phone recorder gets the snapshot", phoneActivity.contains("model.startHandsFree(silenceMs)"))
+        val model = source("$phone/PhoneViewModel.kt")
+        assertTrue(model.contains("SilenceEndpoint(sampleRate = PhoneCapture.SAMPLE_RATE, silenceMs = silenceMs)"))
+        assertTrue("the same capture lifecycle as the Watch", model.contains("private val captures = CaptureCoordinator(") &&
+            model.contains("captures.stop(id, CaptureStop.of(reason))"))
+        assertTrue(source("$phone/PhoneCapture.kt").contains("PcmCaptureLoop({ recorder.read(it, 0, it.size) }, LIMIT_BYTES, endpoint, listener"))
+    }
+
+    @Test
+    fun `no new permission or background component, and the recognizer is visible on Android 11+`() {
+        for (path in listOf("phone/src/main/AndroidManifest.xml", "watch/src/main/AndroidManifest.xml")) {
+            val manifest = source(path)
+            assertTrue(path, manifest.contains("<action android:name=\"android.speech.RecognitionService\" />"))
+            assertFalse(path, manifest.contains("FOREGROUND_SERVICE") || manifest.contains("RECEIVE_BOOT_COMPLETED") || manifest.contains("WAKE_LOCK"))
+        }
+        val phonePermissions = Regex("uses-permission android:name=\"([^\"]+)\"").findAll(source("phone/src/main/AndroidManifest.xml"))
+            .map { it.groupValues[1] }.toList()
+        assertEquals(listOf("android.permission.INTERNET", "android.permission.RECORD_AUDIO"), phonePermissions)
+    }
+
+    @Test
+    fun `settings migrate at phone start and the watch validates what it receives`() {
+        assertTrue(source("$phone/PhoneApp.kt").contains("settings.migrate()"))
+        val app = source("$watch/WatchApp.kt")
+        assertTrue(app.contains("val result = replica.offer(json)") && app.contains("if (result == ReplicaUpdate.APPLIED)"))
+        assertFalse(app.contains("WatchSettings.fromJson(json)"))
     }
 
     @Test
@@ -90,6 +130,6 @@ class AndroidWiringGateTest {
         val app = source("$phone/PhoneApp.kt")
         assertTrue(app.contains("route?.device ?: flowOf(null)"))
         assertFalse(app.contains("_playbackDevice.value = origin"))
-        assertTrue(source("$phone/MainActivity.kt").contains("handleQaAudio(intent, restored = savedInstanceState != null)"))
+        assertTrue(source("$phone/MainActivity.kt").contains("handleQaIntent(intent, restored = savedInstanceState != null)"))
     }
 }

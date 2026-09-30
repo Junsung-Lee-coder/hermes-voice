@@ -37,8 +37,11 @@ object WakeContract {
     /** Longest recognized request carried as text; a longer one is refused, never truncated. */
     const val MAX_REQUEST_CHARS = 4_000
 
-    /** Quiet period after Watch playback ends, so the reply cannot trigger the wake phrase. */
+    /** Quiet period after playback on the device ends, so the reply cannot trigger the wake phrase. */
     const val PLAYBACK_COOLDOWN_MS = 4_000L
+
+    /** Pause between releasing the recognizer and opening the app's recorder. */
+    const val MIC_HANDOFF_MS = 300L
 }
 
 enum class WakeHandoff { SECOND_UTTERANCE, RECOGNIZED_REQUEST }
@@ -275,6 +278,10 @@ class WakeWindowCoordinator(
  */
 class WakeHandoffGate {
     private var pendingGeneration: Long? = null
+
+    /** A handoff is scheduled and not yet claimed or cancelled: the recorder is about to own the microphone. */
+    val pending: Boolean
+        @Synchronized get() = pendingGeneration != null
 
     @Synchronized
     fun schedule(generation: Long) {

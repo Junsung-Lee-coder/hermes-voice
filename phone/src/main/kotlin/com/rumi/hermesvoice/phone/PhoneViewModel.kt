@@ -2,6 +2,8 @@ package com.rumi.hermesvoice.phone
 
 import android.app.Application
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.provider.OpenableColumns
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
@@ -9,14 +11,24 @@ import androidx.lifecycle.viewModelScope
 import com.rumi.hermesvoice.core.ChatSendResult
 import com.rumi.hermesvoice.core.HermesAuthRequiredException
 import com.rumi.hermesvoice.core.VoiceOrigin
+import com.rumi.hermesvoice.core.audio.CaptureEnd
+import com.rumi.hermesvoice.core.audio.PcmCaptureLoop
+import com.rumi.hermesvoice.core.audio.SilenceEndpoint
 import com.rumi.hermesvoice.core.net.AttachmentPolicy
 import com.rumi.hermesvoice.core.net.HistoryMessage
 import com.rumi.hermesvoice.core.net.OutgoingAttachment
 import com.rumi.hermesvoice.core.sessions.AppConversation
 import com.rumi.hermesvoice.core.sessions.OwnedSession
 import com.rumi.hermesvoice.core.settings.ThemeMode
+import com.rumi.hermesvoice.core.settings.VadSilence
+import com.rumi.hermesvoice.core.settings.WakeLocation
 import com.rumi.hermesvoice.core.settings.WatchSettings
 import com.rumi.hermesvoice.core.voice.VoiceTurnRequest
+import com.rumi.hermesvoice.core.watchlink.CaptureCoordinator
+import com.rumi.hermesvoice.core.watchlink.CapturePort
+import com.rumi.hermesvoice.core.watchlink.CaptureStop
+import com.rumi.hermesvoice.core.watchlink.HapticEvent
+import com.rumi.hermesvoice.core.watchlink.TurnTrigger
 import com.rumi.hermesvoice.core.watchlink.VoiceOutcomeText
 import java.util.UUID
 import kotlinx.coroutines.Dispatchers
@@ -51,11 +63,54 @@ data class PhoneUiState(
     val playbackDevice: VoiceOrigin? = null,
     /** Whether the Watch app is reachable over the Data Layer; null until checked. */
     val watchReachable: Boolean? = null,
+    /** A Phone voice turn is being sent, answered or played. */
+    val voiceBusy: Boolean = false,
+    /** The Phone's hands-free state: listening for the wake phrase, or recording the request after it. */
+    val handsFree: HandsFree = HandsFree.IDLE,
+    /** Bumped for each recording start/end haptic of a hands-free request (the activity plays it). */
+    val hapticTick: Int = 0,
 )
+
+enum class HandsFree { IDLE, LISTENING, GET_READY, SPEAK_NOW }
 
 class PhoneViewModel(application: Application) : AndroidViewModel(application) {
     private val app = PhoneApp.from(application)
     private val recorder = WavRecorder()
+    private val main = Handler(Looper.getMainLooper())
+
+    /** The hands-free recorder of the active wake capture; its lifecycle lives in [captures]. */
+    private var handsFreeRecorder: PhoneCapture? = null
+
+    /** The same capture lifecycle as the Watch's: exactly-once stop, eligibility check, never a partial send. */
+    private val captures = CaptureCoordinator(object : CapturePort {
+        override fun stopRecorder(captureId: String, reason: CaptureStop): ByteArray? {
+            val active = handsFreeRecorder?.takeIf { it.captureId == captureId }
+            handsFreeRecorder = null
+            val wav = active?.stop()
+            active?.stats()?.let { stats ->
+                // Aggregates only (no audio): the configured trailing silence and what the VAD measured.
+                Log.i(TAG, "phone hands-free captured turn=${captureId.take(12)} end=$reason pcm_bytes=${stats.pcmBytes} " +
+                    "peak=${stats.peak} rms=${stats.rms} speech=${stats.speech} vad_silence_ms=${stats.silenceMs} " +
+                    "speech_end_ms=${stats.speechEndMs} end_ms=${stats.endMs} " +
+                    "trailing_ms=${if (stats.speechEndMs >= 0) stats.endMs - stats.speechEndMs else -1} wav=${wav != null}")
+            }
+            _state.update { it.copy(handsFree = HandsFree.IDLE) }
+            return wav
+        }
+
+        override fun haptic(event: HapticEvent) {
+            Log.i(TAG, "phone haptic $event")
+            _state.update { it.copy(hapticTick = it.hapticTick + 1) }
+        }
+
+        override fun cue(line: String) = _state.update { it.copy(handsFree = HandsFree.SPEAK_NOW, voiceStatus = line) }
+        override fun upload(captureId: String, trigger: TurnTrigger, wav: ByteArray) = submitVoice(wav)
+        override fun uploadRecognized(turnId: String, text: String) = submitRecognized(turnId, text)
+        override fun discard(message: String) {
+            Log.i(TAG, "phone hands-free discarded: $message")
+            _state.update { it.copy(voiceStatus = message) }
+        }
+    })
     private val _state = MutableStateFlow(initialState())
     val state: StateFlow<PhoneUiState> = _state
 
@@ -226,6 +281,8 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
     // ── phone push-to-talk ───────────────────────────────────────────────────────────────────
 
     fun toggleRecording() {
+        // Tapping during a hands-free request sends it now (it was listening for the user anyway).
+        if (captures.tap()) return
         if (!recorder.isRecording) {
             runCatching { recorder.start() }
                 .onSuccess { _state.update { it.copy(recording = true, voiceStatus = "Listening… tap to send") } }
@@ -251,16 +308,91 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         submitVoice(wav)
     }
 
-    private fun submitVoice(wav: ByteArray) {
-        launchGuarded { wiring ->
-            _state.update { it.copy(voiceStatus = "Sending…") }
-            val turnId = UUID.randomUUID().toString()
-            val outcome = wiring.core.orchestrator.run(VoiceTurnRequest(turnId, VoiceOrigin.PHONE, wav, "audio/wav",
-                PhoneSpeakerSink(getApplication())))
+    private fun submitVoice(wav: ByteArray) = runPhoneTurn(UUID.randomUUID().toString()) { turnId ->
+        VoiceTurnRequest(turnId, VoiceOrigin.PHONE, wav, "audio/wav", PhoneSpeakerSink(getApplication()))
+    }
+
+    /** A request the Phone's recognizer heard in full after the wake phrase: routed like speech, as text. */
+    private fun submitRecognized(turnId: String, text: String) = runPhoneTurn(turnId) { id ->
+        VoiceTurnRequest(id, VoiceOrigin.PHONE, ByteArray(0), "text/plain", PhoneSpeakerSink(getApplication()), recognizedText = text)
+    }
+
+    /** Runs one Phone voice turn; [PhoneUiState.voiceBusy] holds while it is sent, answered and played. */
+    private fun runPhoneTurn(turnId: String, request: (String) -> VoiceTurnRequest) = launchGuarded { wiring ->
+        _state.update { it.copy(voiceBusy = true, voiceStatus = "Sending…") }
+        try {
+            val outcome = wiring.core.orchestrator.run(request(turnId))
             Log.i(TAG, "phone turn ${turnId.take(12)} outcome=${outcome.javaClass.simpleName}")
             _state.update { it.copy(voiceStatus = VoiceOutcomeText.describe(outcome)) }
             _state.value.selected?.let { open(it) }
+        } finally {
+            _state.update { it.copy(voiceBusy = false) }
         }
+    }
+
+    // ── phone hands-free (wake phrase) ───────────────────────────────────────────────────────
+
+    /** Nothing on the Phone owns the microphone or speaker: the wake phrase may listen. */
+    fun voiceIdle(): Boolean = !recorder.isRecording && captures.activeId == null && !_state.value.voiceBusy
+
+    /** A hands-free request is being recorded (a tap on Talk sends it). */
+    fun handsFreeCapturing(): Boolean = captures.activeId != null
+
+    fun setWakeListening(open: Boolean) = _state.update {
+        when {
+            open -> it.copy(handsFree = HandsFree.LISTENING)
+            it.handsFree == HandsFree.LISTENING -> it.copy(handsFree = HandsFree.IDLE)
+            else -> it
+        }
+    }
+
+    /**
+     * Starts the hands-free recorder after a phrase-only wake result. It ends after [silenceMs] of
+     * trailing silence (the setting now; a later change applies to the next request), on no
+     * speech, or on a tap; a pause or opt-out cancels it unsent ([cancelHandsFree]).
+     */
+    fun startHandsFree(silenceMs: Long): Boolean {
+        if (recorder.isRecording || _state.value.voiceBusy) return false
+        val id = UUID.randomUUID().toString()
+        if (!captures.begin(id, TurnTrigger.WAKE_PHRASE)) return false
+        val capture = PhoneCapture(id, SilenceEndpoint(sampleRate = PhoneCapture.SAMPLE_RATE, silenceMs = silenceMs),
+            object : PcmCaptureLoop.Listener {
+                override fun onLive() = Unit
+                override fun onCalibrated() { main.post { captures.onCalibrated(id) } }
+                override fun onEnd(reason: CaptureEnd) { main.post { captures.stop(id, CaptureStop.of(reason)) } }
+            })
+        handsFreeRecorder = capture
+        Log.i(TAG, "phone hands-free capture turn=${id.take(12)} vad_silence_ms=$silenceMs")
+        if (!capture.start()) {
+            captures.stop(id, CaptureStop.START_FAILED)
+            return false
+        }
+        _state.update { it.copy(handsFree = HandsFree.GET_READY, voiceStatus = "Get ready…") }
+        return true
+    }
+
+    /** Stops a hands-free capture in progress without sending it (pause, screen off, opt-out). */
+    fun cancelHandsFree(reason: String) {
+        val id = captures.activeId ?: return
+        Log.i(TAG, "phone hands-free capture cancelled reason=$reason (not sent)")
+        captures.stop(id, CaptureStop.LIFECYCLE)
+    }
+
+    /** The recognizer heard the whole request with the wake phrase: one end pulse, then send it as text. */
+    fun sendRecognizedRequest(text: String) {
+        if (!voiceIdle()) return
+        captures.sendRecognized(UUID.randomUUID().toString(), text)
+    }
+
+    fun onWakeClosed(reason: String) {
+        val notice = when (reason) {
+            "unfinished_request" -> "Didn't catch that. Tap Talk or say it again"
+            "request_too_long" -> "That was too long to send as text. Use Talk"
+            "unavailable" -> "Wake phrase unavailable on this phone (no speech recognizer)"
+            "recognizer_error_12", "recognizer_error_13" -> "The speech recognizer lacks the wake phrase language"
+            else -> return
+        }
+        _state.update { it.copy(voiceStatus = notice) }
     }
 
     // ── settings ─────────────────────────────────────────────────────────────────────────────
@@ -287,19 +419,29 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** Saves all Watch settings as one Phone-owned snapshot (new revision) and publishes it. */
+    /** Saves all shared voice settings as one Phone-owned snapshot (new revision) and publishes it to the Watch. */
     fun updateWatch(settings: WatchSettings) {
         val saved = app.settings.saveWatchSettings(settings)
         _state.update { it.copy(watch = saved) }
         viewModelScope.launch {
             val result = runCatching { WatchSettingsSync.publish(getApplication(), saved) }
-            Log.i(TAG, "watch settings published revision=${saved.revision} wake=${saved.wakePhraseEnabled} ok=${result.isSuccess}")
-            _state.update { it.copy(status = if (result.isSuccess) "Watch settings sent" else "Watch not reachable; will apply when it syncs") }
+            Log.i(TAG, "voice settings saved+published revision=${saved.revision} wake_location=${saved.wakeLocation} " +
+                "vad_silence_s=${saved.vadSilenceSeconds} ok=${result.isSuccess}")
+            _state.update { it.copy(status = if (result.isSuccess) "Settings sent to the Watch" else "Watch not reachable; will apply when it syncs") }
         }
+    }
+
+    fun setWakeLocation(location: WakeLocation) = updateWatch(_state.value.watch.copy(wakeLocation = location))
+
+    /** Only the offered 0.5 s steps are accepted; anything else is ignored. */
+    fun setVadSilence(seconds: Double) {
+        val valid = VadSilence.validOrNull(seconds) ?: return
+        if (valid != _state.value.watch.vadSilenceSeconds) updateWatch(_state.value.watch.copy(vadSilenceSeconds = valid))
     }
 
     override fun onCleared() {
         recorder.stop()
+        cancelHandsFree("cleared")
     }
 
     companion object {
