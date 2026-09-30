@@ -726,6 +726,38 @@ Only the following has been run:
     Say it again".
   - *Routing (current build):* a spoken Phone request created a conversation with the composed
     ack naming the registered title and alias, and the next request on that topic reused it.
+  - *Background operation (current build; the Watch emulator has no speech recognizer, so every
+    Watch wake below came from the simulated recognizer: it tests the flow after a wake, never
+    recognition).* Both switches started only from the open apps: the services ran as
+    *microphone + media playback* (Watch) and *connected device + media playback* (Phone). With
+    both apps closed and both screens off (the Watch dozing or asleep) for 3, 5 and 20 minutes, the
+    Watch opened one 30-second window after another (41 in 20 minutes, each ending on its own) and
+    then recorded a request, sent it, and played the ack and the reply, each acknowledged as
+    played; the Phone relayed it with its app closed. A recording carried on through Home, the
+    activity being recreated and the screen going off, and was sent once. Reopening the Watch app,
+    and recreating the Phone's, during a turn left one upload and one delivery. In Both with both
+    apps closed one request was delivered; with the Phone open and the Watch closed hearing the
+    same phrase, the Phone answered and the Watch showed that it had; a Watch result reported
+    6 seconds late was ignored. Stop in the open Watch app ended listening; Stop with the Watch
+    closed (through the debug trigger that runs the notification's Stop, see below) dropped a
+    recording in progress unsent, withdrew one waiting to be sent, and stopped the reply being
+    played (the Phone reported the turn not delivered); the Phone relay's Stop during a turn
+    ended it and the Watch showed that it had stopped. The Phone's setting excluding the Watch
+    dropped the microphone from the Watch's service at once; including it again while the Watch
+    app was closed left it without, and opening the app restored it. A Phone push-to-talk request
+    followed by Home and screen off was answered on the Phone speaker, with audio focus taken and
+    given back; with the relay off, the same reply was not played (focus refused) and the turn
+    said so. Without a session, leaving the Watch app still cancelled a hands-free recording, a
+    word-paced request ended 1.96 s after the last word, and 20 seconds of kitchen and office room
+    recordings after a wake sent nothing; with a session and the app closed, cafeteria and living
+    room recordings sent nothing either. With the real recognizer selected, the Watch said the
+    wake phrase is unavailable and its session showed "replies only (no recognizer)". After each
+    reinstall both switches showed "paused"; the Phone's relay resumed when its app was opened,
+    the Watch's only after "Tap to start". **Not run:** the notification itself and its Stop
+    button (the notification permission prompt was left unanswered; the service's notification
+    and its one action were checked through the system's service list), recognition with the
+    screen off, rotation (auto-rotate is off on the Phone emulator), Doze, battery drain, and any
+    physical device.
   - *Earlier builds:* Watch reader, gestures, bezel scrolling and haptics, Watch playback with
     `played` ACKs, and playback switching between devices.
 
