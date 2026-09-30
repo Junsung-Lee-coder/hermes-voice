@@ -358,31 +358,49 @@ Only the following has been run:
 - **Paired debug build:** `gradle :phone:assembleDebug :watch:assembleDebug` succeeded with
   Gradle 8.13 and JDK 17. Both APKs have the same package and are v2-signed by the same debug
   certificate.
-- **Phone emulator (Android 15), real microphone input.** Speech played into the emulator
-  microphone went through transcription, routing, the ack played on the Phone, delivery, and the
-  final reply played on the Phone. The Phone was signed in to a local test dashboard.
-- **Watch emulator (Wear OS 5), not paired.** Push-to-talk captured real (non-silent) audio from the
-  emulator microphone for 75 seconds and stopped only when Send was tapped, with one start and one
-  end haptic. The wake-phrase recorder path ran through the debug handoff: 72 seconds of speech with
-  pauses of up to 0.8 seconds were recorded whole and ended once on trailing silence; with no speech
-  it gave up after the no-speech timeout without sending. Swipes, bezel scrolling with scroll
-  haptics, follow-latest and scroll preservation ran with synthetic reader rows. Leaving the app
-  while recording cancelled it without sending.
+- **Paired emulators (Phone Android 15, Watch Wear OS 5), real microphone input.** Speech was
+  played into both emulators' microphones through a virtual audio cable, against a local test
+  dashboard with a real model, speech-to-text and text-to-speech:
+  - *Settings:* changing the wake location and trailing silence on the Phone (Settings screen
+    and debug extras) reached the Watch within about 2 seconds each time; equal-revision snapshots
+    read again on resume were ignored; invalid values (0.7, 12, NaN, an unknown mode) were refused
+    and not sent. A Phone that had the old Watch wake switch on started with **Watch** selected.
+  - *Hands-free ending:* on the Phone, requests ended 500, 2000, 5000 and 10000 ms after the last
+    speech for the 0.5, 2, 5 and 10 s settings; on the Watch 500, 1980 and 4960 ms for 0.5, 2 and
+    5 s (a short sound in the tail pauses the count without restarting it). A 73-second request
+    with pauses was recorded whole and ended once on each device. Soft speech (10 % level) and a
+    single short word ended correctly. A request followed by steady noise ended 2.3 s after the
+    speech while the noise kept playing. With no speech, the recording stopped 8 s after the buzz
+    and nothing was sent; where replies play did not change.
+  - *Phone wake phrase with the platform recognizer (English):* a request in one breath was sent
+    as text once the recognizer's final result arrived; the phrase alone started the recorder
+    0.3 s after the recognizer was released and the request ended at the set silence. Both ran
+    through routing, the ack, delivery and the final reply on the Phone. Speech without the wake
+    phrase sent nothing. With the default Korean phrases, this emulator's on-device recognizer had
+    no Korean model and its fallback recognizer returned no match, so Korean recognition was not
+    verified.
+  - *Wake location:* with **Phone**, the Watch ignored a wake handoff; with **Watch**, the Phone
+    never listened; with **Both**, the Phone answered. Turning the Watch off from the Phone while
+    the Watch was recording a hands-free request, and leaving the Phone app while it was
+    recording one, both stopped the recording without sending it.
+  - *Push-to-talk:* on both devices a recording with 6 seconds of silence after the speech was
+    sent only on the tap; a silent Phone recording was refused before speech-to-text.
+  - *Earlier builds:* Watch reader, gestures, bezel scrolling and haptics, Watch playback with
+    `played` ACKs, and playback switching between devices.
 
-- **Paired emulators, partial.** After pairing, with an older Phone build and no dashboard reachable,
-  Watch reader requests reached the Phone and its answers came back, and Watch recordings were
-  uploaded to the Phone, which reported its stages back. Nothing was transcribed or delivered.
-  Background noise that rose after speech ended the Watch's hands-free recording within seconds.
-
-**Never run:** a complete paired flow with matching Phone and Watch builds, playback on the Watch,
-the Watch `played` ACK, switching playback between devices, and wake-phrase recognition (the Watch
-emulator has no speech recognition service). These are covered only by core unit tests. Nothing has
-been tested on physical devices, including audio routing, haptic strength and a physical bezel.
+**Never run:** wake-phrase recognition on the Watch (the Watch emulator has no speech recognition
+service, so its recorder was started by the debug handoff), Korean wake-phrase recognition, and
+anything on physical devices, including audio routing, haptic strength, real room acoustics and
+a physical bezel. The emulator microphone occasionally delivers digital silence; those runs ended
+as "no speech" and were repeated.
 
 ## Known limitations
 
-- **Not release-ready.** Debug builds only: no release signing configuration and no R8. The Watch
-  has never been paired with a Phone (see [Validation](#validation)).
+- **Not release-ready.** Debug builds only: no release signing configuration and no R8. Tested
+  on emulators only (see [Validation](#validation)).
+- **A reset dashboard at the same address.** The app's saved sessions, including the hidden
+  routing session, belong to the dashboard data that created them. If that data is reset while the
+  address stays the same, voice turns stop with "session no longer exists on the dashboard".
 - **Playback route is in memory.** After the Phone process restarts, nothing plays until the next
   accepted voice request. If the route points to a Watch that has become unreachable, that
   utterance fails and the Phone doesn't play it instead. If the failed utterance is an ack, the turn
