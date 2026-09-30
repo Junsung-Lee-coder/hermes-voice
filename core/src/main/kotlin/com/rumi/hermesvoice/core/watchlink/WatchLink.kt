@@ -131,7 +131,7 @@ class WatchTurnUpload(val turnId: String, val trigger: TurnTrigger, val mimeType
     companion object {
         const val MIME_WAV = "audio/wav"
         const val MIME_TEXT = "text/plain; charset=utf-8"
-        const val MAX_RECOGNIZED_CHARS = 1_000
+        const val MAX_RECOGNIZED_CHARS = com.rumi.hermesvoice.core.wake.WakeContract.MAX_REQUEST_CHARS
 
         fun recognized(turnId: String, text: String): WatchTurnUpload =
             WatchTurnUpload(turnId, TurnTrigger.WAKE_PHRASE, MIME_TEXT, text.trim().toByteArray(StandardCharsets.UTF_8))

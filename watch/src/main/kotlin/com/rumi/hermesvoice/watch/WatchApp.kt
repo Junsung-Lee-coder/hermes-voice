@@ -6,6 +6,7 @@ import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.os.Build
 import android.os.SystemClock
+import android.os.VibrationAttributes
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -22,7 +23,6 @@ import com.rumi.hermesvoice.core.watchlink.ReaderRequest
 import com.rumi.hermesvoice.core.watchlink.ReaderResponse
 import com.rumi.hermesvoice.core.watchlink.ReaderSessionRow
 import com.rumi.hermesvoice.core.watchlink.ReaderSurface
-import com.rumi.hermesvoice.core.watchlink.RecordingHapticLatch
 import com.rumi.hermesvoice.core.watchlink.TurnStateMessage
 import com.rumi.hermesvoice.core.watchlink.TurnTrigger
 import com.rumi.hermesvoice.core.watchlink.WatchHapticPolicy
@@ -64,7 +64,6 @@ class WatchApp : Application() {
 
     /** The Phone node each pending reader request went to; a response from any other node is ignored. */
     private val readerTargets = ConcurrentHashMap<String, String>()
-    private val recordingHaptics = RecordingHapticLatch()
 
     private var player: MediaPlayer? = null
     private var playing: PlayRequest? = null
@@ -152,21 +151,14 @@ class WatchApp : Application() {
         if (message.terminal && ownTurn) refreshSelected()
     }
 
-    // ── recording haptics ────────────────────────────────────────────────────────────────────
+    // ── haptics ──────────────────────────────────────────────────────────────────────────────
 
-    /** The microphone is actually delivering audio for [captureId] (never on button intent). */
-    fun onRecordingStarted(captureId: String) {
-        recordingHaptics.onStarted(captureId)?.let(::haptic)
-        Log.i(TAG, "haptic recording_start capture=${captureId.take(12)}")
-    }
-
-    /** [captureId] left recording (send, cancel, no speech, error or lifecycle); buzzes once, only after a start. */
-    fun onRecordingEnded(captureId: String, reason: String) {
-        val event = recordingHaptics.onEnded(captureId)
-        event?.let(::haptic)
-        Log.i(TAG, "haptic recording_end capture=${captureId.take(12)} reason=$reason fired=${event != null}")
-    }
-
+    /**
+     * One haptic from [WatchHapticPolicy], with touch vibration attributes on API 33+. The exact
+     * waveform durations are kept (the platform "tick" effect played ~100 ms on the emulator, far from
+     * the confirmed 10 ms step). Recording start/end timing is decided by
+     * [com.rumi.hermesvoice.core.watchlink.CaptureCoordinator], never by button intent.
+     */
     fun haptic(event: HapticEvent) {
         if (!_settings.value.hapticsEnabled) return
         runCatching {
@@ -177,9 +169,17 @@ class WatchApp : Application() {
                 getSystemService(Vibrator::class.java)
             } ?: return
             if (!vibrator.hasVibrator()) return
-            vibrator.vibrate(VibrationEffect.createWaveform(WatchHapticPolicy.patternFor(event).timings(), -1))
+            val effect = VibrationEffect.createWaveform(WatchHapticPolicy.patternFor(event).timings(), -1)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                vibrator.vibrate(effect, VibrationAttributes.createForUsage(VibrationAttributes.USAGE_TOUCH))
+            } else {
+                vibrator.vibrate(effect)
+            }
         }
     }
+
+    /** A short status line shown only while nothing is recording, sending or playing. */
+    fun notice(line: String) = _talk.update { if (it.canArmWakePhrase) it.copy(line = line) else it }
 
     // ── conversation reader ──────────────────────────────────────────────────────────────────
 
@@ -232,6 +232,8 @@ class WatchApp : Application() {
             return
         }
         _reader.update { it.onResponse(response) }
+        // A conversation turned out to be gone: reload the browser so it cannot be tapped again.
+        if (_reader.value.sessions.stale) loadSessions()
         Log.i(TAG, "reader ${response.kind.wire} req=${response.reqId.take(12)} ok=${response.ok} error=${response.error} " +
             "sessions=${response.sessions.size} messages=${response.messages.size} has_older=${response.hasOlder}")
     }

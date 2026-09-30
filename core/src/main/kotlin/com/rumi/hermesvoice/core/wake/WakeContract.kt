@@ -7,22 +7,31 @@ import com.rumi.hermesvoice.core.settings.WakePhrasePatterns
  * Recorder Watch "Method A":
  *
  * 1. While the Watch app is visibly in the foreground, one bounded [WINDOW_MS] window is opened
- *    per visibility generation (app shown, or screen back on / out of ambient while shown). The
- *    platform `SpeechRecognizer` is the only microphone user during the window.
- * 2. The decision is made on the recognizer's FINAL result (a partial match extends the window by
- *    [FINAL_GRACE_MS] so the recognizer can finish the utterance):
+ *    per visibility generation (app shown, or screen back on while shown). The platform
+ *    `SpeechRecognizer` is the only microphone user during the window.
+ * 2. A wake phrase counts only at the start of what was said (after at most one short greeting,
+ *    see [WakePhrasePatterns.leadingRequest]); a mention in the middle of a sentence is ignored.
+ * 3. Only the recognizer's FINAL result is ever accepted as the user's words:
  *    - wake phrase only → [WakeHandoff.SECOND_UTTERANCE]: the recognizer is released, the app's
- *      own `AudioRecord` starts, calibrates, and a ready haptic tells the user to speak the request.
- *      That capture ends on trailing silence (no duration cap) or a separate no-speech timeout.
+ *      own `AudioRecord` starts, calibrates, and a ready haptic tells the user to speak the
+ *      request, which ends on trailing silence (no duration cap) or a separate no-speech timeout;
  *    - wake phrase followed by more words → [WakeHandoff.RECOGNIZED_REQUEST]: the recognizer
- *      already consumed the request, so its text is sent as the request instead of being dropped;
- *      no second utterance is expected.
- * 3. Wake-recognizer text never leaves the Watch except as the request of rule 2.
+ *      already heard the whole request, so its final text is sent, complete, as the request.
+ *    Partial results only keep the window open: after a leading wake phrase, every change in the
+ *    partial text extends it by [PENDING_INACTIVITY_MS], so a long request is never cut by a total
+ *    time limit. If the recognizer errors or goes quiet before a final result, a phrase-only
+ *    partial still cues a second utterance (nothing was said yet), but an unfinished request is
+ *    never sent: the window closes with "unfinished_request" and the Watch asks the user to repeat.
+ * 4. Recognized text never leaves the Watch except as the request of rule 3 and is never logged.
  */
 object WakeContract {
     const val WINDOW_MS = 5_000L
-    const val FINAL_GRACE_MS = 8_000L
-    const val MAX_REQUEST_CHARS = 1_000
+
+    /** Quiet time after the last change of a pending partial before the window gives up. */
+    const val PENDING_INACTIVITY_MS = 8_000L
+
+    /** Longest recognized request carried as text; a longer one is refused, never truncated. */
+    const val MAX_REQUEST_CHARS = 4_000
 
     /** Quiet period after Watch playback ends, so the reply cannot trigger the wake phrase. */
     const val PLAYBACK_COOLDOWN_MS = 4_000L
@@ -48,11 +57,13 @@ sealed class WakeOutcome {
  */
 class WakeSession(
     private val windowMs: Long = WakeContract.WINDOW_MS,
-    private val finalGraceMs: Long = WakeContract.FINAL_GRACE_MS,
+    private val pendingInactivityMs: Long = WakeContract.PENDING_INACTIVITY_MS,
 ) {
     private var generation: Long? = null
     private var deadlineMs = 0L
-    private var matchedRequest: String? = null
+
+    /** The request text of the latest leading-wake partial, or null before one was heard. */
+    private var pending: String? = null
 
     val active: Boolean get() = generation != null
 
@@ -60,59 +71,63 @@ class WakeSession(
     fun open(generation: Long, nowMs: Long) {
         this.generation = generation
         deadlineMs = nowMs + windowMs
-        matchedRequest = null
+        pending = null
     }
 
     @Synchronized
     fun onResults(generation: Long, hypotheses: List<String>, final: Boolean, nowMs: Long, patterns: String): WakeOutcome {
         if (generation != this.generation) return WakeOutcome.None
-        if (nowMs > deadlineMs) return close(WakeOutcome.Closed("deadline"))
-        val request = hypotheses.asSequence().mapNotNull { WakePhrasePatterns.requestAfterWake(patterns, it) }.firstOrNull()
-        return when {
-            request == null && final -> matchedRequest?.let(::handoff) ?: close(WakeOutcome.Closed("not_matched"))
-            request == null -> WakeOutcome.None
-            final -> handoff(request)
-            else -> {
-                if (matchedRequest == null) deadlineMs = maxOf(deadlineMs, nowMs + finalGraceMs)
-                matchedRequest = request
-                WakeOutcome.None
+        if (nowMs > deadlineMs) return expire("deadline")
+        val request = hypotheses.asSequence().mapNotNull { WakePhrasePatterns.leadingRequest(patterns, it) }.firstOrNull()
+        if (final) {
+            return when {
+                request == null -> close(WakeOutcome.Closed("not_matched"))
+                request.length > WakeContract.MAX_REQUEST_CHARS -> close(WakeOutcome.Closed("request_too_long"))
+                request.isBlank() -> close(WakeOutcome.Handoff(WakeHandoff.SECOND_UTTERANCE, ""))
+                else -> close(WakeOutcome.Handoff(WakeHandoff.RECOGNIZED_REQUEST, request))
             }
         }
+        if (request != null && request != pending) {
+            pending = request
+            deadlineMs = maxOf(deadlineMs, nowMs + pendingInactivityMs)
+        }
+        return WakeOutcome.None
     }
 
-    /** A recognizer error; a phrase already matched in a partial result is still handed off. */
     @Synchronized
     fun onError(generation: Long, code: Int): WakeOutcome {
         if (generation != this.generation) return WakeOutcome.None
-        return matchedRequest?.let(::handoff) ?: close(WakeOutcome.Closed("recognizer_error_$code"))
+        return expire("recognizer_error_$code")
     }
 
     @Synchronized
     fun onDeadline(generation: Long, nowMs: Long): WakeOutcome {
         if (generation != this.generation || nowMs < deadlineMs) return WakeOutcome.None
-        return matchedRequest?.let(::handoff) ?: close(WakeOutcome.Closed("timeout"))
+        return expire("timeout")
     }
 
-    /** Closes the window (screen off, pause, busy, opt-out...); a pending match is abandoned. */
+    /** Closes the window (screen off, pause, busy, opt-out...); a pending partial is abandoned. */
     @Synchronized
     fun cancel(reason: String): WakeOutcome = if (generation == null) WakeOutcome.None else close(WakeOutcome.Closed(reason))
 
     @Synchronized
     fun deadline(): Long = deadlineMs
 
-    private fun handoff(request: String): WakeOutcome {
-        val bounded = request.take(WakeContract.MAX_REQUEST_CHARS)
-        return close(WakeOutcome.Handoff(if (bounded.isBlank()) WakeHandoff.SECOND_UTTERANCE else WakeHandoff.RECOGNIZED_REQUEST, bounded))
+    /** No final result: a phrase-only partial may still cue a second utterance; words are never sent. */
+    private fun expire(reason: String): WakeOutcome = when {
+        pending == null -> close(WakeOutcome.Closed(reason))
+        pending!!.isBlank() -> close(WakeOutcome.Handoff(WakeHandoff.SECOND_UTTERANCE, ""))
+        else -> close(WakeOutcome.Closed("unfinished_request"))
     }
 
     private fun close(outcome: WakeOutcome): WakeOutcome {
         generation = null
-        matchedRequest = null
+        pending = null
         return outcome
     }
 }
 
-enum class WakeBlock { DISABLED, NOT_FOREGROUND, PERMISSION, MICROPHONE_MUTED, BUSY, PHONE_UNREACHABLE, COOLDOWN, ALREADY_ARMED }
+enum class WakeBlock { DISABLED, NOT_FOREGROUND, PERMISSION, MICROPHONE_MUTED, BUSY, PHONE_UNREACHABLE, COOLDOWN, ALREADY_ARMED, UNAVAILABLE }
 
 data class WakeArmInputs(
     val enabled: Boolean,
@@ -142,5 +157,134 @@ object WakeArmGate {
         inputs.nowMs < inputs.cooldownUntilMs -> WakeBlock.COOLDOWN
         inputs.lastArmedGeneration == inputs.generation -> WakeBlock.ALREADY_ARMED
         else -> null
+    }
+}
+
+/** The platform recognizer, as the wake window needs it. */
+interface WakeRecognizerPort {
+    fun available(): Boolean
+
+    /** Creates and starts a recognizer whose callbacks carry [generation]; false if it could not start. */
+    fun start(generation: Long): Boolean
+
+    /** Cancels and destroys the recognizer, releasing the microphone. */
+    fun release()
+}
+
+interface WakeTimerPort {
+    /** (Re)schedules the single deadline check, replacing any earlier one. */
+    fun schedule(delayMs: Long)
+    fun cancel()
+}
+
+interface WakeHostPort {
+    fun windowChanged(open: Boolean)
+
+    /** Called only after the recognizer was released. */
+    fun handoff(generation: Long, handoff: WakeOutcome.Handoff)
+    fun closed(reason: String)
+}
+
+/**
+ * The wake window's lifecycle, independent of Android: arming per visibility generation, the
+ * deadline timer, and resolution. On any resolution the timer is cancelled and the recognizer is
+ * released BEFORE the host hears of a handoff, so the recognizer and the app's recorder never
+ * hold the microphone together.
+ */
+class WakeWindowCoordinator(
+    private val recognizer: WakeRecognizerPort,
+    private val timer: WakeTimerPort,
+    private val host: WakeHostPort,
+    private val clock: () -> Long,
+) {
+    private val session = WakeSession()
+    private var open = false
+    private var windowGeneration = -1L
+    private var lastArmedGeneration: Long? = null
+
+    /** The current visibility generation (app shown, screen back on while shown). */
+    var generation = 0L
+        private set
+
+    /** Starts a new visibility generation (resume, or screen off); an open window closes with [reason]. */
+    fun newGeneration(reason: String) {
+        close(reason)
+        generation += 1
+    }
+
+    /** Opens a window unless a gate blocks it; returns the blocking reason, or null when it opened. */
+    fun requestArm(inputs: WakeArmInputs): WakeBlock? {
+        if (session.active) return WakeBlock.ALREADY_ARMED
+        WakeArmGate.block(inputs.copy(generation = generation, lastArmedGeneration = lastArmedGeneration))?.let { return it }
+        lastArmedGeneration = generation
+        if (!recognizer.available()) {
+            host.closed("unavailable")
+            return WakeBlock.UNAVAILABLE
+        }
+        windowGeneration = generation
+        session.open(generation, clock())
+        open = true
+        host.windowChanged(true)
+        timer.schedule(session.deadline() - clock())
+        if (!recognizer.start(generation)) resolve(session.cancel("start_failed"))
+        return null
+    }
+
+    fun onResults(generation: Long, hypotheses: List<String>, final: Boolean, patterns: String) =
+        resolve(session.onResults(generation, hypotheses, final, clock(), patterns))
+
+    fun onError(generation: Long, code: Int) = resolve(session.onError(generation, code))
+
+    fun onTimer() = resolve(session.onDeadline(windowGeneration, clock()))
+
+    fun close(reason: String) = resolve(session.cancel(reason))
+
+    private fun resolve(outcome: WakeOutcome) {
+        when (outcome) {
+            WakeOutcome.None -> if (session.active) timer.schedule((session.deadline() - clock()).coerceAtLeast(0L))
+            is WakeOutcome.Closed -> {
+                release()
+                host.closed(outcome.reason)
+            }
+            is WakeOutcome.Handoff -> {
+                release()
+                host.handoff(windowGeneration, outcome)
+            }
+        }
+    }
+
+    private fun release() {
+        timer.cancel()
+        if (!open) return
+        open = false
+        recognizer.release()
+        host.windowChanged(false)
+    }
+}
+
+/**
+ * The short pause between releasing the recognizer and opening the app's recorder, as a
+ * cancellable, generation-bound token: a pause, opt-out or busy state cancels it, and a handoff
+ * from an older generation never starts the recorder.
+ */
+class WakeHandoffGate {
+    private var pendingGeneration: Long? = null
+
+    @Synchronized
+    fun schedule(generation: Long) {
+        pendingGeneration = generation
+    }
+
+    @Synchronized
+    fun cancel() {
+        pendingGeneration = null
+    }
+
+    /** True at most once, and only for the still-current generation while resumed and idle. */
+    @Synchronized
+    fun claim(generation: Long, currentGeneration: Long, resumed: Boolean, captureIdle: Boolean): Boolean {
+        if (pendingGeneration != generation) return false
+        pendingGeneration = null
+        return generation == currentGeneration && resumed && captureIdle
     }
 }

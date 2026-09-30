@@ -86,8 +86,33 @@ class RotaryScrollAccumulator {
         return value
     }
 
-    /** The drain loop stopped early (cancelled); the next delta starts a new one. */
+    /** The drain loop stopped (possibly cancelled): pending rotation is dropped, never replayed later. */
     fun finish() {
+        pending = 0f
         draining = false
+    }
+}
+
+/**
+ * Bezel scrolling for one list: [offer] each rotary delta; when it returns true, run [drain] until
+ * it returns. The list is scrolled by everything accumulated, and a tick is requested only when
+ * the list actually moved ([ScrollHapticGate]).
+ */
+class RotaryScrollDriver(private val haptics: ScrollHapticGate = ScrollHapticGate()) {
+    private val accumulator = RotaryScrollAccumulator()
+
+    fun offer(px: Float): Boolean = accumulator.add(px)
+
+    suspend fun drain(scrollBy: suspend (Float) -> Float, nowMs: () -> Long, onTick: () -> Unit) {
+        try {
+            while (true) {
+                val requested = accumulator.drain()
+                if (requested == 0f) break
+                val consumed = scrollBy(requested)
+                if (haptics.shouldPulse(requested, consumed, nowMs())) onTick()
+            }
+        } finally {
+            accumulator.finish()
+        }
     }
 }

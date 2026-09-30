@@ -79,7 +79,6 @@ import com.rumi.hermesvoice.core.audio.QaAudio
 import com.rumi.hermesvoice.core.audio.QaLaunchGuard
 import com.rumi.hermesvoice.core.sessions.AppConversation
 import com.rumi.hermesvoice.core.settings.ThemeMode
-import com.rumi.hermesvoice.core.settings.WatchSettings
 
 class MainActivity : ComponentActivity() {
     private val model: PhoneViewModel by viewModels()
@@ -372,7 +371,6 @@ private fun ChatTab(state: PhoneUiState, model: PhoneViewModel) {
 @Composable
 private fun SettingsTab(state: PhoneUiState, model: PhoneViewModel) {
     var patterns by remember(state.watch.wakePatterns) { mutableStateOf(state.watch.wakePatterns) }
-    var seconds by remember(state.watch.maxTurnSeconds) { mutableStateOf(state.watch.maxTurnSeconds.toString()) }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("Hermes dashboard", style = MaterialTheme.typography.titleSmall)
         ConnectionFields(state, model, primaryAction = "Sign in")
@@ -407,22 +405,20 @@ private fun SettingsTab(state: PhoneUiState, model: PhoneViewModel) {
             color = if (state.watchReachable == false) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.tertiary,
             style = MaterialTheme.typography.bodyMedium,
         )
-        Text("Push-to-talk is always available on the Watch.",
+        Text("Push-to-talk is always available on the Watch and records until you tap Send (no time limit).",
             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         SwitchRow("Wake phrase (while the Watch app is open)", state.watch.wakePhraseEnabled) {
             model.updateWatch(state.watch.copy(wakePhraseEnabled = it))
         }
         OutlinedTextField(patterns, { patterns = it }, label = { Text("Wake phrases (space-separated, * wildcard)") },
             modifier = Modifier.fillMaxWidth())
-        Text("Wake-phrase requests end when you stop talking (no time limit). Say the phrase and pause for the buzz, " +
-            "or say your request right after it.",
+        Text("Say the wake phrase first. Pause for the buzz, then speak; the request ends when you stop talking " +
+            "(no time limit). Or say the request right after the phrase: it's sent only once the Watch's speech " +
+            "recognizer has finished hearing it, and if it can't finish, nothing is sent and the Watch asks you to repeat.",
             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        OutlinedTextField(seconds, { seconds = it.filter(Char::isDigit).take(3) }, label = { Text("Push-to-talk max seconds") },
-            singleLine = true, modifier = Modifier.fillMaxWidth())
         SwitchRow("Haptics", state.watch.hapticsEnabled) { model.updateWatch(state.watch.copy(hapticsEnabled = it)) }
         OutlinedButton(onClick = {
-            model.updateWatch(state.watch.copy(wakePatterns = patterns,
-                maxTurnSeconds = seconds.toIntOrNull() ?: WatchSettings.DEFAULT_MAX_TURN_SECONDS))
+            model.updateWatch(state.watch.copy(wakePatterns = patterns))
         }) { Text("Save Watch settings") }
     }
 }

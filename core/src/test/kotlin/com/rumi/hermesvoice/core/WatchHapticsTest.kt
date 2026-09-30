@@ -60,5 +60,9 @@ class WatchHapticsTest {
         assertEquals(12f, acc.drain(), 0.001f)
         acc.finish()
         assertTrue(acc.add(1f))
+        assertFalse(acc.add(7f))
+        acc.finish()
+        assertTrue("a cancelled drain drops its pending rotation", acc.add(2f))
+        assertEquals(2f, acc.drain(), 0.001f)
     }
 }

@@ -11,20 +11,23 @@ enum class EndpointDecision { CONTINUE, END_OF_SPEECH, NO_SPEECH, MAX_DURATION }
  *
  * - The first [calibrationMs] estimate the noise floor; [calibrated] then turns true, which is when
  *   the Watch gives its "speak now" cue, so the request itself is never part of the calibration.
- * - Speech starts after [minSpeechMs] above `floor × onsetRatio`. Until then the floor adapts
- *   slowly, and [noSpeechTimeoutMs] (counted from the cue) ends a request that never started.
- * - Once speech started there is NO duration cap: the request ends only after [silenceMs] of
- *   trailing audio below `floor × releaseRatio`. Short impulses do not reset that silence;
- *   renewed speech must last [respeechMs] to do so.
+ * - Voiced audio is energy above `floor × onsetRatio`. Speech is qualified after [minSpeechMs] of
+ *   voiced audio in which no dip lasts longer than [maxDipMs], so syllables separated by short dips
+ *   count, while isolated clicks never do. Until then the floor adapts slowly, and
+ *   [noSpeechTimeoutMs] (counted from the cue) ends a request that never started.
+ * - Once speech started there is NO duration cap. Trailing silence is counted only on frames below
+ *   `floor × releaseRatio`; any louder frame pauses the count, and [respeechMs] of renewed voiced
+ *   audio (again tolerating short dips) resets it. The request ends after [silenceMs] of silence.
  * Push-to-talk does not use this.
  */
 class SilenceEndpoint(
     private val sampleRate: Int = 16_000,
     private val calibrationMs: Long = 400,
     private val minSpeechMs: Long = 300,
+    private val maxDipMs: Long = 200,
     private val silenceMs: Long = 2_000,
     private val noSpeechTimeoutMs: Long = 8_000,
-    private val respeechMs: Long = 300,
+    private val respeechMs: Long = 200,
     private val onsetRatio: Double = 3.0,
     private val releaseRatio: Double = 2.0,
 ) {
@@ -35,8 +38,8 @@ class SilenceEndpoint(
     private var armedMs = 0L
     private val calibration = ArrayList<Double>()
     private var floor = MIN_FLOOR
-    private var speechMs = 0L
-    private var respeechAccumulatedMs = 0L
+    private var voicedMs = 0L
+    private var dipMs = 0L
     private var quietMs = 0L
 
     var speechDetected: Boolean = false
@@ -50,6 +53,7 @@ class SilenceEndpoint(
         if (samples == 0 || phase == Phase.DONE) return EndpointDecision.CONTINUE
         val durationMs = samples * 1000L / sampleRate
         val level = rms(frame)
+        val voiced = level >= floor * onsetRatio
         when (phase) {
             Phase.CALIBRATING -> {
                 calibration += level
@@ -62,39 +66,29 @@ class SilenceEndpoint(
             }
             Phase.ARMED -> {
                 armedMs += durationMs
-                if (level >= floor * onsetRatio) {
-                    speechMs += durationMs
-                    if (speechMs >= minSpeechMs) {
-                        phase = Phase.SPEECH
-                        speechDetected = true
-                    }
-                } else {
-                    speechMs = 0
-                    adapt(level)
-                }
-                if (phase == Phase.ARMED && armedMs >= noSpeechTimeoutMs) {
+                track(voiced, durationMs)
+                if (!voiced && voicedMs == 0L) adapt(level)
+                if (voicedMs >= minSpeechMs) {
+                    phase = Phase.SPEECH
+                    speechDetected = true
+                } else if (armedMs >= noSpeechTimeoutMs) {
                     phase = Phase.DONE
                     return EndpointDecision.NO_SPEECH
                 }
             }
             Phase.SPEECH -> if (level < floor * releaseRatio) {
-                quietMs = durationMs
-                respeechAccumulatedMs = 0
                 phase = Phase.SILENCE
+                quietMs = durationMs
+                voicedMs = 0
+                dipMs = 0
             }
             Phase.SILENCE -> {
-                quietMs += durationMs
-                if (level >= floor * onsetRatio) {
-                    respeechAccumulatedMs += durationMs
-                    if (respeechAccumulatedMs >= respeechMs) {
-                        phase = Phase.SPEECH
-                        quietMs = 0
-                        respeechAccumulatedMs = 0
-                    }
-                } else {
-                    respeechAccumulatedMs = 0
-                }
-                if (phase == Phase.SILENCE && quietMs >= silenceMs) {
+                if (level < floor * releaseRatio) quietMs += durationMs
+                track(voiced, durationMs)
+                if (voicedMs >= respeechMs) {
+                    phase = Phase.SPEECH
+                    quietMs = 0
+                } else if (quietMs >= silenceMs) {
                     phase = Phase.DONE
                     return EndpointDecision.END_OF_SPEECH
                 }
@@ -102,6 +96,20 @@ class SilenceEndpoint(
             Phase.DONE -> Unit
         }
         return EndpointDecision.CONTINUE
+    }
+
+    /** Voiced time accumulated across dips of at most [maxDipMs]; a longer dip starts over. */
+    private fun track(voiced: Boolean, durationMs: Long) {
+        if (voiced) {
+            voicedMs += durationMs
+            dipMs = 0
+        } else if (voicedMs > 0) {
+            dipMs += durationMs
+            if (dipMs > maxDipMs) {
+                voicedMs = 0
+                dipMs = 0
+            }
+        }
     }
 
     /** Slow floor tracking for stationary noise, only from non-speech frames. */

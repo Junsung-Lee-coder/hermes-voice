@@ -21,6 +21,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.wear.compose.material.Colors
@@ -32,6 +33,10 @@ import com.rumi.hermesvoice.core.audio.QaAudio
 import com.rumi.hermesvoice.core.audio.QaLaunchGuard
 import com.rumi.hermesvoice.core.audio.SilenceEndpoint
 import com.rumi.hermesvoice.core.wake.WakeHandoff
+import com.rumi.hermesvoice.core.wake.WakeHandoffGate
+import com.rumi.hermesvoice.core.watchlink.CaptureCoordinator
+import com.rumi.hermesvoice.core.watchlink.CapturePort
+import com.rumi.hermesvoice.core.watchlink.CaptureStop
 import com.rumi.hermesvoice.core.wake.WakeOutcome
 import com.rumi.hermesvoice.core.watchlink.HapticEvent
 import com.rumi.hermesvoice.core.watchlink.LoadStatus
@@ -53,9 +58,49 @@ import kotlinx.coroutines.tasks.await
  */
 class WatchActivity : ComponentActivity() {
     private val app by lazy { WatchApp.from(this) }
-    private var capture: WatchCapture? = null
+
+    /** The Android recorder of the active capture; the lifecycle itself lives in [captures]. */
+    private var recorder: WatchCapture? = null
+    private var lastStop: CaptureStop? = null
+    private val captures: CaptureCoordinator by lazy { CaptureCoordinator(capturePort) }
     private val wakeListening = mutableStateOf(false)
+    private var qaWakeHandoffPending = false
     private lateinit var wake: WakeController
+    private val handoffGate = WakeHandoffGate()
+    private var handoffGeneration = -1L
+    private val handoffRunnable: Runnable = Runnable {
+        val resumed = lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+        if (handoffGate.claim(handoffGeneration, wake.generation, resumed, captureIdle = captures.activeId == null)) {
+            startCapture(TurnTrigger.WAKE_PHRASE)
+        } else {
+            Log.i(TAG, "wake handoff dropped gen=$handoffGeneration current=${wake.generation} resumed=$resumed")
+        }
+    }
+
+    private val capturePort: CapturePort = object : CapturePort {
+        override fun stopRecorder(captureId: String): ByteArray? {
+            val active = recorder?.takeIf { it.turnId == captureId }
+            recorder = null
+            val wav = active?.stop()
+            active?.stats()?.let { stats ->
+                // Aggregates only (no audio): proves whether the microphone delivered real, non-silent PCM.
+                Log.i(TAG, "watch mic captured turn=${captureId.take(12)} trigger=${active.trigger} end=$lastStop " +
+                    "pcm_bytes=${stats.pcmBytes} peak=${stats.peak} rms=${stats.rms} speech=${stats.speech} wav=${wav != null}")
+            }
+            updateKeepScreenOn()
+            return wav
+        }
+
+        override fun haptic(event: HapticEvent) {
+            Log.i(TAG, "haptic $event")
+            app.haptic(event)
+        }
+
+        override fun cue(line: String) = app.cue(line)
+        override fun upload(captureId: String, trigger: TurnTrigger, wav: ByteArray) = app.upload(captureId, trigger, wav)
+        override fun uploadRecognized(turnId: String, text: String) = app.uploadRecognized(turnId, text)
+        override fun discard(message: String) = app.discard(message)
+    }
 
     private val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) wake.onPermissionGranted()
@@ -66,7 +111,7 @@ class WatchActivity : ComponentActivity() {
         wake = WakeController(this, app, onWindowChanged = { open ->
             wakeListening.value = open
             updateKeepScreenOn()
-        }, onHandoff = ::onWakeHandoff)
+        }, onHandoff = ::onWakeHandoff, onClosed = ::onWakeClosed)
         lifecycle.addObserver(wake)
         setContent {
             val talk by app.talk.collectAsStateWithLifecycle()
@@ -104,10 +149,24 @@ class WatchActivity : ComponentActivity() {
         }
         handleQaIntent(intent, restored = savedInstanceState != null)
         lifecycleScope.launch {
-            app.talk.collect { if (it.canArmWakePhrase) wake.requestArm("idle") else wake.onTalkBusy() }
+            app.talk.collect {
+                if (it.canArmWakePhrase) {
+                    wake.requestArm("idle")
+                } else if (captures.activeId == null) {
+                    cancelHandoff()
+                    wake.onTalkBusy()
+                }
+            }
         }
         lifecycleScope.launch {
-            app.settings.collect { if (it.wakePhraseEnabled) wake.requestArm("settings") else wake.onOptOut() }
+            app.settings.collect {
+                if (it.wakePhraseEnabled) {
+                    wake.requestArm("settings")
+                } else {
+                    cancelHandoff()
+                    wake.onOptOut()
+                }
+            }
         }
     }
 
@@ -124,10 +183,19 @@ class WatchActivity : ComponentActivity() {
         if (app.reader.value.sessions.status == LoadStatus.IDLE) app.loadSessions()
         if (app.reader.value.selectedSessionId != null) app.refreshSelected()
         if (!hasMic()) micPermission.launch(Manifest.permission.RECORD_AUDIO)
+        if (qaWakeHandoffPending) {
+            qaWakeHandoffPending = false
+            // Posted: lifecycle observers (the wake window's new generation) run after onResume returns.
+            window.decorView.post {
+                Log.i(TAG, "qa wake handoff fixture contract=SECOND_UTTERANCE gen=${wake.generation} (recorder path only, not recognition)")
+                onWakeHandoff(wake.generation, WakeOutcome.Handoff(WakeHandoff.SECOND_UTTERANCE, ""))
+            }
+        }
     }
 
     override fun onPause() {
-        capture?.let { finishCapture(send = false, reason = "Cancelled", endReason = "lifecycle") }
+        cancelHandoff()
+        captures.activeId?.let { end(it, CaptureStop.LIFECYCLE) }
         super.onPause()
     }
 
@@ -161,96 +229,104 @@ class WatchActivity : ComponentActivity() {
     }
 
     private fun onTalkPressed() {
-        if (capture != null) {
-            finishCapture(send = true, reason = "", endReason = "tap_send")
+        captures.activeId?.let {
+            end(it, CaptureStop.TAP_SEND)
             return
         }
         if (!hasMic()) {
             micPermission.launch(Manifest.permission.RECORD_AUDIO)
             return
         }
+        cancelHandoff()
         wake.onTalkBusy()
         startCapture(TurnTrigger.PUSH_TO_TALK)
     }
 
     // ── capture ──────────────────────────────────────────────────────────────────────────────
 
+    /**
+     * Starts the app's recorder. There is no duration limit: push-to-talk ends when the user taps
+     * (or on a lifecycle, microphone or storage failure), a wake-phrase request on trailing silence.
+     */
     private fun startCapture(trigger: TurnTrigger) {
         val turnId = app.newTurn(trigger) ?: return
+        if (!captures.begin(turnId, trigger)) return
         val wakeRequest = trigger == TurnTrigger.WAKE_PHRASE
-        val started = WatchCapture(turnId, trigger, WatchCapture.limitFor(trigger, app.settings.value.maxTurnSeconds),
-            if (wakeRequest) SilenceEndpoint() else null, object : WatchCapture.Listener {
+        val started = WatchCapture(turnId, trigger, WatchCapture.FRAME_BOUND_PCM_BYTES, if (wakeRequest) SilenceEndpoint() else null,
+            object : WatchCapture.Listener {
                 override fun onLive() = runOnUiThread {
-                    if (capture?.turnId != turnId) return@runOnUiThread
                     Log.i(TAG, "capture live turn=${turnId.take(12)} trigger=$trigger")
-                    // Push-to-talk records from the first real audio; a wake request cues after calibration.
-                    if (!wakeRequest) app.onRecordingStarted(turnId)
+                    captures.onLive(turnId)
                 }
 
                 override fun onCalibrated() = runOnUiThread {
-                    if (capture?.turnId != turnId) return@runOnUiThread
                     Log.i(TAG, "capture calibrated turn=${turnId.take(12)} (speak-now cue)")
-                    app.cue("Speak now…")
-                    app.onRecordingStarted(turnId)
+                    captures.onCalibrated(turnId)
                 }
 
                 override fun onEnd(reason: CaptureEnd) = runOnUiThread {
-                    if (capture?.turnId != turnId) return@runOnUiThread
-                    when (reason) {
-                        CaptureEnd.NO_SPEECH -> finishCapture(send = false, reason = "Didn't hear a request", endReason = "no_speech_timeout")
-                        CaptureEnd.MIC_ERROR -> finishCapture(send = false, reason = "Microphone unavailable", endReason = "mic_read_error")
-                        CaptureEnd.SILENCE -> finishCapture(send = true, reason = "", endReason = "adaptive_silence")
-                        CaptureEnd.LIMIT -> finishCapture(send = true, reason = "", endReason = "size_limit")
-                    }
+                    end(turnId, when (reason) {
+                        CaptureEnd.SILENCE -> CaptureStop.SILENCE
+                        CaptureEnd.NO_SPEECH -> CaptureStop.NO_SPEECH
+                        CaptureEnd.LIMIT -> CaptureStop.SIZE_LIMIT
+                        CaptureEnd.MIC_ERROR -> CaptureStop.MIC_ERROR
+                    })
                 }
             })
-        capture = started
+        recorder = started
         if (!started.start()) {
-            capture = null
             Log.w(TAG, "capture start failed turn=${turnId.take(12)} trigger=$trigger")
-            app.discard("Microphone unavailable")
+            end(turnId, CaptureStop.START_FAILED)
             return
         }
         if (wakeRequest) app.cue("Get ready…")
         updateKeepScreenOn()
     }
 
-    private fun finishCapture(send: Boolean, reason: String, endReason: String) {
-        val active = capture ?: return
-        capture = null
-        val wav = active.stop()
-        val stats = active.stats()
-        // Aggregates only (no audio): proves whether the microphone delivered real, non-silent PCM.
-        Log.i(TAG, "watch mic captured turn=${active.turnId.take(12)} trigger=${active.trigger} end=$endReason " +
-            "pcm_bytes=${stats.pcmBytes} peak=${stats.peak} rms=${stats.rms} speech=${stats.speech} send=${send && wav != null}")
-        app.onRecordingEnded(active.turnId, endReason)
-        if (send && wav != null) app.upload(active.turnId, active.trigger, wav) else app.discard(reason.ifBlank { "Too short" })
-        updateKeepScreenOn()
+    /** Ends [captureId] exactly once, whoever asks first (see [CaptureCoordinator]). */
+    private fun end(captureId: String, reason: CaptureStop) {
+        lastStop = reason
+        captures.stop(captureId, reason)
     }
 
     // ── wake phrase ──────────────────────────────────────────────────────────────────────────
 
-    private fun onWakeHandoff(handoff: WakeOutcome.Handoff) {
+    private fun onWakeHandoff(generation: Long, handoff: WakeOutcome.Handoff) {
         when (handoff.contract) {
             WakeHandoff.RECOGNIZED_REQUEST -> {
-                // The recognizer already heard the request with the wake phrase: send it, don't ask again.
+                // The recognizer's FINAL result had the request after a leading wake phrase: send it whole.
                 val turnId = app.newTurn(TurnTrigger.WAKE_PHRASE) ?: return
-                app.uploadRecognized(turnId, handoff.request)
+                captures.sendRecognized(turnId, handoff.request)
             }
             WakeHandoff.SECOND_UTTERANCE -> {
-                if (!hasMic() || capture != null) return
-                // Give the recognizer's microphone a moment to be released before our recorder opens it.
-                window.decorView.postDelayed({
-                    if (capture == null && lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) {
-                        startCapture(TurnTrigger.WAKE_PHRASE)
-                    }
-                }, MIC_HANDOFF_MS)
+                if (!hasMic() || captures.activeId != null) return
+                // Give the recognizer's microphone a moment to be released before our recorder opens it;
+                // pausing, opting out or getting busy meanwhile cancels this, and so does a newer generation.
+                window.decorView.removeCallbacks(handoffRunnable)
+                handoffGeneration = generation
+                handoffGate.schedule(generation)
+                window.decorView.postDelayed(handoffRunnable, MIC_HANDOFF_MS)
             }
         }
     }
 
+    private fun onWakeClosed(reason: String) {
+        val notice = when (reason) {
+            "unfinished_request" -> "Didn't catch that. Tap or say it again"
+            "request_too_long" -> "That was too long for the watch. Use the phone"
+            "unavailable" -> "Wake phrase unavailable on this watch"
+            else -> return
+        }
+        app.notice(notice)
+    }
+
+    private fun cancelHandoff() {
+        handoffGate.cancel()
+        window.decorView.removeCallbacks(handoffRunnable)
+    }
+
     private fun updateKeepScreenOn() {
-        if (capture != null || wakeListening.value) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (recorder != null || wakeListening.value) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 
@@ -277,14 +353,14 @@ class WatchActivity : ComponentActivity() {
         intent.putExtra(QA_HANDLED, true)
         setIntent(intent)
         if (!QaLaunchGuard.shouldHandle(restored, fromHistory, handled)) return
-        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0 || capture != null) return
+        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0 || captures.activeId != null) return
         if (seed > 0) {
             app.seedReaderForQa(seed.coerceAtMost(40), intent.getLongExtra(QA_SEED_NEWEST, seed.toLong()))
             return
         }
         if (handoff == "second_utterance") {
-            Log.i(TAG, "qa wake handoff fixture contract=SECOND_UTTERANCE")
-            onWakeHandoff(WakeOutcome.Handoff(WakeHandoff.SECOND_UTTERANCE, ""))
+            // Runs from onResume, in the visible generation, like a recognizer match would.
+            qaWakeHandoffPending = true
             return
         }
         val file = QaAudio.resolve(File(filesDir, QaAudio.DIR), wav) ?: return

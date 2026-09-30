@@ -45,6 +45,8 @@ class WakeContractTest {
         assertFalse(legacy.wakePhraseEnabled)
         assertEquals("루미 hey*", legacy.wakePatterns)
         assertEquals(0L, legacy.revision)
+        // A legacy Watch recording cap is ignored: Watch recordings have no total duration limit.
+        assertFalse(legacy.toJson().contains("max_turn_seconds"))
     }
 
     @Test
@@ -60,6 +62,18 @@ class WakeContractTest {
     }
 
     @Test
+    fun `only a leading wake phrase counts, with at most one short greeting before it`() {
+        assertEquals("내일 일정 알려줘", WakePhrasePatterns.leadingRequest(defaults, "루미야 내일 일정 알려줘"))
+        assertEquals("날씨 어때?", WakePhrasePatterns.leadingRequest(defaults, "안녕, 루미! 날씨 어때?"))
+        assertEquals("what's next", WakePhrasePatterns.leadingRequest("hermes", "Hey Hermes, what's next"))
+        assertEquals("", WakePhrasePatterns.leadingRequest(defaults, "루미야."))
+        for (ambient in listOf("I told hermes about the budget", "그래서 루미가 그랬대", "안녕 반가워 루미야 불 꺼", "hey there hermes stop")) {
+            assertNull(ambient, WakePhrasePatterns.leadingRequest("hermes 루미 루미야 루미가", ambient))
+        }
+        assertNull(WakePhrasePatterns.leadingRequest(defaults, "루미네이트 해줘"))
+    }
+
+    @Test
     fun `phrase-only final hands off to a second utterance after the ready cue`() {
         val session = WakeSession()
         session.open(generation = 1, nowMs = 0)
@@ -70,51 +84,89 @@ class WakeContractTest {
     }
 
     @Test
-    fun `a request spoken in the same breath is carried as the recognized request, never dropped`() {
-        val session = WakeSession()
-        session.open(generation = 2, nowMs = 0)
-        assertEquals(WakeOutcome.None, session.onResults(2, listOf("루미야 내일"), final = false, nowMs = 1_000, patterns = defaults))
-        // The recognizer's own endpoint arrives after the 5 s arm window; the matched turn has a grace period.
-        val outcome = session.onResults(2, listOf("루미야 내일 일정 알려줘"), final = true, nowMs = 6_500, patterns = defaults)
-        assertEquals(WakeOutcome.Handoff(WakeHandoff.RECOGNIZED_REQUEST, "내일 일정 알려줘"), outcome)
+    fun `only the final hypothesis of a same-breath request is sent, however long the speech continues`() {
+        for (seconds in listOf(30, 60, 120)) {
+            val session = WakeSession().apply { open(2, 0) }
+            val words = StringBuilder("루미야")
+            var t = 300L
+            while (t < seconds * 1_000L) {
+                words.append(" 말").append(t / 500)
+                assertEquals("$seconds s partial at $t", WakeOutcome.None,
+                    session.onResults(2, listOf(words.toString()), final = false, nowMs = t, patterns = defaults))
+                assertEquals(WakeOutcome.None, session.onDeadline(2, nowMs = t + 100))
+                t += 500
+            }
+            val final = session.onResults(2, listOf(words.toString()), final = true, nowMs = t + 700, patterns = defaults)
+            assertEquals(WakeOutcome.Handoff(WakeHandoff.RECOGNIZED_REQUEST, words.removePrefix("루미야 ").toString()), final)
+        }
     }
 
     @Test
-    fun `a matched partial is not lost when the recognizer errors or the grace deadline passes`() {
+    fun `an unfinished request is never sent when the recognizer errors or goes quiet`() {
         val errored = WakeSession().apply { open(3, 0) }
         errored.onResults(3, listOf("루미야 불 꺼"), final = false, nowMs = 500, patterns = defaults)
-        assertEquals(WakeOutcome.Handoff(WakeHandoff.RECOGNIZED_REQUEST, "불 꺼"), errored.onError(3, 7))
+        assertEquals(WakeOutcome.Closed("unfinished_request"), errored.onError(3, 2))
 
-        val timedOut = WakeSession().apply { open(4, 0) }
-        timedOut.onResults(4, listOf("루미"), final = false, nowMs = 500, patterns = defaults)
-        assertEquals(WakeOutcome.None, timedOut.onDeadline(4, nowMs = 5_000))
-        assertEquals(WakeOutcome.Handoff(WakeHandoff.SECOND_UTTERANCE, ""), timedOut.onDeadline(4, nowMs = 500 + WakeContract.FINAL_GRACE_MS))
+        val quiet = WakeSession().apply { open(4, 0) }
+        quiet.onResults(4, listOf("루미야 문 열어"), final = false, nowMs = 500, patterns = defaults)
+        assertEquals(WakeOutcome.None, quiet.onDeadline(4, nowMs = 500 + WakeContract.PENDING_INACTIVITY_MS - 1))
+        assertEquals(WakeOutcome.Closed("unfinished_request"), quiet.onDeadline(4, nowMs = 500 + WakeContract.PENDING_INACTIVITY_MS))
+
+        val late = WakeSession().apply { open(5, 0) }
+        late.onResults(5, listOf("루미야 문 열어"), final = false, nowMs = 500, patterns = defaults)
+        assertEquals("a final after the recognizer went quiet is not trusted", WakeOutcome.Closed("unfinished_request"),
+            late.onResults(5, listOf("루미야 문 열어 줘"), final = true, nowMs = 500 + WakeContract.PENDING_INACTIVITY_MS + 1, patterns = defaults))
+    }
+
+    @Test
+    fun `a phrase-only partial still cues a second utterance when the recognizer stops`() {
+        val timedOut = WakeSession().apply { open(6, 0) }
+        timedOut.onResults(6, listOf("루미"), final = false, nowMs = 500, patterns = defaults)
+        assertEquals(WakeOutcome.None, timedOut.onDeadline(6, nowMs = 5_000))
+        assertEquals(WakeOutcome.Handoff(WakeHandoff.SECOND_UTTERANCE, ""), timedOut.onDeadline(6, nowMs = 500 + WakeContract.PENDING_INACTIVITY_MS))
+        val errored = WakeSession().apply { open(7, 0) }
+        errored.onResults(7, listOf("루미야"), final = false, nowMs = 500, patterns = defaults)
+        assertEquals(WakeOutcome.Handoff(WakeHandoff.SECOND_UTTERANCE, ""), errored.onError(7, 7))
+    }
+
+    @Test
+    fun `an ambient mention or a revised final is not a request`() {
+        val ambient = WakeSession().apply { open(8, 0) }
+        assertEquals(WakeOutcome.None, ambient.onResults(8, listOf("I told hermes"), final = false, nowMs = 300, patterns = "hermes"))
+        assertEquals(WakeOutcome.Closed("not_matched"),
+            ambient.onResults(8, listOf("I told hermes about the budget"), final = true, nowMs = 900, patterns = "hermes"))
+        val revised = WakeSession().apply { open(9, 0) }
+        revised.onResults(9, listOf("루미야 불"), final = false, nowMs = 300, patterns = defaults)
+        assertEquals(WakeOutcome.Closed("not_matched"), revised.onResults(9, listOf("누구야 불 꺼"), final = true, nowMs = 900, patterns = defaults))
     }
 
     @Test
     fun `no match, timeouts, stale generations and late results close without a handoff`() {
-        val miss = WakeSession().apply { open(5, 0) }
-        assertEquals(WakeOutcome.Closed("not_matched"), miss.onResults(5, listOf("안녕하세요"), final = true, nowMs = 800, patterns = defaults))
+        val miss = WakeSession().apply { open(10, 0) }
+        assertEquals(WakeOutcome.Closed("not_matched"), miss.onResults(10, listOf("안녕하세요"), final = true, nowMs = 800, patterns = defaults))
 
-        val quiet = WakeSession().apply { open(6, 0) }
-        assertEquals(WakeOutcome.None, quiet.onDeadline(6, nowMs = 4_999))
-        assertEquals(WakeOutcome.Closed("timeout"), quiet.onDeadline(6, nowMs = WakeContract.WINDOW_MS))
+        val quiet = WakeSession().apply { open(11, 0) }
+        assertEquals(WakeOutcome.None, quiet.onDeadline(11, nowMs = 4_999))
+        assertEquals(WakeOutcome.Closed("timeout"), quiet.onDeadline(11, nowMs = WakeContract.WINDOW_MS))
 
-        val stale = WakeSession().apply { open(7, 0) }
-        assertEquals(WakeOutcome.None, stale.onResults(6, listOf("루미"), final = true, nowMs = 100, patterns = defaults))
+        val stale = WakeSession().apply { open(12, 0) }
+        assertEquals(WakeOutcome.None, stale.onResults(11, listOf("루미"), final = true, nowMs = 100, patterns = defaults))
         assertEquals(WakeOutcome.Closed("screen_off"), stale.cancel("screen_off"))
-        assertEquals(WakeOutcome.None, stale.onResults(7, listOf("루미"), final = true, nowMs = 200, patterns = defaults))
+        assertEquals(WakeOutcome.None, stale.onResults(12, listOf("루미"), final = true, nowMs = 200, patterns = defaults))
 
-        val late = WakeSession().apply { open(8, 0) }
-        assertEquals(WakeOutcome.Closed("deadline"), late.onResults(8, listOf("루미야"), final = true, nowMs = WakeContract.WINDOW_MS + 1, patterns = defaults))
+        val late = WakeSession().apply { open(13, 0) }
+        assertEquals(WakeOutcome.Closed("deadline"), late.onResults(13, listOf("루미야"), final = true, nowMs = WakeContract.WINDOW_MS + 1, patterns = defaults))
     }
 
     @Test
-    fun `recognized requests are bounded`() {
-        val session = WakeSession().apply { open(9, 0) }
-        val outcome = session.onResults(9, listOf("루미 " + "가".repeat(5_000)), final = true, nowMs = 10, patterns = defaults)
-        val handoff = outcome as WakeOutcome.Handoff
-        assertEquals(WakeContract.MAX_REQUEST_CHARS, handoff.request.length)
+    fun `an over-long recognized request is refused explicitly, never truncated`() {
+        val session = WakeSession().apply { open(14, 0) }
+        val outcome = session.onResults(14, listOf("루미 " + "가".repeat(WakeContract.MAX_REQUEST_CHARS + 1)), final = true, nowMs = 10,
+            patterns = defaults)
+        assertEquals(WakeOutcome.Closed("request_too_long"), outcome)
+        val fits = WakeSession().apply { open(15, 0) }
+        val ok = fits.onResults(15, listOf("루미 " + "가".repeat(WakeContract.MAX_REQUEST_CHARS)), final = true, nowMs = 10, patterns = defaults)
+        assertEquals(WakeContract.MAX_REQUEST_CHARS, (ok as WakeOutcome.Handoff).request.length)
     }
 
     @Test
@@ -134,5 +186,6 @@ class WakeContractTest {
         assertNull("unknown reachability does not block", WakeArmGate.block(ok.copy(phoneReachable = null)))
         assertEquals(WakeBlock.COOLDOWN, WakeArmGate.block(ok.copy(cooldownUntilMs = 10_001)))
         assertEquals(WakeBlock.ALREADY_ARMED, WakeArmGate.block(ok.copy(lastArmedGeneration = 3)))
+        assertFalse(WakeBlock.values().any { it.name.contains("DURATION") })
     }
 }

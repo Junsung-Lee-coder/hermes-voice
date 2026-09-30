@@ -16,7 +16,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import kotlin.math.sqrt
 
-/** Why a capture stopped on its own (a user tap or lifecycle stop is decided by the caller). */
+/** Why a capture stopped on its own (a user tap or lifecycle stop is decided by the caller). There is no duration limit. */
 enum class CaptureEnd { SILENCE, NO_SPEECH, LIMIT, MIC_ERROR }
 
 /** Privacy-safe aggregates of what the microphone delivered: no audio or text. */
@@ -32,7 +32,7 @@ data class CaptureStats(val pcmBytes: Int, val peak: Int, val rms: Int, val spee
  *   wake-phrase request.
  * - [Listener.onEnd]: trailing silence, no speech, the size bound, or a microphone failure.
  *
- * Wake-phrase captures have no duration cap: [limitBytes] is only the Data Layer frame bound.
+ * No capture has a duration cap: [limitBytes] is only the Data Layer frame bound (a storage limit).
  */
 class WatchCapture(
     val turnId: String,
@@ -154,11 +154,7 @@ class WatchCapture(
         const val FRAME_BYTES = 3_200
         private const val READ_RETRY_MS = 20L
 
-        /** The largest WAV one Data Layer turn frame can carry (about 13 minutes). */
+        /** The largest WAV one Data Layer turn frame can carry (about 13 minutes): a storage bound, not a time limit. */
         const val FRAME_BOUND_PCM_BYTES: Long = LinkFrame.MAX_PAYLOAD_BYTES - 44L
-
-        fun limitFor(trigger: TurnTrigger, pushToTalkSeconds: Int): Long =
-            if (trigger == TurnTrigger.WAKE_PHRASE) FRAME_BOUND_PCM_BYTES
-            else minOf(FRAME_BOUND_PCM_BYTES, SAMPLE_RATE * 2L * pushToTalkSeconds)
     }
 }

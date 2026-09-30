@@ -7,9 +7,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Source gates for Android wiring the JVM suite cannot execute: they fail if a platform behavior
- * regresses to an easy wrong shape (a no-op gesture, a haptic on button intent, a service-scoped
- * context in app-scoped work). Runtime behavior is verified separately on devices/emulators.
+ * Secondary source gates: the behaviour itself is tested on the pure cores the Android adapters
+ * delegate to (see WatchAdaptersTest). These only check that the adapters still delegate there and
+ * keep platform wiring the JVM cannot run (theme flags, manifest, focus order, contexts).
  */
 class AndroidWiringGateTest {
     private val root: File = generateSequence(File(System.getProperty("user.dir")).absoluteFile) { it.parentFile }
@@ -36,7 +36,7 @@ class AndroidWiringGateTest {
         val ui = source("$watch/ReaderUi.kt")
         assertEquals(2, Regex("\\.rotaryScroll\\(listState, focusRequester, onScrollStep\\)").findAll(ui).count())
         assertTrue(ui.contains("onRotaryScrollEvent"))
-        assertTrue(ui.contains("haptics.shouldPulse(requested, consumed"))
+        assertTrue(ui.contains("driver.offer(event.verticalScrollPixels)") && ui.contains("driver.drain("))
         assertTrue("focus sits on the list, not around buttons", ui.contains("}.focusRequester(focusRequester).focusable()"))
         val activity = source("$watch/WatchActivity.kt")
         assertTrue(activity.contains("sessionsFocus.requestFocus()") && activity.contains("chatFocus.requestFocus()"))
@@ -44,26 +44,26 @@ class AndroidWiringGateTest {
     }
 
     @Test
-    fun `recording haptics follow real microphone audio, never the button`() {
+    fun `the capture lifecycle and wake window delegate to the tested cores`() {
         val activity = source("$watch/WatchActivity.kt")
         val talkPressed = activity.substringAfter("private fun onTalkPressed()").substringBefore("// ── capture")
-        assertFalse(talkPressed.contains("haptic") || talkPressed.contains("onRecordingStarted"))
-        assertTrue(activity.substringAfter("override fun onLive()").substringBefore("override fun onCalibrated()")
-            .contains("if (!wakeRequest) app.onRecordingStarted(turnId)"))
-        assertTrue(activity.substringAfter("override fun onCalibrated()").substringBefore("override fun onEnd(")
-            .contains("app.onRecordingStarted(turnId)"))
-        assertTrue(activity.substringAfter("private fun finishCapture(").substringBefore("// ── wake phrase")
-            .contains("app.onRecordingEnded(active.turnId, endReason)"))
+        assertFalse("no haptic on button intent", talkPressed.contains("haptic"))
+        assertTrue(activity.contains("CaptureCoordinator(capturePort)"))
+        assertTrue(activity.substringAfter("override fun onLive()").substringBefore("override fun onCalibrated()").contains("captures.onLive(turnId)"))
+        assertTrue(activity.substringAfter("override fun onCalibrated()").substringBefore("override fun onEnd(").contains("captures.onCalibrated(turnId)"))
+        assertTrue(activity.substringAfter("override fun onPause()").substringBefore("super.onPause()").contains("CaptureStop.LIFECYCLE"))
+        assertTrue("handoff is cancellable and generation-bound",
+            activity.contains("handoffGate.claim(handoffGeneration, wake.generation") && activity.contains("removeCallbacks(handoffRunnable)"))
+        assertFalse("no duration cap", activity.contains("maxTurnSeconds") || source("$watch/WatchCapture.kt").contains("limitFor"))
         val capture = source("$watch/WatchCapture.kt")
         assertTrue("start is confirmed by the recorder state", capture.contains("recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING"))
         assertFalse("no buzz on phone stage updates or timers", source("$watch/WatchApp.kt").contains("fun buzz("))
     }
 
     @Test
-    fun `wake recognizer and recorder never share the microphone`() {
+    fun `wake recognizer adapter delegates to the window coordinator`() {
         val wake = source("$watch/WakeController.kt")
-        val beforeHandoff = wake.substringAfter("is WakeOutcome.Handoff -> {").substringBefore("onHandoff(outcome)")
-        assertTrue("the recognizer is released before the recorder is handed the microphone", beforeHandoff.contains("release()"))
+        assertTrue(wake.contains("WakeWindowCoordinator(recognizerPort, timerPort, hostPort"))
         assertFalse("receiver never touches the microphone", wake.substringAfter("override fun onReceive").substringBefore("override fun onStart")
             .contains("startListening"))
         assertFalse(wake.contains("EXTRA_PREFER_OFFLINE"))

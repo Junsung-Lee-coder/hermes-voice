@@ -53,8 +53,7 @@ import com.rumi.hermesvoice.core.watchlink.ReaderHistory
 import com.rumi.hermesvoice.core.watchlink.ReaderMessageRow
 import com.rumi.hermesvoice.core.watchlink.ReaderScrollPolicy
 import com.rumi.hermesvoice.core.watchlink.ReaderSessionsState
-import com.rumi.hermesvoice.core.watchlink.RotaryScrollAccumulator
-import com.rumi.hermesvoice.core.watchlink.ScrollHapticGate
+import com.rumi.hermesvoice.core.watchlink.RotaryScrollDriver
 import com.rumi.hermesvoice.core.watchlink.SwipeDirection
 import com.rumi.hermesvoice.core.watchlink.SwipeTracker
 import com.rumi.hermesvoice.core.watchlink.WatchPhase
@@ -89,28 +88,17 @@ fun Modifier.readerSwipe(onSwipe: (SwipeDirection) -> Unit): Modifier = pointerI
 }
 
 /**
- * Bezel/crown scrolling for one list: rotary events reach the focused list, are coalesced while a
- * scroll runs (nothing is lost), and give one short tick only when the list really moved.
+ * Bezel/crown scrolling for one list: rotary events reach the focused list and go through
+ * [RotaryScrollDriver], which coalesces them while a scroll runs (nothing is lost, and a cancelled
+ * scroll drops its leftovers) and asks for one short tick only when the list really moved.
  */
 @Composable
 fun Modifier.rotaryScroll(state: LazyListState, focusRequester: FocusRequester, onScrollStep: () -> Unit): Modifier {
     val scope = rememberCoroutineScope()
-    val accumulator = remember { RotaryScrollAccumulator() }
-    val haptics = remember { ScrollHapticGate() }
+    val driver = remember { RotaryScrollDriver() }
     return onRotaryScrollEvent { event ->
-        if (accumulator.add(event.verticalScrollPixels)) {
-            scope.launch {
-                try {
-                    while (true) {
-                        val requested = accumulator.drain()
-                        if (requested == 0f) break
-                        val consumed = state.scrollBy(requested)
-                        if (haptics.shouldPulse(requested, consumed, SystemClock.uptimeMillis())) onScrollStep()
-                    }
-                } finally {
-                    accumulator.finish()
-                }
-            }
+        if (driver.offer(event.verticalScrollPixels)) {
+            scope.launch { driver.drain({ px -> state.scrollBy(px) }, SystemClock::uptimeMillis, onScrollStep) }
         }
         true
     }.focusRequester(focusRequester).focusable()

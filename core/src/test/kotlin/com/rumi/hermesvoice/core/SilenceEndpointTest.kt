@@ -5,6 +5,7 @@ import com.rumi.hermesvoice.core.audio.MicReadGuard
 import com.rumi.hermesvoice.core.audio.SilenceEndpoint
 import kotlin.math.PI
 import kotlin.math.sin
+import kotlin.random.Random
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -28,6 +29,39 @@ class SilenceEndpointTest {
             if (decision != EndpointDecision.CONTINUE) return decision to index
         }
         return EndpointDecision.CONTINUE to -1
+    }
+
+    /** 100 ms of a voiced-like frame: varying pitch (110-320 Hz), a harmonic and a syllable envelope. */
+    private fun voiced(random: Random): ByteArray {
+        val out = ByteArray(3_200)
+        val f0 = 110.0 + random.nextDouble() * 210.0
+        val peak = 1_800 + random.nextInt(4_500)
+        for (n in 0 until 1_600) {
+            val envelope = 0.55 + 0.45 * sin(PI * n / 1_600.0)
+            val sample = (peak * envelope * (0.7 * sin(2 * PI * f0 * n / 16_000.0) + 0.3 * sin(4 * PI * f0 * n / 16_000.0))).toInt() +
+                random.nextInt(61) - 30
+            out[2 * n] = (sample and 0xff).toByte()
+            out[2 * n + 1] = ((sample shr 8) and 0xff).toByte()
+        }
+        return out
+    }
+
+    /**
+     * Speech-like cadence for [seconds]: voiced runs separated by short dips and phrase pauses
+     * (e.g. 300/100, 200/100 ms, and 400-800 ms gaps), always ending on a full voiced run.
+     */
+    private fun cadence(seconds: Int, pattern: List<Pair<Int, Int>>, seed: Int): List<ByteArray> {
+        val random = Random(seed)
+        val frames = ArrayList<ByteArray>()
+        var i = 0
+        while (frames.size < seconds * 10) {
+            val (on, off) = pattern[i++ % pattern.size]
+            repeat(on) { frames += voiced(random) }
+            if (frames.size < seconds * 10) repeat(off) { frames += frame(100) }
+        }
+        while (frames.isNotEmpty() && SilenceEndpoint.rms(frames.last()) < 1_000) frames.removeAt(frames.size - 1)
+        repeat(3) { frames += voiced(random) }
+        return frames
     }
 
     private fun quiet(n: Int) = generateSequence { frame(100) }.take(n)
@@ -76,11 +110,50 @@ class SilenceEndpointTest {
     }
 
     @Test
+    fun `modulated speech of 30, 60 and 120 seconds with short pauses is never cut and ends once`() {
+        val cadences = listOf(
+            listOf(3 to 1),
+            listOf(2 to 1),
+            listOf(15 to 4, 9 to 1, 20 to 8, 6 to 2, 12 to 6),
+        )
+        var seed = 1
+        for (seconds in listOf(30, 60, 120)) {
+            for (pattern in cadences) {
+                val speech = cadence(seconds, pattern, seed++)
+                val endpoint = SilenceEndpoint()
+                val (decision, index) = feed(endpoint, quiet(4) + speech.asSequence() + quiet(40))
+                assertEquals("$seconds s $pattern", EndpointDecision.END_OF_SPEECH, decision)
+                assertEquals("$seconds s $pattern ends 2 s after the last speech", 4 + speech.size + 19, index)
+                assertTrue(endpoint.speechDetected)
+            }
+        }
+    }
+
+    @Test
+    fun `speech with short dips from the first syllable is detected`() {
+        val random = Random(7)
+        val frames = quiet(4) + generateSequence { listOf(voiced(random), voiced(random), frame(100)) }.take(20).flatten() + quiet(30)
+        val endpoint = SilenceEndpoint()
+        val (decision, _) = feed(endpoint, frames)
+        assertEquals(EndpointDecision.END_OF_SPEECH, decision)
+        assertTrue(endpoint.speechDetected)
+    }
+
+    @Test
+    fun `isolated clicks never qualify as speech`() {
+        val sparse = quiet(4) + generateSequence { sequenceOf(frame(6_000)) + quiet(4) }.take(30).flatten()
+        assertEquals(EndpointDecision.NO_SPEECH, feed(SilenceEndpoint(), sparse).first)
+        val pairs = quiet(4) + generateSequence { sequenceOf(frame(6_000)) + quiet(3) + sequenceOf(frame(6_000)) + quiet(6) }.take(12).flatten()
+        assertEquals(EndpointDecision.NO_SPEECH, feed(SilenceEndpoint(), pairs).first)
+    }
+
+    @Test
     fun `short impulses in the pause do not reset silence, sustained renewed speech does`() {
         val clicks = quiet(4) + speech(20) + quiet(8) + speech(1) + quiet(8) + speech(1) + quiet(10)
         val (clickDecision, clickIndex) = feed(SilenceEndpoint(), clicks)
         assertEquals(EndpointDecision.END_OF_SPEECH, clickDecision)
-        assertEquals(4 + 20 + 19, clickIndex)
+        // Each click only pauses the silence count for its own 100 ms; it never prevents the endpoint.
+        assertEquals(4 + 20 + 21, clickIndex)
 
         val resumed = quiet(4) + speech(20) + quiet(15) + speech(5) + quiet(30)
         val (decision, index) = feed(SilenceEndpoint(), resumed)

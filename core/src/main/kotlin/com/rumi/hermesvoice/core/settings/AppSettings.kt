@@ -12,27 +12,23 @@ import org.json.JSONObject
 data class WatchSettings(
     val wakePhraseEnabled: Boolean = false,
     val wakePatterns: String = WakePhrasePatterns.DEFAULT_PATTERNS,
-    /** Push-to-talk recording limit. Wake-phrase requests have no duration cap (they end on silence). */
-    val maxTurnSeconds: Int = DEFAULT_MAX_TURN_SECONDS,
     val hapticsEnabled: Boolean = true,
     /** Phone wall-clock millis of the save; 0 for a legacy payload or a never-synced Watch. */
     val revision: Long = 0L,
 ) {
     fun toJson(): String = JSONObject().put("wake_phrase_enabled", wakePhraseEnabled).put("wake_patterns", wakePatterns)
-        .put("max_turn_seconds", maxTurnSeconds).put("haptics_enabled", hapticsEnabled).put("revision", revision).toString()
+        .put("haptics_enabled", hapticsEnabled).put("revision", revision).toString()
 
     companion object {
-        const val DEFAULT_MAX_TURN_SECONDS = 60
-        const val MIN_TURN_SECONDS = 5
-        const val MAX_TURN_SECONDS = 300
-
-        /** Tolerant: unknown or out-of-range values fall back to safe defaults (wake phrase stays OFF). */
+        /**
+         * Tolerant: unknown or out-of-range values fall back to safe defaults (wake phrase stays OFF).
+         * A legacy `max_turn_seconds` is ignored: Watch recordings have no total duration limit.
+         */
         fun fromJson(raw: String?): WatchSettings {
             val json = runCatching { JSONObject(raw.orEmpty()) }.getOrNull() ?: return WatchSettings()
             return WatchSettings(
                 wakePhraseEnabled = json.optBoolean("wake_phrase_enabled", false),
                 wakePatterns = WakePhrasePatterns.normalize(json.optString("wake_patterns")),
-                maxTurnSeconds = json.optInt("max_turn_seconds", DEFAULT_MAX_TURN_SECONDS).coerceIn(MIN_TURN_SECONDS, MAX_TURN_SECONDS),
                 hapticsEnabled = json.optBoolean("haptics_enabled", true),
                 revision = json.optLong("revision", 0L).coerceAtLeast(0L),
             )
@@ -78,11 +74,6 @@ class AppSettings(private val store: KeyValueStore) {
         get() = WakePhrasePatterns.normalize(store.getString(KEY_WATCH_WAKE_PATTERNS))
         set(value) = store.putString(KEY_WATCH_WAKE_PATTERNS, WakePhrasePatterns.normalize(value))
 
-    var watchMaxTurnSeconds: Int
-        get() = store.getInt(KEY_WATCH_MAX_TURN, WatchSettings.DEFAULT_MAX_TURN_SECONDS)
-            .coerceIn(WatchSettings.MIN_TURN_SECONDS, WatchSettings.MAX_TURN_SECONDS)
-        set(value) = store.putInt(KEY_WATCH_MAX_TURN, value.coerceIn(WatchSettings.MIN_TURN_SECONDS, WatchSettings.MAX_TURN_SECONDS))
-
     var watchHapticsEnabled: Boolean
         get() = store.getBoolean(KEY_WATCH_HAPTICS, true)
         set(value) = store.putBoolean(KEY_WATCH_HAPTICS, value)
@@ -96,7 +87,6 @@ class AppSettings(private val store: KeyValueStore) {
     fun saveWatchSettings(settings: WatchSettings, nowMs: Long = System.currentTimeMillis()): WatchSettings {
         watchWakePhraseEnabled = settings.wakePhraseEnabled
         watchWakePatterns = settings.wakePatterns
-        watchMaxTurnSeconds = settings.maxTurnSeconds
         watchHapticsEnabled = settings.hapticsEnabled
         store.putString(KEY_WATCH_REVISION, maxOf(nowMs, watchSettingsRevision + 1).toString())
         return watchSettings()
@@ -110,7 +100,7 @@ class AppSettings(private val store: KeyValueStore) {
     fun playback(): ResponsePlaybackSettings = ResponsePlaybackSettings(playFirstResponse, playMiddleResponses)
 
     fun watchSettings(): WatchSettings =
-        WatchSettings(watchWakePhraseEnabled, watchWakePatterns, watchMaxTurnSeconds, watchHapticsEnabled, watchSettingsRevision)
+        WatchSettings(watchWakePhraseEnabled, watchWakePatterns, watchHapticsEnabled, watchSettingsRevision)
 
     companion object {
         const val PREFERENCES_NAME = "hermes_voice_settings"
@@ -120,7 +110,6 @@ class AppSettings(private val store: KeyValueStore) {
         const val KEY_PLAY_MIDDLE = "play_middle_responses"
         const val KEY_WATCH_WAKE = "watch_wake_phrase_enabled"
         const val KEY_WATCH_WAKE_PATTERNS = "watch_wake_patterns"
-        const val KEY_WATCH_MAX_TURN = "watch_max_turn_seconds"
         const val KEY_WATCH_HAPTICS = "watch_haptics_enabled"
         const val KEY_WATCH_REVISION = "watch_settings_revision"
         const val KEY_THEME_MODE = "theme_mode"
@@ -172,6 +161,28 @@ object WakePhrasePatterns {
         val wake = tokens.firstOrNull { token -> patterns.any { globMatches(it, token.value.lowercase()) } } ?: return null
         return recognizedText.substring(wake.range.last + 1).trimStart { !it.isLetterOrDigit() }.trimEnd()
     }
+
+    /**
+     * The request after a wake phrase that LEADS [recognizedText]: the first word, or the second
+     * after one short greeting from [LEADING_GREETINGS] ("hey Hermes, …", "안녕, 루미! …"). Null for
+     * no leading wake phrase, e.g. an ambient mention in the middle of a sentence; "" when nothing
+     * follows it.
+     */
+    fun leadingRequest(configuredPatterns: String?, recognizedText: String): String? {
+        val patterns = normalize(configuredPatterns).split(' ').map { it.lowercase() }
+        for (stream in listOf(RAW_TOKEN, LEXICAL_TOKEN)) {
+            val tokens = stream.findAll(recognizedText).take(2).toList()
+            val first = tokens.getOrNull(0) ?: continue
+            val greeting = LEXICAL_TOKEN.find(first.value)?.value?.lowercase() in LEADING_GREETINGS
+            val wake = listOfNotNull(first, tokens.getOrNull(1)?.takeIf { greeting })
+                .firstOrNull { token -> patterns.any { globMatches(it, token.value.lowercase()) } } ?: continue
+            return recognizedText.substring(wake.range.last + 1).trimStart { !it.isLetterOrDigit() }.trimEnd()
+        }
+        return null
+    }
+
+    /** The only words allowed before a leading wake phrase. */
+    val LEADING_GREETINGS: Set<String> = setOf("hey", "hi", "hello", "ok", "okay", "안녕", "저기")
 
     private val RAW_TOKEN = Regex("[^\\s]+")
     private val LEXICAL_TOKEN = Regex("[\\p{L}\\p{N}]+")

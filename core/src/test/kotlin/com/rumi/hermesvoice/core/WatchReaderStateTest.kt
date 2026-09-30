@@ -133,6 +133,8 @@ class WatchReaderStateTest {
         assertNull(state.historyFor("gone"))
         assertNull(state.selectedSessionId)
         assertEquals(ReaderSurface.SESSIONS, state.surface)
+        assertTrue("the browser must reload so the gone entry disappears", state.sessions.stale)
+        assertFalse(state.requestSessions("req-n2").sessions.stale)
     }
 
     @Test

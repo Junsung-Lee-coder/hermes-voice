@@ -229,6 +229,8 @@ data class ReaderSessionsState(
     val status: LoadStatus = LoadStatus.IDLE,
     val error: String? = null,
     val pendingReqId: String? = null,
+    /** A listed conversation turned out not to be available: the list must be reloaded. */
+    val stale: Boolean = false,
 )
 
 /** Cached history of one conversation, oldest first, de-duplicated by row id. */
@@ -269,7 +271,7 @@ data class WatchReaderState(
     fun showSurface(target: ReaderSurface): WatchReaderState = copy(surface = target)
 
     fun requestSessions(reqId: String): WatchReaderState =
-        copy(sessions = sessions.copy(status = LoadStatus.LOADING, error = null, pendingReqId = reqId))
+        copy(sessions = sessions.copy(status = LoadStatus.LOADING, error = null, pendingReqId = reqId, stale = false))
 
     /** Opens [sessionId] in chat and asks for its latest page. */
     fun select(sessionId: String, reqId: String): WatchReaderState {
@@ -310,7 +312,7 @@ data class WatchReaderState(
                 history == null || response.sessionId != selectedSessionId -> this
                 response.ok -> putHistory(merge(history, response))
                 response.error == ReaderError.NOT_OWNED -> copy(selectedSessionId = null, surface = ReaderSurface.SESSIONS,
-                    histories = histories.filterNot { it.sessionId == history.sessionId })
+                    histories = histories.filterNot { it.sessionId == history.sessionId }, sessions = sessions.copy(stale = true))
                 else -> putHistory(history.copy(status = LoadStatus.ERROR, error = response.error, pendingReqId = null, loadingOlder = false))
             }
         }

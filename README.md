@@ -147,9 +147,12 @@ each, which keeps base64 frames under the 16 MiB WebSocket frame limit of older 
 
 The flow is the same whether a turn starts on the Phone or the Watch:
 
-1. **Record a WAV.** On the Phone, the Talk button toggles recording. On the Watch, use
-   push-to-talk or the optional [wake phrase](#watch-wake-phrase). The Watch sends the recording
-   to the Phone over the Data Layer (`/hv/v1/turn/<id>`).
+1. **Record a WAV.** On the Phone, the Talk button toggles recording; the Phone recorder keeps at
+   most the first 2 minutes of a recording (a Phone-only limit). On the Watch, use push-to-talk,
+   which records until you tap Send with no time limit, or the optional
+   [wake phrase](#watch-wake-phrase). The Watch sends the recording to the Phone over the Data
+   Layer (`/hv/v1/turn/<id>`). One Data Layer frame holds about 13 minutes of audio; a longer Watch
+   recording is not sent, and the Watch says so.
 2. **Transcribe.** The Phone calls `POST /api/audio/transcribe`. If no speech is detected, the turn
    ends without routing or delivering anything. A wake-phrase request the Watch's recognizer
    already heard arrives as text instead and skips this step; it is treated exactly like a
@@ -214,9 +217,10 @@ The Watch shows the app's conversations without ever calling Hermes itself:
   never changes where voice replies play or which conversation a voice turn goes to.
 - **Bounds:** at most 24 conversations, 20 messages per page and 60 KB per response (long texts are
   shortened, marked "more on phone"). The Watch caches 4 conversations and 200 messages each.
-- **Haptics:** a 10 ms tick per bezel step that actually scrolled (nothing at the ends), a 50 ms
-  pulse when the microphone really starts delivering audio, and a 2 × 30 ms pulse when recording
-  ends for any reason. The Phone's Watch **Haptics** setting turns them all off.
+- **Haptics:** a 10 ms tick per bezel step that actually scrolled (nothing at the ends), a 50 ms pulse when the microphone really
+  starts delivering audio, and a 2 × 30 ms pulse once when recording ends for any reason (also when
+  a wake-phrase request heard by the recognizer is sent). The Phone's Watch **Haptics** setting
+  turns them all off.
 
 ## Watch wake phrase
 
@@ -231,17 +235,21 @@ screen turns back on with the app shown, the platform `SpeechRecognizer` listens
 Phone, playing audio, or for 4 seconds after playback. The recognizer and the app's recorder never
 use the microphone at the same time.
 
-What happens after a match depends on how you say it:
+The wake phrase must come first: at the start of what you say, or right after one short greeting
+("hey", "hi", "hello", "ok", "okay", "안녕", "저기"). A mention in the middle of a sentence is
+ignored. What happens next depends on how you say it:
 
 - **Wake phrase, then pause:** the recognizer is released, the Watch's own recorder starts and
   measures the room, and a buzz means "speak now". The request ends after about 2 seconds of
-  silence. There is no time limit while you keep talking. If you don't start within 8 seconds,
-  nothing is sent.
-- **Wake phrase and request in one breath:** the recognizer has already heard the request, so its
-  text is sent as the request (it isn't dropped or re-asked).
+  silence; short pauses between words don't end it, and there is no time limit while you keep
+  talking. If you don't start within 8 seconds, nothing is sent.
+- **Wake phrase and request in one breath:** only the recognizer's **final** result is used, and
+  it's sent whole as the request. While you keep talking, the window stays open (it closes 8
+  seconds after the recognizer last heard something new). If the recognizer stops or fails before
+  a final result, nothing is sent and the Watch shows "Didn't catch that. Tap or say it again".
+  A request longer than 4,000 characters is refused, not cut.
 
-The recognized text is never logged; only counts and outcomes are. Push-to-talk keeps its own
-limit (Settings → Watch → Push-to-talk max seconds).
+The recognized text is never logged; only counts and outcomes are.
 
 ## Text chat and history
 
@@ -256,8 +264,7 @@ turn completes. Replies to text chat aren't spoken.
   responses** (off by default). There's deliberately no setting for the ack or the final reply.
   Settings also shows whether the Watch app is reachable.
 - **Watch settings** (edited on the Phone, synced as the `/hv/v1/settings` data item): wake phrase
-  on/off (off by default), the wake phrases, push-to-talk maximum length (5–300 seconds) and
-  haptics.
+  on/off (off by default), the wake phrases and haptics. There is no Watch recording time limit.
 - **Dark by default.** On the Phone, sign-in, lists, chat, Settings and dialogs follow the
   Appearance setting. The Watch is always dark and shows whether the Phone is reachable.
 - **Full-width Talk bar.** The Phone's Talk button is a full-width bar above the navigation bar,
@@ -275,11 +282,13 @@ non-debuggable builds ignore them.
 
 Only the following has been run:
 
-- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **148 JUnit tests**, all
+- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **165 JUnit tests**, all
   passing. They use an in-process fake dashboard and cover sign-in, session ownership, chat and
-  attachments, routing, playback routing, the Watch link and reader contracts, the wake contract,
-  silence endpointing (30, 60 and 120 seconds of continuous speech are not cut), haptic timing,
-  gesture arbitration, and source checks of the Android wiring.
+  attachments, routing, playback routing, the Watch link and reader contracts, the wake contract
+  (final-only, leading wake phrase, 30/60/120-second recognizer streams), silence endpointing
+  (30, 60 and 120 seconds of continuous and of speech-like audio with short pauses are not cut),
+  haptic timing, gesture arbitration, the Watch capture, wake-window, microphone-handoff and bezel
+  scrolling logic the Android adapters delegate to, and source checks of the Android wiring.
 - **Paired debug build:** `gradle :phone:assembleDebug :watch:assembleDebug` succeeded with
   Gradle 8.13 and JDK 17. Both APKs have the same package and are v2-signed by the same debug
   certificate.
@@ -287,10 +296,12 @@ Only the following has been run:
   microphone went through transcription, routing, the ack played on the Phone, delivery, and the
   final reply played on the Phone. The Phone was signed in to a local test dashboard.
 - **Watch emulator (Wear OS 5), not paired.** Push-to-talk captured real (non-silent) audio from the
-  emulator microphone, with one start and one end haptic. The wake-phrase recorder path (cue after
-  calibration, end on silence, bounded no-speech timeout) ran through the debug handoff. Swipes,
-  bezel scrolling with scroll haptics, follow-latest and scroll preservation ran with synthetic
-  reader rows. Leaving the app while recording cancelled it without sending.
+  emulator microphone for 75 seconds and stopped only when Send was tapped, with one start and one
+  end haptic. The wake-phrase recorder path ran through the debug handoff: 72 seconds of speech with
+  pauses of up to 0.8 seconds were recorded whole and ended once on trailing silence; with no speech
+  it gave up after the no-speech timeout without sending. Swipes, bezel scrolling with scroll
+  haptics, follow-latest and scroll preservation ran with synthetic reader rows. Leaving the app
+  while recording cancelled it without sending.
 
 **Never run:** Watch↔Phone Data Layer transfer (including the reader), playback on the Watch, the
 Watch `played` ACK, switching playback between devices, and wake-phrase recognition (the Watch
