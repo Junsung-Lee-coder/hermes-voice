@@ -490,6 +490,24 @@ Only the following has been run:
     recording one, both stopped the recording without sending it.
   - *Push-to-talk:* on both devices a recording with 6 seconds of silence after the speech was
     sent only on the tap; a silent Phone recording was refused before speech-to-text.
+  - *After the VAD review repair:* a 75-second request with a 2.5-second held "uhh" at speech
+    level in the middle (Watch and Phone), and one with a 4-second steady noise burst at speech
+    level (Watch), were recorded whole and ended 2.0 s after the speech; the earlier build cut
+    such requests and sent them truncated. Most of these runs used the build just before the last
+    two fixes, which did not touch the ending; the held-sound run was repeated on the last build. Speech that was already under way when the
+    recorder started was detected and sent complete. Push-to-talk speech about 4 dB above steady
+    noise was accepted and answered on both devices; the same noise alone was refused before
+    speech-to-text on both. Tapping Talk while the Phone's real recognizer was listening released
+    it first and the recording had normal audio.
+  - *Both, with simulated recognizers:* the recognizers were replaced by a debug fixture that
+    reports a result on each device (this tests arbitration, not recognition; the Watch emulator
+    has no recognizer). With the same one-breath request on both devices, in either order, one
+    device's request was accepted and answered there, and the other showed that the other device
+    answered and sent nothing. With the phrase alone, only the winner recorded, on the real
+    microphone, renewing its claim throughout (25 renewals over a 77-second request), and the
+    other never started its recorder. Watch push-to-talk in Both needed no claim. One earlier
+    build let the Watch give its claim back as its recorder started; the Phone then accepted only
+    one of the two recordings, and that defect is fixed and covered by a test.
   - *New conversations from the router:* starting with no conversations at all, a spoken request
     on the Phone led the real routing model to ask for a new conversation; the Phone created it,
     played the ack, delivered the transcript and played the reply, and the conversation appeared
