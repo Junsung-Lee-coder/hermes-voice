@@ -117,7 +117,10 @@ class PhoneApp : Application() {
         override fun onStage(turnId: String, stage: VoiceTurnStage) = log("stage turn=${turnId.take(12)} $stage")
 
         override fun onRouted(route: AssembledRoute) {
-            log("routed turn=${route.turnId.take(12)} alias=${route.destination.alias} created=${route.created}")
+            log("routed turn=${route.turnId.take(12)} alias=${route.destination.alias} created=${route.created}" +
+                // Debug builds only: the acknowledgement the Phone composed for a conversation it created
+                // (its title and alias; never the transcript or the router's sentence).
+                if (route.created && applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) " phone_ack=\"${route.ackText}\"" else "")
             // A conversation the router asked for now exists: lists on screen should show it.
             if (route.created) conversationsCreated.value += 1
         }
