@@ -420,10 +420,14 @@ Both devices end a hands-free request with the same voice-activity detector (VAD
     one level (the middle half of it within about 6 dB). It follows that level up within a third
     of a second and down slowly, so a room whose noise wanders isn't taken for speech at its
     louder moments.
-  - *Once you have spoken* it is what your speech sits on: the lower quarter of the last second,
-    the dips between words. It rises only to levels clearly below your voice (under about 45% of
-    its typical level), so soft words stay above it while a background that rose doesn't hold the
-    request open.
+  - *Once you have spoken* it holds. Speech is quiet for seconds at a time without being
+    background (soft words, the end of a sentence), so nothing heard in one second may raise it.
+    It rises only slowly, towards the quietest tenth of the last three seconds (the pauses and
+    the gaps between words), and only to levels clearly below your voice (under about 45% of its
+    typical level): a background that rose doesn't hold the request open for ever, and soft
+    speech isn't absorbed.
+  - Sound a little above the background (two to three times it) neither counts as your silence
+    nor as speech: it pauses the count. Only background counts towards the trailing silence.
   - If it started far too high (you spoke before the buzz, or a loud moment fell into the 0.4 s),
     it drops at once to the quiet between your words.
   - A steady sound about as loud as your speech is never taken for background once you have
@@ -437,15 +441,20 @@ Both devices end a hands-free request with the same voice-activity detector (VAD
     one open until it stops or you tap Send.
   - After you have spoken, steady noise that is about as loud as your speech was (in tests, from
     about half of its level) can't be told from a held voice, so the request stays open for a tap
-    rather than being cut. Quieter steady noise ends it 2–3.5 s after the speech.
+    rather than being cut. Quieter steady noise ends it 3–4 s after the speech.
   - Your voice has to stand clearly above the room. In tests with recorded speech mixed into
-    recordings of real rooms, no request was cut short with the speech 15 dB or more above the
-    room noise; at 10 dB about one in twenty was sent without its last words; at 6 dB about one
-    in four was, and one in five wasn't heard at all. In a noisy place use push-to-talk, or a
-    longer trailing silence.
-  - A room whose noise swings widely (by about 5 dB or more from moment to moment) can still be
-    taken for a request now and then, and a request there can take several seconds longer to end.
-    The recording check then refuses most recordings that hold nothing but such noise.
+    recordings of five real rooms, no request was cut short with the speech 15 dB or more above
+    the room noise, and a pause of one second between two sentences never ended a request. At
+    10 dB about one in twenty-five was sent without its last words; at 6 dB about one in six
+    was, and one in five wasn't heard at all. A pause of 1.5 s between sentences (with the 2 s
+    setting) ended 7 of 130 requests at 15 dB and none at 20 dB. In a noisy place use
+    push-to-talk, or a longer trailing silence.
+  - A room whose noise swings widely (by about 5 dB or more from moment to moment), or that has
+    loud events of its own (dishes, a door, someone else talking), can still be taken for a
+    request now and then, and a request there can take several seconds longer to end. The
+    recording check refuses most recordings that hold nothing but wandering noise, but not loud
+    events. With nobody speaking, 30-second recordings of a living room, a cafeteria and a
+    laundry room were never sent in these tests; of a kitchen and an office, 4 of 36 were.
   - A word has to be voiced for 140 ms: very short words with long pauses between them, spoken
     softly, may not count.
   - A single click or knock of 100 ms or less doesn't count, and neither does sparse clicking
@@ -507,8 +516,8 @@ Only the following has been run:
   accepts the same audio), its behaviour in unsteady backgrounds (synthetic, 40 seeds per cell:
   a background drifting by 1, 2, 3 and 4.5 dB with nobody speaking is recorded as a request in 0,
   0, 0 and 10 of 40 half-minutes and uploaded in 0, 0, 0 and 9–10; one whose level jumps every
-  100 ms by 2–6 dB in 0, 0, 8 and 33; a request in such a background is never cut and ends on
-  average 2.0–3.1 s after the speech, at worst 10 s; six seconds of drifting noise alone pass the
+  100 ms by 2–6 dB in 0, 0, 8 and 33; a request in a background drifting by up to 4.5 dB is never cut and
+  ends on average 2.0–3.1 s after the speech, at worst 10 s; six seconds of drifting noise alone pass the
   recording check in 0, 2, 4 and 24 of 40; strings of short knocks never start a request; steady noise of 2.5–30 times the background that starts
   with nobody speaking ends as "no request"; a held voice first, then speech, is kept whole; noise
   after speech ends the request only when clearly quieter than the speech; words of 100–300 ms

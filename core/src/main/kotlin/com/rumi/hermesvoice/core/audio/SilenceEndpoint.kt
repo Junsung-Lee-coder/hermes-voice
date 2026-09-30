@@ -19,11 +19,12 @@ enum class EndpointDecision { CONTINUE, END_OF_SPEECH, NO_SPEECH }
  *   it as background ([EnergyVad.absorbingSteadyNoise]) the request is back to "not started", on
  *   the same clock from the cue.
  * - Once speech started there is NO duration cap. The request ends after [silenceMs] (the user's
- *   "trailing silence" setting) of counted non-voice: background frames count fully, frames a
- *   little above it ([VadClass.GRAY], e.g. a fan that started) at half rate while the floor adapts
- *   to them, so such a tail still ends the request, within 2 × [silenceMs]. Voiced frames pause
- *   the count; [respeechMs] of renewed speech (dips tolerated) restarts it, which is the same bar
- *   as the first speech, so words said one at a time keep the request open like the first one did.
+ *   "trailing silence" setting) of background ([VadClass.QUIET]). Frames a little above it
+ *   ([VadClass.GRAY]: soft words, the end of a sentence, or a fan that started) and voiced frames
+ *   pause the count: soft speech is never counted as silence, and a steady sound that started is
+ *   absorbed by the floor within a second or two, after which it counts. [respeechMs] of renewed
+ *   speech (dips tolerated) restarts the count, which is the same bar as the first speech, so
+ *   words said one at a time keep the request open like the first one did.
  * Push-to-talk does not use this: it ends only when the user taps.
  */
 class SilenceEndpoint(
@@ -107,12 +108,12 @@ class SilenceEndpoint(
                 } else {
                     phase = Phase.SILENCE
                     pausedBefore = true
-                    quietMs = weight(cls)
+                    quietMs = if (cls == VadClass.QUIET) frameMs else 0
                     vad.resetRun()
                 }
             }
             Phase.SILENCE -> {
-                if (cls != VadClass.VOICED) quietMs += weight(cls)
+                if (cls == VadClass.QUIET) quietMs += frameMs
                 if (vad.qualifiedFor(respeechMs)) {
                     phase = Phase.SPEECH
                     quietMs = 0
@@ -126,8 +127,6 @@ class SilenceEndpoint(
         }
         return EndpointDecision.CONTINUE
     }
-
-    private fun weight(cls: VadClass): Long = if (cls == VadClass.QUIET) frameMs else frameMs / 2
 
     /** No request [noSpeechTimeoutMs] after the cue: ends the capture as "no speech". */
     private fun notStarted(): Boolean {
