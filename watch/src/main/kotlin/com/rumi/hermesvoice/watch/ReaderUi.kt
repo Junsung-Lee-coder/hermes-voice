@@ -2,6 +2,7 @@ package com.rumi.hermesvoice.watch
 
 import android.os.SystemClock
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -30,6 +31,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
@@ -47,6 +49,8 @@ import androidx.wear.compose.material.ChipDefaults
 import androidx.wear.compose.material.CompactChip
 import androidx.wear.compose.material.MaterialTheme
 import androidx.wear.compose.material.Text
+import com.rumi.hermesvoice.core.background.BackgroundStatus
+import com.rumi.hermesvoice.core.background.BackgroundText
 import com.rumi.hermesvoice.core.watchlink.LoadStatus
 import com.rumi.hermesvoice.core.watchlink.ReaderError
 import com.rumi.hermesvoice.core.watchlink.ReaderHistory
@@ -245,7 +249,8 @@ fun SessionsSurface(
 
 /** Big Talk/Send button used when no conversation is open. */
 @Composable
-fun TalkHome(phone: Boolean?, talk: WatchTalkState, wakeEnabled: Boolean, wakeListening: Boolean, wakeUnavailable: Boolean, onTalk: () -> Unit) {
+fun TalkHome(phone: Boolean?, talk: WatchTalkState, wakeEnabled: Boolean, wakeListening: Boolean, wakeUnavailable: Boolean,
+             background: BackgroundStatus, onTalk: () -> Unit, onBackground: () -> Unit) {
     Column(Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 14.dp),
         horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
         Text(
@@ -270,6 +275,12 @@ fun TalkHome(phone: Boolean?, talk: WatchTalkState, wakeEnabled: Boolean, wakeLi
             color = MaterialTheme.colors.onBackground, style = MaterialTheme.typography.body2,
             textAlign = TextAlign.Center, maxLines = 3,
         )
+        // The background session: what it really does now, and what a tap does. Started and stopped only here (or Stop in its notification).
+        Text("${BackgroundText.watchLabel(background, recognizer = !wakeUnavailable)}\n${BackgroundText.watchAction(background)}",
+            Modifier.padding(top = 2.dp).clip(RoundedCornerShape(10.dp)).background(MaterialTheme.colors.surface)
+                .clickable(onClick = onBackground).padding(horizontal = 8.dp, vertical = 2.dp).testTag("background"),
+            color = if (background.running) MaterialTheme.colors.secondary else MaterialTheme.colors.onSurfaceVariant,
+            style = MaterialTheme.typography.caption3, textAlign = TextAlign.Center, maxLines = 3)
         Text("Swipe left for conversations", color = MaterialTheme.colors.onSurfaceVariant,
             style = MaterialTheme.typography.caption3, textAlign = TextAlign.Center)
     }

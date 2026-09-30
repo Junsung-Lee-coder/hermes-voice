@@ -9,6 +9,12 @@ import com.rumi.hermesvoice.core.net.HermesGatewayConnector
 import com.rumi.hermesvoice.core.sessions.OwnedSessionRegistry
 import com.rumi.hermesvoice.core.VoiceOrigin
 import com.rumi.hermesvoice.core.audio.AudioInputVerdict
+import com.rumi.hermesvoice.core.background.BackgroundNotice
+import com.rumi.hermesvoice.core.background.BackgroundPort
+import com.rumi.hermesvoice.core.background.BackgroundSession
+import com.rumi.hermesvoice.core.background.BackgroundStatus
+import com.rumi.hermesvoice.core.background.HoldReason
+import com.rumi.hermesvoice.core.background.WakeHolds
 import com.rumi.hermesvoice.core.settings.AppSettings
 import com.rumi.hermesvoice.core.voice.AssembledRoute
 import com.rumi.hermesvoice.core.voice.PlaybackCue
@@ -18,12 +24,18 @@ import com.rumi.hermesvoice.core.voice.VoiceTurnStage
 import com.rumi.hermesvoice.core.wake.WakeEpisode
 import com.rumi.hermesvoice.core.wake.WakeEpochItem
 import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import android.content.Intent
+import android.os.SystemClock
 import android.util.Log
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -37,7 +49,10 @@ import okhttp3.OkHttpClient
 /**
  * Process-wide graph. One [HermesVoiceCore] per (dashboard URL, profile), shared by the Phone UI,
  * the Phone push-to-talk button and the Watch listener service, so both origins go through the
- * same orchestrator (ordering, speaker ownership, turn-id dedup).
+ * same orchestrator (ordering, speaker ownership, turn-id dedup). Voice turns of either origin run
+ * in [appScope], not in an activity or view model, so closing or recreating the screen never ends
+ * one. The optional background relay ([relay], [PhoneRelayService]) keeps this process running
+ * with the app closed; it adds no second client, orchestrator or store.
  */
 class PhoneApp : Application() {
     /** Background work (Watch turns) must never crash the process; failures are logged. */
@@ -45,7 +60,8 @@ class PhoneApp : Application() {
         Log.e("HermesVoice", "background task failed: ${error.javaClass.simpleName}")
     })
 
-    val settings: AppSettings by lazy { AppSettings(SharedPreferencesKeyValueStore(prefs(AppSettings.PREFERENCES_NAME))) }
+    private val settingsStore by lazy { SharedPreferencesKeyValueStore(prefs(AppSettings.PREFERENCES_NAME)) }
+    val settings: AppSettings by lazy { AppSettings(settingsStore) }
 
     /** Elapsed-realtime millis when Phone speaker playback last ended (wake-phrase cooldown). */
     @Volatile var lastPhonePlaybackEndedAtMs: Long = 0L
@@ -56,6 +72,132 @@ class PhoneApp : Application() {
         val migrated = settings.migrate()
         Log.i("HermesVoice", "voice settings wake_location=${settings.wakeLocation} vad_silence_s=${settings.vadSilenceSeconds} " +
             "revision=${settings.watchSettingsRevision} migrated=$migrated")
+        PhoneRelayService.createChannel(this)
+        _relayStatus.value = relay.status
+        if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+            // Exported so `adb shell am broadcast` reaches it; never registered in a release build.
+            ContextCompat.registerReceiver(this, qaReceiver, android.content.IntentFilter(QA_ACTION), ContextCompat.RECEIVER_EXPORTED)
+        }
+    }
+
+    /**
+     * Debug builds only: `adb shell am broadcast -a com.rumi.hermesvoice.QA_PHONE --es hv_qa_relay stop`
+     * runs the same Stop as the relay notification's action, which a test cannot tap while the
+     * notification is not allowed. Nothing else is accepted here.
+     */
+    private val qaReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: android.content.Context, intent: Intent) {
+            if (intent.getStringExtra(QA_RELAY) != "stop") return
+            Log.i(RELAY_TAG, "qa relay stop (debug builds only; the notification's Stop path)")
+            android.os.Handler(android.os.Looper.getMainLooper()).post { stopRelay() }
+        }
+    }
+
+    // ── background relay ─────────────────────────────────────────────────────────────────────
+
+    /** CPU wake locks, one per reason and each with a timeout (see [WakeHolds]). */
+    val holds: WakeHolds by lazy { WakeHolds(AndroidWakeLocks(this), SystemClock::elapsedRealtime) }
+
+    private val _relayStatus = MutableStateFlow(BackgroundStatus(false, false, false, BackgroundNotice.OFF))
+
+    /** The background relay as it really is now (not the saved switch alone). */
+    val relayStatus: StateFlow<BackgroundStatus> = _relayStatus
+
+    private val relayPort = object : BackgroundPort {
+        override fun startService(microphone: Boolean): Boolean = runCatching {
+            ContextCompat.startForegroundService(this@PhoneApp, PhoneRelayService.start(this@PhoneApp))
+        }.onFailure { Log.w(RELAY_TAG, "background relay start refused: ${it.javaClass.simpleName}") }.isSuccess
+
+        // The relay never uses this Phone's microphone: there is nothing to re-type.
+        override fun retypeService(microphone: Boolean): Boolean = !microphone
+
+        // A service whose start is still on its way ends itself when it arrives (it must enter the foreground first).
+        override fun stopService() {
+            PhoneRelayService.running?.finish()
+        }
+    }
+
+    /**
+     * Device-local opt-in, off unless the user switched it on here. It has no microphone, so after
+     * Android ended it (or the phone restarted) it resumes when the app is next opened; it never
+     * starts from the background.
+     */
+    val relay: BackgroundSession by lazy {
+        BackgroundSession(settingsStore, KEY_BACKGROUND_RELAY, relayPort, resumeWhenVisible = true) { status ->
+            Log.i(RELAY_TAG, "background relay wanted=${status.wanted} running=${status.running} notice=${status.notice}")
+            _relayStatus.value = status
+            PhoneRelayService.running?.refresh(status)
+        }
+    }
+
+    /** An activity of this app is visible (started): the only time the relay may be started. */
+    @Volatile var activityVisible = false
+        private set
+
+    fun onActivityStarted() {
+        activityVisible = true
+        _relayStatus.value = relay.onVisible(microphoneWanted = false, microphonePermission = false)
+    }
+
+    fun onActivityStopped() {
+        activityVisible = false
+    }
+
+    /** The user's switch, from the visible app. */
+    fun startRelay(): BackgroundStatus =
+        relay.start(visible = activityVisible, microphoneWanted = false, microphonePermission = false).also { _relayStatus.value = it }
+
+    /**
+     * The user's Stop (switch or notification), safe to repeat: the relay is off for good. With the
+     * app closed, turns in flight are cancelled (a Watch is told its turn was stopped; nothing more
+     * is played) and the wake lock is let go. With the app on screen, foreground use goes on.
+     */
+    fun stopRelay() {
+        val hidden = !activityVisible
+        relay.stop()
+        _relayStatus.value = relay.status
+        if (!hidden) return
+        turns.keys.toList().forEach { it.cancel() }
+        holds.releaseAll()
+    }
+
+    /** True the first time only: whether the relay's notification may show is asked once, not at every switch-on. */
+    fun askNotificationsOnce(): Boolean {
+        if (settingsStore.getBoolean(KEY_NOTIFICATIONS_ASKED, false)) return false
+        settingsStore.putBoolean(KEY_NOTIFICATIONS_ASKED, true)
+        return true
+    }
+
+    fun onRelayServiceGone(generation: Long) {
+        _relayStatus.value = relay.onServiceGone(generation)
+    }
+
+    // ── voice turns ──────────────────────────────────────────────────────────────────────────
+
+    private val turns = ConcurrentHashMap<Job, String>()
+
+    /** How many Phone-origin voice turns are being sent, answered or played. */
+    val phoneTurns = MutableStateFlow(0)
+
+    /**
+     * Runs one voice turn (Phone or Watch origin) in the application scope, with a time-limited
+     * CPU hold for as long as any turn runs. [phoneOrigin] turns are counted for the Phone's UI.
+     */
+    fun launchTurn(turnId: String, phoneOrigin: Boolean, block: suspend () -> Unit): Job {
+        if (phoneOrigin) phoneTurns.value += 1
+        val job = appScope.launch(start = CoroutineStart.LAZY) {
+            try {
+                block()
+            } finally {
+                turns.remove(coroutineContext[Job])
+                if (phoneOrigin) phoneTurns.value -= 1
+                if (turns.isEmpty()) holds.release(HoldReason.TURN)
+            }
+        }
+        turns[job] = turnId
+        holds.acquire(HoldReason.TURN)
+        job.start()
+        return job
     }
     val tokens: KeystoreTokenStore by lazy { KeystoreTokenStore(this) }
 
@@ -154,6 +296,11 @@ class PhoneApp : Application() {
 
     companion object {
         private const val VOICE_TAG = "HermesVoiceTurn"
+        private const val RELAY_TAG = "HermesVoiceRelay"
+        const val KEY_BACKGROUND_RELAY = "phone_background_relay"
+        private const val KEY_NOTIFICATIONS_ASKED = "notifications_asked"
+        private const val QA_ACTION = "com.rumi.hermesvoice.QA_PHONE"
+        private const val QA_RELAY = "hv_qa_relay"
         const val REGISTRY_PREFS_PREFIX = "hermes_voice_sessions_"
 
         private fun digest(value: String): String = MessageDigest.getInstance("SHA-256")

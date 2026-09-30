@@ -63,7 +63,8 @@ class PhoneWatchListenerService : WearableListenerService() {
         val context = applicationContext
         val app = PhoneApp.from(context)
         val transport = DataLayerWatchTransport(context, channel.nodeId)
-        app.appScope.launch {
+        // In the application scope, as a tracked turn: it outlives this service call and the screen.
+        app.launchTurn(turnId, phoneOrigin = false) {
             val client = Wearable.getChannelClient(context)
             // null = unreadable or larger than one frame: rejected below without reaching the orchestrator.
             val bytes = try {
@@ -80,7 +81,7 @@ class PhoneWatchListenerService : WearableListenerService() {
                 runCatching {
                     transport.sendMessage(WatchLinkPaths.STATE, TurnStateMessage(turnId, "rejected", "Set up Hermes on the phone", true).encode())
                 }
-                return@launch
+                return@launchTurn
             }
             Log.i(TAG, "watch turn ${turnId.take(12)} received bytes=${bytes?.size ?: -1}")
             val outcome = wiring.core.watchIntake.onTurnChannel(path, bytes, transport)

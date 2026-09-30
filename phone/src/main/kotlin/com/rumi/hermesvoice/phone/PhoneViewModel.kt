@@ -14,6 +14,8 @@ import com.rumi.hermesvoice.core.VoiceOrigin
 import com.rumi.hermesvoice.core.audio.CaptureEnd
 import com.rumi.hermesvoice.core.audio.PcmCaptureLoop
 import com.rumi.hermesvoice.core.audio.SilenceEndpoint
+import com.rumi.hermesvoice.core.background.BackgroundNotice
+import com.rumi.hermesvoice.core.background.BackgroundStatus
 import com.rumi.hermesvoice.core.net.AttachmentPolicy
 import com.rumi.hermesvoice.core.net.HistoryMessage
 import com.rumi.hermesvoice.core.net.OutgoingAttachment
@@ -69,6 +71,8 @@ data class PhoneUiState(
     val handsFree: HandsFree = HandsFree.IDLE,
     /** Bumped for each recording start/end haptic of a hands-free request (the activity plays it). */
     val hapticTick: Int = 0,
+    /** The optional background relay as it really is now (see [PhoneApp.relay]). */
+    val relay: BackgroundStatus = BackgroundStatus(false, false, false, BackgroundNotice.OFF),
 )
 
 enum class HandsFree { IDLE, LISTENING, GET_READY, SPEAK_NOW }
@@ -133,6 +137,9 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { app.playbackDevice.collect { device -> _state.update { it.copy(playbackDevice = device) } } }
         // A voice turn (from the Phone or the Watch) created a conversation: show it.
         viewModelScope.launch { app.conversationsCreated.collect { count -> if (count > 0 && _state.value.signedIn) refresh() } }
+        viewModelScope.launch { app.relayStatus.collect { relay -> _state.update { it.copy(relay = relay) } } }
+        // Phone voice turns run in the application, so one started before this screen was (re)created still counts as busy.
+        viewModelScope.launch { app.phoneTurns.collect { running -> _state.update { it.copy(voiceBusy = running > 0) } } }
         refreshWatchStatus()
     }
 
@@ -340,23 +347,36 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
             wakeTurn = true, wakeClaimId = claimId)
     }
 
-    /** Runs one Phone voice turn; [PhoneUiState.voiceBusy] holds while it is sent, answered and played. */
-    private fun runPhoneTurn(turnId: String, request: (String) -> VoiceTurnRequest) = launchGuarded { wiring ->
+    /**
+     * Runs one Phone voice turn; [PhoneUiState.voiceBusy] holds while it is sent, answered and
+     * played. The turn belongs to the application ([PhoneApp.launchTurn]), not to this screen:
+     * leaving or recreating the screen does not end it.
+     */
+    private fun runPhoneTurn(turnId: String, request: (String) -> VoiceTurnRequest) {
+        val wiring = wiringOrStatus() ?: return
         _state.update { it.copy(voiceBusy = true, voiceStatus = "Sending…") }
-        try {
-            val outcome = wiring.core.orchestrator.run(request(turnId))
-            Log.i(TAG, "phone turn ${turnId.take(12)} outcome=${outcome.javaClass.simpleName}")
-            _state.update { it.copy(voiceStatus = VoiceOutcomeText.describe(outcome)) }
-            _state.value.selected?.let { open(it) }
-        } finally {
-            _state.update { it.copy(voiceBusy = false) }
+        app.launchTurn(turnId, phoneOrigin = true) {
+            try {
+                val outcome = wiring.core.orchestrator.run(request(turnId))
+                Log.i(TAG, "phone turn ${turnId.take(12)} outcome=${outcome.javaClass.simpleName}")
+                _state.update { it.copy(voiceStatus = VoiceOutcomeText.describe(outcome)) }
+                _state.value.selected?.let { open(it) }
+            } catch (error: HermesAuthRequiredException) {
+                _state.update { it.copy(signedIn = false, status = "Sign in to Hermes (${error.message})") }
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                _state.update { it.copy(voiceStatus = "Stopped") }
+                throw error
+            } catch (error: Exception) {
+                Log.w(TAG, "phone turn failed: ${error.javaClass.simpleName}")
+                _state.update { it.copy(status = error.message ?: error.javaClass.simpleName) }
+            }
         }
     }
 
     // ── phone hands-free (wake phrase) ───────────────────────────────────────────────────────
 
     /** Nothing on the Phone owns the microphone or speaker: the wake phrase may listen. */
-    fun voiceIdle(): Boolean = !recorder.isRecording && captures.activeId == null && !_state.value.voiceBusy
+    fun voiceIdle(): Boolean = !recorder.isRecording && captures.activeId == null && !_state.value.voiceBusy && app.phoneTurns.value == 0
 
     /** A hands-free request is being recorded (a tap on Talk sends it). */
     fun handsFreeCapturing(): Boolean = captures.activeId != null
@@ -375,7 +395,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
      * speech, or on a tap; a pause or opt-out cancels it unsent ([cancelHandsFree]).
      */
     fun startHandsFree(silenceMs: Long, claimId: String? = null): Boolean {
-        if (recorder.isRecording || _state.value.voiceBusy) return false
+        if (recorder.isRecording || _state.value.voiceBusy || app.phoneTurns.value > 0) return false
         handsFreeClaimId = claimId
         val id = UUID.randomUUID().toString()
         if (!captures.begin(id, TurnTrigger.WAKE_PHRASE)) return false
@@ -463,6 +483,20 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
             _state.update { it.copy(status = if (result.isSuccess) "Settings sent to the Watch" else "Watch not reachable; will apply when it syncs") }
         }
     }
+
+    /**
+     * The background relay switch (this phone only; not a voice setting and not sent to the Watch).
+     * On starts it from this visible screen; off stops it for good.
+     */
+    fun setBackgroundRelay(on: Boolean) {
+        if (on) app.startRelay() else {
+            Log.i(TAG, "background relay stop requested (app)")
+            app.stopRelay()
+        }
+    }
+
+    /** True the first time only (kept across restarts): the notification permission is asked once, at the first switch-on. */
+    fun askNotificationsOnce(): Boolean = app.askNotificationsOnce()
 
     fun setWakeLocation(location: WakeLocation) = updateWatch(_state.value.watch.copy(wakeLocation = location))
 

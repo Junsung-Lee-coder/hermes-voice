@@ -92,6 +92,7 @@ import kotlinx.coroutines.launch
 import com.rumi.hermesvoice.core.VoiceOrigin
 import com.rumi.hermesvoice.core.audio.QaAudio
 import com.rumi.hermesvoice.core.audio.QaLaunchGuard
+import com.rumi.hermesvoice.core.background.BackgroundText
 import com.rumi.hermesvoice.core.sessions.AppConversation
 import com.rumi.hermesvoice.core.settings.ThemeMode
 import com.rumi.hermesvoice.core.settings.VadSilence
@@ -257,6 +258,17 @@ class MainActivity : ComponentActivity() {
         }
         if (model.state.value.signedIn) model.refresh()
         handleQaIntent(intent, restored = savedInstanceState != null)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // Visible: a background relay the user left switched on may (re)start now, and only now.
+        PhoneApp.from(this).onActivityStarted()
+    }
+
+    override fun onStop() {
+        PhoneApp.from(this).onActivityStopped()
+        super.onStop()
     }
 
     override fun onResume() {
@@ -659,6 +671,31 @@ private fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerAv
         SwitchRow("Watch haptics", state.watch.hapticsEnabled) { model.updateWatch(state.watch.copy(hapticsEnabled = it)) }
 
         HorizontalDivider()
+        Text("Background", style = MaterialTheme.typography.titleSmall)
+        // The first switch-on asks whether the app may show its notification (Android 13+); the relay starts whatever the answer.
+        val notifications = android.os.Build.VERSION.SDK_INT < 33 ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { model.setBackgroundRelay(true) }
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("Keep relaying for the Watch when this app is closed", Modifier.weight(1f))
+            Switch(checked = state.relay.running, modifier = Modifier.testTag("background_relay"), onCheckedChange = { on ->
+                if (on && !notifications && model.askNotificationsOnce()) {
+                    notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                } else {
+                    model.setBackgroundRelay(on)
+                }
+            })
+        }
+        Text(BackgroundText.phoneStatus(state.relay, notifications), style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.testTag("background_relay_status"),
+            color = if (state.relay.wanted && !state.relay.running) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.tertiary)
+        Text("Off by default. While on, Watch requests are transcribed, routed, delivered and answered with this app closed and " +
+            "the screen off, and a notification with Stop stays visible. This phone doesn't listen or record in the background: " +
+            "its own Talk button and wake phrase work only while the app is open. It doesn't survive a force stop, a restart of the " +
+            "phone or the system's own Stop; it starts again when you open the app. It uses more battery.",
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+        HorizontalDivider()
         Text("Wake phrase", style = MaterialTheme.typography.titleSmall)
         Text("Listen on", style = MaterialTheme.typography.bodyMedium)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -685,11 +722,13 @@ private fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerAv
             when {
                 !watchListens -> "Watch: off"
                 state.watchReachable == false -> "Watch: app not reachable; it applies this when it syncs"
-                else -> "Watch: listens for ${WakeContract.WINDOW_MS / 1000} s each time the Watch app opens; the Watch shows if it has no recognizer"
+                else -> "Watch: listens for ${WakeContract.WINDOW_MS / 1000} s each time the Watch app opens, or continuously while " +
+                    "Background is started on the Watch; the Watch shows if it has no recognizer"
             },
             style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.tertiary,
         )
-        Text("Only while the app is open on screen, never in the background. Say the wake phrase, pause for the buzz, " +
+        Text("On this phone only while the app is open on screen. On the Watch also with its app closed, once you start " +
+            "Background there. Say the wake phrase, pause for the buzz, " +
             "then speak: the request is sent when you stop talking (no time limit). Or say the request right after " +
             "the phrase: it's sent only once the speech recognizer has finished hearing it; if it can't, nothing is " +
             "sent and you're asked to repeat.",

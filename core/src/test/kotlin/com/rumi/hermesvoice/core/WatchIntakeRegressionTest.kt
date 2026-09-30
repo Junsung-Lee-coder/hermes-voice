@@ -21,6 +21,7 @@ import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -73,6 +74,38 @@ class WatchIntakeRegressionTest {
             assertEquals(List(4) { "rejected" }, watch.states.map { it.stage })
             assertTrue(watch.states.all { it.terminal })
             assertEquals(0, h.fake.server.requestCount)
+        }
+    }
+
+    @Test
+    fun `a watch turn stopped on the phone tells the watch it ended and stops its playback`() {
+        CoreHarness().use { h ->
+            h.fake.sourceScripts[AppSources.ROUTER] = { listOf(FakeHermesDashboard.complete("""{"destination":"work","ack":"On it."}""")) }
+            val work = runBlocking { h.core.sessions.createConversation("Work", "work", "") }.storedSessionId
+            h.fake.scripts[work] = { listOf(FakeHermesDashboard.complete("Done.")) }
+            val playing = CountDownLatch(1)
+            val messages: MutableList<Pair<String, TurnStateMessage>> = Collections.synchronizedList(mutableListOf())
+            // A Watch that received the acknowledgement and is still playing it (no `played` comes back).
+            val watch = object : WatchTransport {
+                override val nodeId = "watch-node-a"
+                override suspend fun sendMessage(path: String, bytes: ByteArray) { messages += path to TurnStateMessage.decode(bytes)!! }
+                override suspend fun sendChannel(path: String, bytes: ByteArray) = playing.countDown()
+            }
+            val upload = WatchTurnUpload.recognized("turn-stop-01", "내일 일정 알려줘")
+            runBlocking {
+                val turn = launch(kotlinx.coroutines.Dispatchers.Default) {
+                    h.core.watchIntake.onTurnChannel(WatchLinkPaths.turnPath("turn-stop-01"), upload.toFrame().encode(), watch)
+                }
+                assertTrue(playing.await(10, TimeUnit.SECONDS))
+                turn.cancel()
+                turn.join()
+            }
+            val last = messages.last()
+            assertEquals(WatchLinkPaths.STATE, last.first)
+            assertTrue("the Watch leaves its waiting state", last.second.terminal)
+            assertEquals(com.rumi.hermesvoice.core.watchlink.WatchTurnIntake.STOPPED_ON_PHONE, last.second.detail)
+            assertTrue("the utterance in progress is stopped on the Watch", messages.any { it.first == WatchLinkPaths.STOP })
+            assertEquals("the transcript was not delivered after the stop", 0, h.fake.prompts.count { it.first == work })
         }
     }
 

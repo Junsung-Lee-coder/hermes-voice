@@ -31,6 +31,13 @@ import com.rumi.hermesvoice.core.settings.WakePhrasePatterns
 object WakeContract {
     const val WINDOW_MS = 5_000L
 
+    /**
+     * A window of an armed background session (see [WakePresence]): longer, because windows follow
+     * one another and a phrase spoken across the gap between two is missed. The recognition service
+     * usually ends a quiet window sooner by itself; this only bounds one that does not.
+     */
+    const val BACKGROUND_WINDOW_MS = 30_000L
+
     /** Quiet time after the last change of a pending partial before the window gives up. */
     const val PENDING_INACTIVITY_MS = 8_000L
 
@@ -82,7 +89,7 @@ sealed class WakeOutcome {
  * can be handed off at most once.
  */
 class WakeSession(
-    private val windowMs: Long = WakeContract.WINDOW_MS,
+    private val defaultWindowMs: Long = WakeContract.WINDOW_MS,
     private val pendingInactivityMs: Long = WakeContract.PENDING_INACTIVITY_MS,
 ) {
     private var generation: Long? = null
@@ -94,7 +101,7 @@ class WakeSession(
     val active: Boolean get() = generation != null
 
     @Synchronized
-    fun open(generation: Long, nowMs: Long) {
+    fun open(generation: Long, nowMs: Long, windowMs: Long = defaultWindowMs) {
         this.generation = generation
         deadlineMs = nowMs + windowMs
         pending = null
@@ -243,8 +250,8 @@ class WakeWindowCoordinator(
         generation += 1
     }
 
-    /** Opens a window unless a gate blocks it; returns the blocking reason, or null when it opened. */
-    fun requestArm(inputs: WakeArmInputs): WakeBlock? {
+    /** Opens a window of [windowMs] unless a gate blocks it; returns the blocking reason, or null when it opened. */
+    fun requestArm(inputs: WakeArmInputs, windowMs: Long = WakeContract.WINDOW_MS): WakeBlock? {
         if (session.active) return WakeBlock.ALREADY_ARMED
         WakeArmGate.block(inputs.copy(generation = generation, lastArmedGeneration = lastArmedGeneration))?.let { return it }
         lastArmedGeneration = generation
@@ -253,7 +260,7 @@ class WakeWindowCoordinator(
             return WakeBlock.UNAVAILABLE
         }
         windowGeneration = generation
-        session.open(generation, clock())
+        session.open(generation, clock(), windowMs)
         open = true
         host.windowChanged(true)
         timer.schedule(session.deadline() - clock())

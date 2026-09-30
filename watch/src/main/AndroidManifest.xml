@@ -5,7 +5,17 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.VIBRATE" />
 
-    <!-- Package visibility (Android 11+) for the platform speech recognizer used by the foreground
+    <!-- The optional background session (WatchVoiceService), started only by the user from the
+         visible app: replies play and, when the Phone's wake settings include the Watch, the wake
+         phrase is heard with the app hidden. POST_NOTIFICATIONS shows its notification with Stop;
+         WAKE_LOCK is for short, time-limited CPU holds while it listens, records, sends or plays. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Package visibility (Android 11+) for the platform speech recognizer used by the
          wake phrase; without it SpeechRecognizer reports no recognition service. Not a permission. -->
     <queries>
         <intent>
@@ -29,6 +39,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Not exported: started and stopped only by this app (the visible activity, or Stop in its own notification). -->
+        <service
+            android:name=".WatchVoiceService"
+            android:exported="false"
+            android:foregroundServiceType="microphone|mediaPlayback" />
 
         <service
             android:name=".WatchListenerService"

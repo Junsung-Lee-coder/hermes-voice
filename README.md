@@ -320,15 +320,18 @@ it is opened, the Watch reads the synced snapshot before it listens. Settings sh
 status: off, listening, or why it can't (no speech recognizer, no microphone permission, not
 signed in, Watch not reachable).
 
-It works only while that device's app is open on screen (foreground), never in the background,
-and needs no permission beyond the microphone. Each time the app is shown, or the screen turns
-back on with the app shown, the platform `SpeechRecognizer` listens for 5 seconds. On-device
+By default it works only while that device's app is open on screen (foreground) and needs no
+permission beyond the microphone. Each time the app is shown, or the screen turns back on with the
+app shown, the platform `SpeechRecognizer` listens for 5 seconds. On the Watch it can also keep
+listening with the app closed and the screen off, once you start **Background** there (see
+[Background operation](#background-operation-opt-in)); the Phone's own wake phrase is always
+foreground-only. On-device
 recognition is used when available; if it reports that it lacks the wake phrases' language, the
 app falls back once to the system's default recognition service, which may send audio over the
 network. It never runs while recording, sending, waiting for a reply, playing
 audio, or for 4 seconds after playback. A device the setting excludes doesn't listen or respond;
 turning it off, leaving the app or the screen going off closes the recognizer and stops a
-hands-free recording without sending it. The recognizer and the app's recorder never use the
+hands-free recording without sending it (unless the Watch's background session is listening). The recognizer and the app's recorder never use the
 microphone at the same time: tapping Talk while the recognizer is listening releases it first and
 starts recording after the same short pause. Leaving the screen, which includes rotating the
 Phone, cancels a hands-free recording with "Cancelled"; nothing is sent. The Watch never holds
@@ -462,6 +465,61 @@ Both devices end a hands-free request with the same voice-activity detector (VAD
     (dishes, a door), and a burst of noise longer than 140 ms, like a cough, can start a request,
     which speech-to-text may then find empty or mishear.
 
+## Background operation (opt-in)
+
+Both are off by default, on fresh and upgraded installs, and each is switched on only on its own
+device, by you, while that app is on screen. They are not voice settings: where the wake phrase
+listens, the phrases and the trailing silence stay Phone settings, and the Phone can't start
+anything on the Watch.
+
+- **Phone: Settings → Background → "Keep relaying for the Watch when this app is closed".** While
+  on, Watch requests are transcribed, routed, delivered and answered with the Phone app closed and
+  its screen off, and a reply due on the Phone (it sent the latest voice request) still plays. It
+  runs as a foreground service of the *connected device* and *media playback* types, with an
+  ongoing "Relaying …" notification that has **Stop**. This Phone doesn't listen or record in the
+  background: its Talk button and wake phrase work only with the app open. The relay is the same
+  one the open app uses (one dashboard client, one orchestrator, the same saved data).
+- **Watch: the "Background" control under Talk.** "Tap to start" starts a session; while it runs
+  the control says what it really does (listening, replies only, paused) and "Tap to stop" ends
+  it. The session always lets replies play with the app closed. If the Phone's wake setting
+  includes the Watch and the microphone is allowed, it also keeps listening for the wake phrase
+  with the app closed and the screen off: one recognizer window after another (30 seconds each, a
+  third of a second apart, backing off up to a minute when the recognizer fails), then records,
+  sends and plays exactly as on screen, including the Both claim. It runs as a foreground service
+  of the *microphone* and *media playback* types with an ongoing notification and **Stop**. The
+  Watch's screen isn't kept on for it; only a recording keeps it on, as before.
+- **The microphone is armed only from the open app.** Android doesn't let an app start using the
+  microphone from the background, and the Watch doesn't try: if the Phone's setting stops
+  including the Watch, listening stops at once and the session keeps only playback; if it
+  includes the Watch again while the app is closed, the Watch shows "replies only until opened"
+  and listens again only once you open it.
+- **Stop** (the notification's, or the control) is final and can be repeated: nothing listens or
+  records any more. With the app closed it also ends what was under way: a recording is dropped
+  unsent (a Both claim is given back), a recording not yet handed to the Phone is withdrawn, the
+  reply playing stops and the rest of that turn isn't played; on the Phone, turns in flight are
+  stopped and the Watch shows "Stopped on the phone". With the app open, Stop only ends the
+  background part.
+- **Nothing restarts by itself.** A session the system ended (force stop, the system's own Stop,
+  a revoked permission, a reboot, an app update) shows as paused. The Phone's relay starts again
+  when you next open the Phone app; the Watch waits for your "Tap to start". There is no boot
+  start, battery-optimization exemption, assistant role, accessibility service, screen wake or
+  full-screen notification.
+- **Notifications.** The first start asks, once, whether the app may show notifications
+  (Android 13+). The session runs either way; if they aren't allowed the notification (and its
+  Stop) is hidden, the Phone says so under the switch, and the in-app control stops it.
+- **Power.** While the Watch listens with its app closed it holds a partial wake lock for each
+  30-second window, so the CPU and the speech recognizer keep running: expect a clearly shorter
+  battery life while it is on. Every wake lock has a reason and a time limit (a window, a
+  recording, a transfer, a turn, an utterance) and is released when that ends. No battery figure
+  has been measured.
+- **Audio.** Replies take transient audio focus (other audio ducks) and respect the volume and Do
+  Not Disturb. If focus isn't granted, the reply isn't played and the turn reports a playback
+  failure; this is also what happens on Android 15 to a Phone reply that becomes due after you
+  closed the Phone app while the relay is off (the request is still delivered and shown).
+
+Without these switches, what worked before still works while the apps are open. Android may also
+keep a closed app running for a while and let it relay or play, but nothing promises that.
+
 ## Text chat and history
 
 History shows user and assistant messages (hidden and tool rows are dropped), newest page first,
@@ -477,6 +535,8 @@ turn completes. Replies to text chat aren't spoken.
 - **Voice settings** (edited on the Phone, synced to the Watch as the `/hv/v1/settings` data
   item): where the wake phrase listens (Off by default), the shared wake phrases, the hands-free
   trailing silence (2 s by default), and Watch haptics. There is no Watch recording time limit.
+- **Background** (each device's own, not synced; off by default): the Phone's relay switch and
+  the Watch's Background control (see [Background operation](#background-operation-opt-in)).
 - **Dark by default.** On the Phone, sign-in, lists, chat, Settings and dialogs follow the
   Appearance setting. The Watch is always dark and shows whether the Phone is reachable.
 - **Full-width Talk bar.** The Phone's Talk button is a full-width bar above the navigation bar,
@@ -494,13 +554,18 @@ The Phone accepts `hv_qa_wake_location=<OFF|WATCH|PHONE|BOTH>` and `hv_qa_vad_si
 (saved and sent to the Watch exactly as from Settings; invalid values are refused). The Watch
 accepts `hv_qa_seed_reader=<n>` (shows synthetic reader rows, to test the reader UI without a
 paired Phone). Each extra is honoured once, for a fresh launch intent only, and non-debuggable
-builds ignore them.
+builds ignore them. For the background session, which must not be brought to the screen, debuggable
+builds also register broadcast receivers (never registered otherwise): on the Watch
+`-a com.rumi.hermesvoice.QA_WATCH --es hv_qa_wake_heard <text> [--es hv_qa_wake_delay_ms <ms>]`
+is a simulated recognizer result for the window open at that moment (again never recognition), and
+`--es hv_qa_background stop` runs the notification's Stop; on the Phone
+`-a com.rumi.hermesvoice.QA_PHONE --es hv_qa_relay stop` does the same for the relay.
 
 ## Validation
 
 Only the following has been run:
 
-- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **312 JUnit tests**, all
+- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **344 JUnit tests**, all
   passing. They use an in-process fake dashboard and cover sign-in, session ownership, chat and
   attachments, routing, playback routing, the Watch link and reader contracts, the wake contract
   (final-only, leading wake phrase, contradicted or empty finals, 30/60/120-second recognizer
@@ -542,7 +607,15 @@ Only the following has been run:
   between manual and router creation, rename and unarchive; invisible characters and quoted
   prompt data; a destination archived while the ack plays; the one-time routing-session
   replacement and its interruption), the recording loop of both recorders (Phone and Watch read sizes), the recording input
-  check, haptic timing, gesture arbitration, bezel scrolling, and source checks of the Android wiring.
+  check, haptic timing, gesture arbitration, bezel scrolling, the background session (off on fresh
+  and upgraded installs, started and its microphone armed only from the visible app, a refused
+  microphone, a Stop that is final and can be repeated, "paused" after the system ended it and no
+  restart by itself, callbacks of an older session ignored), listening with the app hidden (window
+  after window for hours, back-off, no recognizer, cooldown and an unreachable Phone, a late result
+  of an earlier window, the Both claim, Stop while listening or recording, settings that exclude
+  and include the device, showing and hiding the screen without a second window), time-limited
+  wake locks, a Watch turn stopped on the Phone, and source checks of the Android wiring
+  (permissions and service types, where sessions may start, Stop paths, wake locks, audio focus).
 - **Paired debug build:** `gradle :phone:assembleDebug :watch:assembleDebug` succeeded with
   Gradle 8.13 and JDK 17. Both APKs have the same package and are v2-signed by the same debug
   certificate.
@@ -682,9 +755,19 @@ as "no speech" and were repeated.
   already queued, the message is still delivered, but its reply isn't spoken or shown inline.
 - **Server-to-client requests aren't answered.** A turn that needs a tool approval or a
   clarification ends at the 15-minute timeout.
-- **Wake phrase is foreground-only** and depends on each device's speech recognition service.
-  Where none is installed, the device says the wake phrase is unavailable. There's no always-on
-  hotword.
+- **Wake phrase depends on each device's speech recognition service.** The Phone listens only with
+  its app open; the Watch also with its app closed once Background is started, by running the
+  platform recognizer window after window, not a dedicated low-power hotword. Where no recognizer
+  is installed (as on the Watch emulator used here), the device says the wake phrase is
+  unavailable, and a background session then only plays replies. Whether a watch's recognizer
+  keeps working with the screen off for hours, and what that costs in battery, hasn't been
+  measured.
+- **Background sessions don't survive** a force stop, the system's Stop, a revoked permission, a
+  restart of either device, the microphone privacy switch, an OEM's own power rules or a Phone that
+  stays out of reach; the app shows them as paused and waits for you. The Phone relay's
+  foreground-service type is *connected device*; Android requires one of a few permissions for it,
+  and the app declares `CHANGE_NETWORK_STATE` for that reason only (it never changes network
+  state).
 - **Hands-free ending is loudness-based**, not speech understanding (see
   [Hands-free ending](#hands-free-ending-shared-vad)).
 - **Watch reader history is a window.** The Watch keeps at most 200 messages per conversation;

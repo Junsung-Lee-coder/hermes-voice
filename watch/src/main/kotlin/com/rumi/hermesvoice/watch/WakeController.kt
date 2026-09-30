@@ -1,9 +1,7 @@
 package com.rumi.hermesvoice.watch
 
-import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -13,34 +11,32 @@ import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.util.Log
-import androidx.activity.ComponentActivity
-import androidx.lifecycle.DefaultLifecycleObserver
-import androidx.lifecycle.LifecycleOwner
 import com.rumi.hermesvoice.core.VoiceOrigin
 import com.rumi.hermesvoice.core.settings.WatchSettings
 import com.rumi.hermesvoice.core.wake.RecognizerGuard
 import com.rumi.hermesvoice.core.wake.WakeClaimPort
-import com.rumi.hermesvoice.core.wake.WakeContract
 import com.rumi.hermesvoice.core.wake.WakeDeviceController
 import com.rumi.hermesvoice.core.wake.WakeDevicePort
 import com.rumi.hermesvoice.core.wake.WakeRecognizerPort
 import com.rumi.hermesvoice.core.wake.WakeTimerPort
 
 /**
- * Android adapter for the Watch's foreground-only wake phrase: lifecycle and screen signals drive
- * the shared [WakeDeviceController] (which decides, from the Phone-owned wake location, whether
- * the Watch listens at all), the platform `SpeechRecognizer` is the recognizer port, and a
- * main-thread handler is the deadline timer. The screen broadcast only posts a signal; the
- * microphone is never touched from the receiver. The recognizer is released before any handoff,
- * so the app's own recorder never overlaps it. After a resume the Watch waits for its settings
- * replica to be current before listening ([WakeDeviceController.onSettingsCurrent]).
+ * Android adapter for the Watch's wake phrase: the platform `SpeechRecognizer` is the recognizer
+ * port of the shared [WakeDeviceController] (which decides, from the Phone-owned wake location,
+ * whether the Watch listens at all) and a main-thread handler is the deadline timer. It belongs
+ * to the application's [WatchVoiceRuntime], not to an activity: the runtime tells the controller
+ * when the app is shown, hidden or has a background session (see
+ * [com.rumi.hermesvoice.core.wake.WakePresence]). The recognizer is released before any handoff,
+ * so the app's own recorder never overlaps it. All calls are on the main thread.
  */
 class WakeController(
-    private val activity: ComponentActivity,
+    private val context: Context,
     port: WakeDevicePort,
     initial: WatchSettings,
     claims: WakeClaimPort,
-) : DefaultLifecycleObserver {
+    /** The recognizer reported something for the open window (the runtime keeps the CPU awake for it). */
+    private val onActivity: () -> Unit = {},
+) {
     private val handler = Handler(Looper.getMainLooper())
     private var recognizer: SpeechRecognizer? = null
     private val guard = RecognizerGuard()
@@ -51,21 +47,23 @@ class WakeController(
      */
     var qaFixtureRecognizer = false
 
-    /** Debug QA only: a result of the simulated recognizer for the open window. */
-    fun qaHeard(text: String, final: Boolean) {
+    /**
+     * Debug QA only: a result of the simulated recognizer, as the recognizer of window [generation]
+     * (the one open when the phrase was "heard") would report it; a later window never takes it.
+     */
+    fun qaHeard(text: String, final: Boolean, generation: Long = wake.generation) {
         if (!qaFixtureRecognizer) return
-        Log.i(TAG, "qa recognizer fixture result gen=${wake.generation} final=$final chars=${text.length} (simulated, not recognition)")
-        wake.onResults(wake.generation, listOf(text), final)
+        Log.i(TAG, "qa recognizer fixture result gen=$generation current=${wake.generation} final=$final chars=${text.length} (simulated, not recognition)")
+        wake.onResults(generation, listOf(text), final)
     }
-    private var receiverRegistered = false
 
     private val recognizerPort: WakeRecognizerPort = object : WakeRecognizerPort {
         override fun available(): Boolean = qaFixtureRecognizer ||
-            runCatching { SpeechRecognizer.isRecognitionAvailable(activity) }.getOrDefault(false) || onDeviceAvailable()
+            runCatching { SpeechRecognizer.isRecognitionAvailable(context) }.getOrDefault(false) || onDeviceAvailable()
 
         override fun start(generation: Long): Boolean {
             if (qaFixtureRecognizer) {
-                Log.i(TAG, "wake window opened gen=$generation mode=FIXTURE window_ms=${WakeContract.WINDOW_MS} (simulated recognizer)")
+                Log.i(TAG, "wake window opened gen=$generation mode=FIXTURE window_ms=${wake.windowMs} (simulated recognizer)")
                 return true
             }
             return startRecognizer(generation, onDevice = onDeviceAvailable())
@@ -76,7 +74,7 @@ class WakeController(
 
     /** On-device recognition is preferred; [onDevice] false uses the system's default recognition service. */
     private fun startRecognizer(generation: Long, onDevice: Boolean): Boolean = runCatching {
-        val created = if (onDevice) SpeechRecognizer.createOnDeviceSpeechRecognizer(activity) else SpeechRecognizer.createSpeechRecognizer(activity)
+        val created = if (onDevice) SpeechRecognizer.createOnDeviceSpeechRecognizer(context) else SpeechRecognizer.createSpeechRecognizer(context)
         recognizer = created
         created.setRecognitionListener(listenerFor(generation, onDevice, guard.open()))
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
@@ -90,7 +88,7 @@ class WakeController(
             .putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, SILENCE_HINT_MS)
         if (wake.settings.wakePatterns.any { it in '가'..'힣' }) intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ko-KR")
         created.startListening(intent)
-        Log.i(TAG, "wake window opened gen=$generation mode=${if (onDevice) "ON_DEVICE" else "SYSTEM"} window_ms=${WakeContract.WINDOW_MS}")
+        Log.i(TAG, "wake window opened gen=$generation mode=${if (onDevice) "ON_DEVICE" else "SYSTEM"} window_ms=${wake.windowMs}")
     }.onFailure { Log.w(TAG, "wake recognizer start failed ${it.javaClass.simpleName}") }.isSuccess
 
     /** Cancels and destroys the recognizer; its late callbacks are ignored from here on ([guard]). */
@@ -114,47 +112,11 @@ class WakeController(
     /** The shared wake flow; the activity feeds it settings, busy/idle and handoff timing. */
     val wake: WakeDeviceController = WakeDeviceController(VoiceOrigin.WATCH, recognizerPort, timerPort, port, SystemClock::elapsedRealtime, initial, claims)
 
-    private val screenReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            when (intent.action) {
-                Intent.ACTION_SCREEN_OFF -> handler.post { wake.onScreenOff() }
-                Intent.ACTION_SCREEN_ON -> handler.post { wake.onScreenOn() }
-            }
-        }
-    }
-
-    override fun onStart(owner: LifecycleOwner) {
-        if (receiverRegistered) return
-        val filter = IntentFilter().apply {
-            addAction(Intent.ACTION_SCREEN_ON)
-            addAction(Intent.ACTION_SCREEN_OFF)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            activity.registerReceiver(screenReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            activity.registerReceiver(screenReceiver, filter)
-        }
-        receiverRegistered = true
-    }
-
-    /** The Watch may hold settings older than the Phone's until the activity has read the synced item. */
-    override fun onResume(owner: LifecycleOwner) = wake.onResume(settingsPending = true)
-
-    override fun onPause(owner: LifecycleOwner) = wake.onPause()
-
-    override fun onStop(owner: LifecycleOwner) {
-        if (receiverRegistered) runCatching { activity.unregisterReceiver(screenReceiver) }
-        receiverRegistered = false
-        wake.onPause()
-    }
-
-    override fun onDestroy(owner: LifecycleOwner) {
-        handler.removeCallbacksAndMessages(null)
-        wake.onPause()
-    }
+    /** Cancels the deadline timer (the runtime calls it when it shuts the wake flow down). */
+    fun cancelTimers() = handler.removeCallbacks(deadlineCheck)
 
     private fun onDeviceAvailable(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-        runCatching { SpeechRecognizer.isOnDeviceRecognitionAvailable(activity) }.getOrDefault(false)
+        runCatching { SpeechRecognizer.isOnDeviceRecognitionAvailable(context) }.getOrDefault(false)
 
     private fun listenerFor(gen: Long, onDevice: Boolean, token: Long) = object : RecognitionListener {
         override fun onReadyForSpeech(params: Bundle?) { Log.i(TAG, "wake recognizer ready gen=$gen") }
@@ -183,6 +145,7 @@ class WakeController(
         val heard = bundle?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION).orEmpty()
         // Privacy: only counts are logged, never recognized words.
         Log.i(TAG, "wake recognizer result gen=$gen final=$final candidates=${heard.size}")
+        onActivity()
         wake.onResults(gen, heard, final)
     }
 

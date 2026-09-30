@@ -136,7 +136,22 @@ class WatchTurnIntake(
                 states.trySend(TurnStateMessage(route.turnId, "routed", route.destination.alias, false))
             }
         }
-        return coroutineScope {
+        return try {
+            relay(upload, transport, states, listener)
+        } catch (cancelled: CancellationException) {
+            // The turn was stopped on the Phone (its background relay was stopped): the Watch is told, so it does not wait on.
+            withContext(NonCancellable) {
+                runCatching {
+                    transport.sendMessage(WatchLinkPaths.STATE, TurnStateMessage(upload.turnId, "done", STOPPED_ON_PHONE, true).encode())
+                }
+            }
+            throw cancelled
+        }
+    }
+
+    private suspend fun relay(upload: WatchTurnUpload, transport: WatchTransport, states: Channel<TurnStateMessage>,
+                              listener: VoiceTurnListener): VoiceTurnOutcome =
+        coroutineScope {
             val forwarder = launch {
                 for (state in states) runCatching { transport.sendMessage(WatchLinkPaths.STATE, state.encode()) }
             }
@@ -155,6 +170,9 @@ class WatchTurnIntake(
             }
             outcome
         }
+
+    companion object {
+        const val STOPPED_ON_PHONE = "Stopped on the phone"
     }
 }
 

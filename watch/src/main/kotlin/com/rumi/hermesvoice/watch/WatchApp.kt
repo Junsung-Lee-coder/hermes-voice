@@ -2,8 +2,12 @@ package com.rumi.hermesvoice.watch
 
 import android.app.Application
 import android.content.Context
+import android.content.SharedPreferences
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.media.MediaPlayer
+import android.os.PowerManager
 import android.os.Build
 import android.os.SystemClock
 import android.os.VibrationAttributes
@@ -13,6 +17,10 @@ import android.os.VibratorManager
 import android.util.Log
 import com.google.android.gms.wearable.CapabilityClient
 import com.google.android.gms.wearable.Wearable
+import com.rumi.hermesvoice.core.KeyValueStore
+import com.rumi.hermesvoice.core.background.HoldReason
+import com.rumi.hermesvoice.core.background.WakeHolds
+import com.rumi.hermesvoice.core.background.WakeLockPort
 import com.rumi.hermesvoice.core.settings.ReplicaUpdate
 import com.rumi.hermesvoice.core.wake.ClaimVerdict
 import com.rumi.hermesvoice.core.wake.WakeClaimMessage
@@ -45,6 +53,7 @@ import java.io.File
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -60,7 +69,9 @@ import kotlinx.coroutines.withContext
  * Watch process state. The Watch never talks to Hermes: it uploads captured WAVs to the Phone,
  * shows the Phone's stage updates, plays whatever the Phone sends (acknowledging each playback so
  * the Phone can keep its ordering: ack → delivery → replies), and reads the app's conversations
- * through the Phone ([reader]).
+ * through the Phone ([reader]). Listening and recording belong to [voice]. Everything here is
+ * owned by the application, not by an activity, so it goes on with the app hidden for as long as
+ * the process runs; [WatchVoiceService] keeps it running for a background session.
  */
 class WatchApp : Application() {
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -86,6 +97,16 @@ class WatchApp : Application() {
 
     private lateinit var replica: WatchSettingsReplica
 
+    /** Device-local choices of this Watch (not the Phone-owned voice settings): the background opt-in. */
+    val localStore: KeyValueStore by lazy { PrefsStore(getSharedPreferences(LOCAL_PREFS, Context.MODE_PRIVATE)) }
+
+    /** CPU wake locks, one per reason and each with a timeout (see [WakeHolds]). */
+    val holds: WakeHolds by lazy { WakeHolds(AndroidWakeLocks(this), SystemClock::elapsedRealtime) }
+
+    /** The one voice runtime (wake phrase, recorder, background session); created with the process, on the main thread. */
+    lateinit var voice: WatchVoiceRuntime
+        private set
+
     override fun onCreate() {
         super.onCreate()
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -94,6 +115,8 @@ class WatchApp : Application() {
         // Durable migration: a copy from before the wake-location selector (or an unreadable one) is rewritten once.
         if (stored != null && stored != replica.current.toJson()) prefs.edit().putString(KEY_SETTINGS, replica.current.toJson()).apply()
         _settings.value = replica.current
+        WatchVoiceService.createChannel(this)
+        voice = WatchVoiceRuntime(this)
     }
 
     /**
@@ -232,9 +255,35 @@ class WatchApp : Application() {
     /** Debug QA only (set from WatchActivity in debuggable builds): how long every upload waits first, to model a slow link. */
     @Volatile var qaUploadDelayMs = 0L
 
+    /** Uploads that have not reached the link yet, and why one of them was stopped. */
+    private val uploads = ConcurrentHashMap<String, Job>()
+    private val uploadStops = ConcurrentHashMap<String, String>()
+
+    /** Turns the user stopped from this Watch: whatever the Phone still sends for them is not played. */
+    private val stoppedTurns = java.util.Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+
+    /**
+     * The background session was stopped with the app hidden: recordings on their way to the link
+     * are withdrawn (their wake claims given back), and the turn the Watch was waiting on is
+     * dropped here, so nothing of it is played later.
+     */
+    fun cancelPendingUploads(reason: String) {
+        if (stoppedTurns.size >= 16) stoppedTurns.clear()
+        val turnId = _talk.value.turnId
+        stoppedTurns += uploads.keys + listOfNotNull(turnId)
+        uploads.forEach { (id, job) ->
+            uploadStops[id] = reason
+            job.cancel()
+        }
+        _talk.update { if (turnId != null && it.turnId == turnId) it.sendFailed(reason) else it }
+        if (turnId != null) Log.i(TAG, "turn ${turnId.take(12)} stopped on the watch reason=$reason")
+    }
+
     private fun send(turnId: String, upload: WatchTurnUpload) {
         _talk.update { if (it.turnId == turnId) it.sending() else it }
-        scope.launch {
+        holds.acquire(HoldReason.TRANSFER, WakeContract.transitLimitMs(upload.audio.size))
+        // Registered before it runs, so its own end always finds (and removes) its entry.
+        val job = scope.launch(start = CoroutineStart.LAZY) {
             val failure = runCatching {
                 if (qaUploadDelayMs > 0) {
                     Log.i(TAG, "qa slow transfer: turn=${turnId.take(12)} waits $qaUploadDelayMs ms (debug builds only)")
@@ -251,11 +300,16 @@ class WatchApp : Application() {
                 Log.i(TAG, "upload sent turn=${turnId.take(12)} trigger=${upload.trigger} kind=" +
                     (if (upload.recognizedText != null) "recognized_request" else "wav") + " bytes=${upload.audio.size}")
             } else {
-                Log.w(TAG, "upload failed: ${failure.message}")
+                val stopped = uploadStops.remove(turnId)
+                Log.w(TAG, "upload failed: ${stopped ?: failure.message}")
                 transit.onTransferFailed(turnId)
-                _talk.update { if (it.turnId == turnId) it.sendFailed(failure.message ?: "Could not reach the phone") else it }
+                _talk.update { if (it.turnId == turnId) it.sendFailed(stopped ?: failure.message ?: "Could not reach the phone") else it }
             }
+            uploads.remove(turnId)
+            if (uploads.isEmpty()) holds.release(HoldReason.TRANSFER)
         }
+        uploads[turnId] = job
+        job.start()
     }
 
     fun onPhoneState(message: TurnStateMessage) {
@@ -432,6 +486,10 @@ class WatchApp : Application() {
         stopPlayback("superseded")
         Log.i(TAG, "play received turn=${request.turnId.take(12)} seq=${request.sequence} role=${request.role} " +
             "bytes=${request.audio.size} from=${nodeId.take(8)} own_turn=${request.turnId == _talk.value.turnId}")
+        if (request.turnId in stoppedTurns) return refusePlayback(request, nodeId, "stopped on the watch")
+        // Audio focus, as any player: not granted (a call, or a policy that silences this app) means not played.
+        if (!requestFocus()) return refusePlayback(request, nodeId, "audio focus denied")
+        holds.acquire(HoldReason.PLAYBACK)
         val file = File(cacheDir, "hv-play-${request.sequence}.${if (request.mimeType.contains("wav")) "wav" else "mp3"}")
         file.writeBytes(request.audio)
         _talk.update { it.playing(request.turnId) }
@@ -439,8 +497,9 @@ class WatchApp : Application() {
         player = mp
         playing = request
         playingNode = nodeId
-        mp.setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ASSISTANT)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+        mp.setAudioAttributes(playbackAttributes)
+        // The player keeps the CPU awake while it plays, screen on or off.
+        mp.setWakeMode(this, PowerManager.PARTIAL_WAKE_LOCK)
         // A callback from a player that was already replaced must not end (or ACK) the current one.
         mp.setOnCompletionListener { if (player === it) finishPlayback(ok = true, error = "") }
         mp.setOnErrorListener { it, what, extra ->
@@ -475,25 +534,91 @@ class WatchApp : Application() {
         player = null
         playing = null
         playingNode = null
+        abandonFocus()
         lastPlaybackEndedAtMs = SystemClock.elapsedRealtime()
         _talk.update { it.playbackEnded(request.turnId) }
-        if (node != null) {
-            scope.launch {
-                val sent = runCatching {
-                    Wearable.getMessageClient(this@WatchApp)
-                        .sendMessage(node, WatchLinkPaths.PLAYED, PlayedAck(request.turnId, request.sequence, ok, error).encode()).await()
-                }
-                Log.i(TAG, "played ack turn=${request.turnId.take(12)} seq=${request.sequence} ok=$ok" +
-                    (if (ok) "" else " error=$error") + " sent=${sent.isSuccess}")
+        if (node == null) return holds.release(HoldReason.PLAYBACK)
+        sendPlayed(request, node, ok, error)
+    }
+
+    /** Not played at all: the Phone is told so (it never waits for a timeout, and never takes it for played). */
+    private fun refusePlayback(request: PlayRequest, nodeId: String, error: String) {
+        holds.acquire(HoldReason.PLAYBACK, ACK_HOLD_MS)
+        sendPlayed(request, nodeId, ok = false, error = error)
+    }
+
+    private fun sendPlayed(request: PlayRequest, node: String, ok: Boolean, error: String) {
+        scope.launch {
+            val sent = runCatching {
+                Wearable.getMessageClient(this@WatchApp)
+                    .sendMessage(node, WatchLinkPaths.PLAYED, PlayedAck(request.turnId, request.sequence, ok, error).encode()).await()
             }
+            Log.i(TAG, "played ack turn=${request.turnId.take(12)} seq=${request.sequence} ok=$ok" +
+                (if (ok) "" else " error=$error") + " sent=${sent.isSuccess}")
+            // The next utterance takes its own hold; none is playing now.
+            if (playing == null) holds.release(HoldReason.PLAYBACK)
         }
+    }
+
+    private val playbackAttributes: AudioAttributes = AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ASSISTANT)
+        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build()
+
+    /** Losing the focus for good or for a while (a call, another player) ends the utterance; it is acknowledged as not played. */
+    private val focusRequest: AudioFocusRequest by lazy {
+        AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+            .setAudioAttributes(playbackAttributes)
+            .setOnAudioFocusChangeListener { change ->
+                if (change == AudioManager.AUDIOFOCUS_LOSS || change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
+                    scope.launch { stopPlayback("audio focus lost") }
+                }
+            }.build()
+    }
+
+    private fun requestFocus(): Boolean = runCatching {
+        getSystemService(AudioManager::class.java).requestAudioFocus(focusRequest) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+    }.getOrDefault(false)
+
+    private fun abandonFocus() {
+        runCatching { getSystemService(AudioManager::class.java).abandonAudioFocusRequest(focusRequest) }
     }
 
     companion object {
         private const val TAG = "HermesVoiceWatch"
         private const val PREFS = "hermes_voice_watch"
         private const val KEY_SETTINGS = "settings_json"
+        private const val LOCAL_PREFS = "hermes_voice_watch_local"
+        private const val ACK_HOLD_MS = 10_000L
 
         fun from(context: Context): WatchApp = context.applicationContext as WatchApp
+    }
+}
+
+/** A private SharedPreferences file as the core's key-value seam. */
+private class PrefsStore(private val prefs: SharedPreferences) : KeyValueStore {
+    override fun getString(key: String): String? = prefs.getString(key, null)
+    override fun putString(key: String, value: String) { prefs.edit().putString(key, value).apply() }
+    override fun commitString(key: String, value: String): Boolean = prefs.edit().putString(key, value).commit()
+    override fun getBoolean(key: String, default: Boolean): Boolean = prefs.getBoolean(key, default)
+    override fun putBoolean(key: String, value: Boolean) { prefs.edit().putBoolean(key, value).apply() }
+    override fun getInt(key: String, default: Int): Int = prefs.getInt(key, default)
+    override fun putInt(key: String, value: Int) { prefs.edit().putInt(key, value).apply() }
+}
+
+/** One partial wake lock per reason; every acquire carries the timeout [WakeHolds] bounded. */
+class AndroidWakeLocks(context: Context) : WakeLockPort {
+    private val power = context.applicationContext.getSystemService(PowerManager::class.java)
+    private val locks = HashMap<HoldReason, PowerManager.WakeLock>()
+
+    @Synchronized
+    override fun acquire(reason: HoldReason, timeoutMs: Long) {
+        val lock = locks.getOrPut(reason) {
+            power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "HermesVoice:${reason.name.lowercase()}").apply { setReferenceCounted(false) }
+        }
+        lock.acquire(timeoutMs)
+    }
+
+    @Synchronized
+    override fun release(reason: HoldReason) {
+        locks[reason]?.takeIf { it.isHeld }?.release()
     }
 }

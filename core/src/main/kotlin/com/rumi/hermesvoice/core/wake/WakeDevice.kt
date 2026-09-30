@@ -132,6 +132,9 @@ class WakeDeviceController(
     var settings: WatchSettings = initial
         private set
 
+    /** How long the next window stays open without hearing the phrase ([WakePresence] lengthens it for a background session). */
+    var windowMs: Long = WakeContract.WINDOW_MS
+
     /** Whether this device listens under the current mode. */
     val enabledHere: Boolean get() = settings.wakeLocation.listensOn(device)
 
@@ -216,10 +219,22 @@ class WakeDeviceController(
         // Read before the recognizer starts: what this window hears is newer than every request answered so far.
         val epoch = claims?.epoch() ?: 0L
         val wasListening = window.listening
-        val block = window.requestArm(inputs)
+        val block = window.requestArm(inputs, windowMs)
         if (block == null && !wasListening) windowEpoch = epoch
         if (block != null) port.armBlocked(source, block)
         return block
+    }
+
+    /**
+     * Opens the next window of an armed background session: a new generation, so nothing of the
+     * window before it can act on this one. Does nothing while a window is open or a wake episode
+     * is under way (a claim asked, a handoff pending, a request being recorded).
+     */
+    fun rearm(source: String): WakeBlock? {
+        if (window.listening) return WakeBlock.ALREADY_ARMED
+        if (claim != null || heldHandoff != null || handoffGate.pending || capturing) return WakeBlock.BUSY
+        window.newGeneration("rearm")
+        return requestArm(source)
     }
 
     fun onResults(generation: Long, hypotheses: List<String>, final: Boolean) {
