@@ -243,6 +243,29 @@ class VadReviewMatrixTest {
     }
 
     @Test
+    fun `steady noise that starts and stops inside the recording is refused, speech in the same place is not`() {
+        // Found on the paired emulators: a push-to-talk recording of quiet + steady noise + quiet.
+        for (seed in 1..10) for (level in listOf(300.0, 700.0, 1_200.0, 3_000.0)) for (secs in listOf(1L, 2L, 6L, 30L)) {
+            val s = Signals(rate, seed)
+            val stepNoise = s.concat(s.noise(500, 3.0), s.noise(secs * 1_000, level), s.noise(600, 3.0))
+            assertEquals("seed $seed: ${secs}s of steady noise $level between quiet margins", AudioInputVerdict.NO_SPEECH_ENERGY, gate(stepNoise))
+            val inRoom = s.concat(s.noise(500, bg), s.noise(secs * 1_000, level), s.noise(600, bg))
+            assertEquals("seed $seed: the same over room noise", AudioInputVerdict.NO_SPEECH_ENERGY, gate(inRoom))
+        }
+        for (seed in 1..10) {
+            val s = Signals(rate, seed)
+            assertEquals("a perfectly steady tone alone", AudioInputVerdict.NO_SPEECH_ENERGY, gate(s.concat(s.noise(300, bg), s.tone(3_000, 3_000.0), s.noise(300, bg))))
+            // A held vowel wobbles like a voice (±1 dB): the check stays on the permissive side and lets it through.
+            assertEquals("a held vowel alone", AudioInputVerdict.USABLE, gate(s.concat(s.noise(300, bg), held(s, 3_000, 3_000.0), s.noise(300, bg))))
+            assertEquals("speech between quiet margins", AudioInputVerdict.USABLE,
+                gate(s.concat(s.noise(500, 3.0), s.speech(6_000, 1_200.0), s.noise(600, 3.0))))
+            assertEquals("speech after a steady noise", AudioInputVerdict.USABLE,
+                gate(s.concat(s.noise(500, bg), s.noise(3_000, 1_200.0), s.over(s.speech(4_000, 3_000.0), bg), s.noise(600, bg))))
+            assertEquals("one short word", AudioInputVerdict.USABLE, gate(s.concat(s.noise(500, bg), s.over(s.syllable(220, 1_500.0), bg), s.noise(600, bg))))
+        }
+    }
+
+    @Test
     fun `recordings with no speech are still refused and soft or tight speech still passes`() {
         val s = Signals(rate, 42)
         assertEquals(AudioInputVerdict.SILENT, gate(s.silence(5_000)))

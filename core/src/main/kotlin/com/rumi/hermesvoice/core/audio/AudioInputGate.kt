@@ -30,17 +30,26 @@ enum class AudioInputVerdict {
  * - [AudioInputVerdict.INVALID]: unreadable, not 16-bit PCM, or under [MIN_AUDIO_MS];
  * - [AudioInputVerdict.SILENT]: peak below [MIN_PEAK] (about −44 dBFS), far below soft speech;
  * - [AudioInputVerdict.NO_SPEECH_ENERGY]: the shared [EnergyVad] ([VadProfile.ELIGIBILITY], 20 ms
- *   frames, floor seeded from the recording's 10th-percentile frame level) never qualifies speech:
- *   nothing at least twice the background for [VadProfile.MIN_SPEECH_MS] (short dips tolerated).
+ *   frames, fixed floor = the recording's 10th-percentile frame level) never qualifies speech
+ *   (nothing half again above the background for [VadProfile.MIN_SPEECH_MS], short dips
+ *   tolerated), or everything loud in it is one steady level: at least half a second of loud
+ *   frames, none of whose 1 s stretches varies by [MODULATION_RATIO] (steady noise that started
+ *   and stopped during the recording, a hum, a held tone).
  *
- * It is an energy test, not a speech detector: loud non-speech sound passes it (and may still be
- * mis-transcribed), and it deliberately leans towards letting soft and short speech through. A
- * hands-free request that its endpoint ended as speech always has frames 3× its background, so it
- * passes this 2× check on the same frames.
+ * It is an energy test, not a speech detector: changing non-speech sound passes it (and may still
+ * be mis-transcribed), and it deliberately leans towards letting soft and short speech through,
+ * including speech a few dB above loud steady noise.
  */
 object AudioInputGate {
     const val MIN_AUDIO_MS = 100L
     const val MIN_PEAK = 200
+
+    /** Half a second of loud frames is enough to judge whether the loud part is steady. */
+    const val MIN_MODULATION_FRAMES = 25
+    const val MODULATION_WINDOW_FRAMES = 50
+
+    /** Loud frames of speech differ by far more than this; those of steady noise by a few percent. */
+    const val MODULATION_RATIO = 1.2
 
     /** Recordings in formats this gate cannot read (none today) are left to the dashboard. */
     fun assess(audio: ByteArray, mimeType: String): AudioInputVerdict {
@@ -63,11 +72,29 @@ object AudioInputGate {
         if (peak < MIN_PEAK) return AudioInputVerdict.SILENT
         val vad = EnergyVad(VadProfile.ELIGIBILITY, levels.sorted()[(levels.size - 1) / 10])
         val frameMs = PcmFramer.FRAME_MS.toLong()
+        val recent = DoubleArray(MODULATION_WINDOW_FRAMES)
+        val sorted = DoubleArray(MODULATION_WINDOW_FRAMES)
+        var voicedFrames = 0
+        var qualified = false
+        var modulated = false
         for (level in levels) {
-            vad.observe(level, frameMs)
-            if (vad.qualified) return AudioInputVerdict.USABLE
+            if (vad.observe(level, frameMs) != VadClass.VOICED) continue
+            qualified = qualified || vad.qualified
+            recent[voicedFrames % recent.size] = level
+            voicedFrames++
+            val n = min(voicedFrames, recent.size)
+            if (modulated || n < MIN_MODULATION_FRAMES) continue
+            System.arraycopy(recent, 0, sorted, 0, n)
+            java.util.Arrays.sort(sorted, 0, n)
+            // The quietest and loudest tenth are left out, so the edges of a noise block do not count.
+            modulated = sorted[n - 1 - n / 10] >= sorted[n / 10] * MODULATION_RATIO
         }
-        return AudioInputVerdict.NO_SPEECH_ENERGY
+        return when {
+            !qualified -> AudioInputVerdict.NO_SPEECH_ENERGY
+            // Too little loud audio to judge its steadiness: a short word passes.
+            voicedFrames < MIN_MODULATION_FRAMES || modulated -> AudioInputVerdict.USABLE
+            else -> AudioInputVerdict.NO_SPEECH_ENERGY
+        }
     }
 }
 

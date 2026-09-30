@@ -160,7 +160,9 @@ The flow is the same whether a turn starts on the Phone or the Watch:
    checks before uploading and the Phone checks again before accepting. The check runs the same
    voice-activity detector as the hands-free ending (see [Hands-free ending](#hands-free-ending-shared-vad)),
    with a lower bar: it only refuses a recording in which nothing rose at least half again above
-   its own background for 140 ms, i.e. silence or steady noise. Speech in loud steady noise
+   its own background for 140 ms, or whose loud part (half a second or more) stays at one steady
+   level, i.e. silence or steady noise, also when the noise started and stopped during the
+   recording. Speech in loud steady noise
    (tested down to 3 dB above it) passes. It is a loudness check, not speech recognition: it lets
    soft and short speech through, so changing non-speech sound still reaches speech-to-text, which
    can mistake it for words. Otherwise the Phone calls `POST /api/audio/transcribe`. If that finds no speech,
@@ -433,7 +435,7 @@ builds ignore them.
 
 Only the following has been run:
 
-- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **255 JUnit tests**, all
+- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **256 JUnit tests**, all
   passing. They use an in-process fake dashboard and cover sign-in, session ownership, chat and
   attachments, routing, playback routing, the Watch link and reader contracts, the wake contract
   (final-only, leading wake phrase, contradicted or empty finals, 30/60/120-second recognizer
@@ -445,7 +447,7 @@ Only the following has been run:
   shallow-modulated voice, and speaking before the buzz (40 seeds at four levels) never end it
   early; isolated and sparse clicks don't count; short words and soft speech do; push-to-talk
   speech 3, 5 and 7 dB above steady noise is accepted for 30 seeds at 4, 20 and 60 s while silence
-  and steady noise alone are refused; whenever the ending finds speech the recording check
+  and steady noise alone (throughout, or between quiet margins) are refused; whenever the ending finds speech the recording check
   accepts the same audio), wake arbitration in Both (the claim lease, its renewal, expiry and
   stale messages; two simulated recognizers hearing the same phrase in either order, by partial or
   final result, phrase-only and in one breath; unanswered, refused and lost claims; push-to-talk
