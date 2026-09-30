@@ -429,6 +429,16 @@ Only the following has been run:
     recording one, both stopped the recording without sending it.
   - *Push-to-talk:* on both devices a recording with 6 seconds of silence after the speech was
     sent only on the tap; a silent Phone recording was refused before speech-to-text.
+  - *New conversations from the router:* starting with no conversations at all, a spoken request
+    on the Phone led the real routing model to ask for a new conversation; the Phone created it,
+    played the ack, delivered the transcript and played the reply, and the conversation appeared
+    in the Phone list. The next request on that topic was routed to it without creating another.
+    A hands-free Watch request on an unrelated topic created a second conversation, with the ack
+    and the reply played and acknowledged on the Watch; the Watch browser listed it on its own and
+    showed its history, and a follow-up from the Watch reused it. The dashboard held exactly those
+    two app conversations plus the hidden routing session. Whether to create was the model's own
+    choice in these runs; forced replies (refusals, malformed replies, failures, restarts) were
+    exercised only in the unit tests against the fake dashboard.
   - *Earlier builds:* Watch reader, gestures, bezel scrolling and haptics, Watch playback with
     `played` ACKs, and playback switching between devices.
 
