@@ -31,7 +31,14 @@ enum class MicBlock {
      * session's channel switched off): a hidden microphone would have no visible indicator and no
      * Stop outside the app, so it is not armed.
      */
-    NOTIFICATIONS;
+    NOTIFICATIONS,
+
+    /**
+     * The app is on screen but this show's check of the Phone's settings hasn't finished: a NEW
+     * microphone arming waits for it (an already armed session isn't affected). In-process only;
+     * not a stored setting and nothing sent to the Phone.
+     */
+    SETTINGS_PENDING;
 
     companion object {
         fun of(wanted: Boolean, permission: Boolean): MicBlock? = when {
@@ -64,6 +71,9 @@ enum class BackgroundNotice {
 
     /** Running for replies only: the device has no speech recognizer. */
     NO_RECOGNIZER,
+
+    /** Running for replies only while the open app finishes checking the Phone's settings; listening follows. */
+    NEEDS_SETTINGS,
 
     /** Opted in, not running (the system ended it, or the device restarted): the user has to start it again. */
     PAUSED,
@@ -116,6 +126,7 @@ class BackgroundSession(
                 MicBlock.PERMISSION -> BackgroundNotice.NEEDS_PERMISSION
                 MicBlock.NO_RECOGNIZER -> BackgroundNotice.NO_RECOGNIZER
                 MicBlock.NOTIFICATIONS -> BackgroundNotice.NEEDS_NOTIFICATIONS
+                MicBlock.SETTINGS_PENDING -> BackgroundNotice.NEEDS_SETTINGS
                 null -> BackgroundNotice.NEEDS_VISIBLE_TO_LISTEN
             }
         })

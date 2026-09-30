@@ -17,6 +17,7 @@ object BackgroundText {
             BackgroundNotice.NEEDS_VISIBLE_TO_LISTEN -> "Open the app to listen for the wake phrase"
             BackgroundNotice.NEEDS_NOTIFICATIONS -> "Not listening: notifications are off"
             BackgroundNotice.NO_RECOGNIZER -> "Wake phrase unavailable on this watch"
+            BackgroundNotice.NEEDS_SETTINGS -> "Not listening: Phone settings check not complete"
             else -> "The wake phrase is off for the watch"
         }
     }
@@ -30,6 +31,7 @@ object BackgroundText {
         BackgroundNotice.NEEDS_VISIBLE_TO_LISTEN -> "Background: replies only until opened"
         BackgroundNotice.NEEDS_NOTIFICATIONS -> "Background: replies only. Allow notifications, then open this app to listen"
         BackgroundNotice.NO_RECOGNIZER -> "Background: replies only (no recognizer)"
+        BackgroundNotice.NEEDS_SETTINGS -> "Background: checking Phone settings (replies only)"
         BackgroundNotice.PAUSED -> "Background: paused"
         BackgroundNotice.NEEDS_VISIBLE -> "Background: open the app to start"
         BackgroundNotice.REFUSED -> "Background: couldn't start"

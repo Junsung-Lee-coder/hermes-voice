@@ -494,7 +494,11 @@ anything on the Watch.
 - **The microphone is armed only from the open app.** Android doesn't let an app start using the
   microphone from the background, and the Watch doesn't try. It arms only while its app is on
   screen, after that show's settings check has finished; a check that finishes after you left is
-  ignored. Anything that stops it from listening (the Phone's setting no longer including the
+  ignored. A Start before the check finishes (for example right after the notification prompt)
+  runs the session for replies only, showing "Background: checking Phone settings (replies
+  only)", and listening starts when the check finishes. If you leave first, it keeps playing
+  replies only ("replies only until opened") and listens after your next visit to the app. A
+  session that was already listening keeps listening while a new visit's check runs. Anything that stops it from listening (the Phone's setting no longer including the
   Watch, the microphone or notification permission taken away, notifications switched off, no
   recognizer found) disarms it at once and the session keeps only playback. When that changes
   back while the app is closed, the Watch shows why it replies only and listens again only once
@@ -506,9 +510,11 @@ anything on the Watch.
   stopped and the Watch shows "Stopped on the phone". With the app open, Stop only ends the
   background part. Withdrawing a recording is best effort once sending has begun: the Phone may
   already have received it and started on it (transcription, routing, possibly creating a new
-  conversation). Even then its transcript is never delivered after a Stop, and nothing is
-  confirmed as played, because the stopped Watch refuses to play the acknowledgement and a request
-  is delivered only after its acknowledgement has played.
+  conversation). Even then, while the Watch remains the latest accepted voice sender, its
+  transcript isn't delivered after a Stop and nothing is confirmed as played: the stopped Watch
+  refuses to play the acknowledgement, and a request is delivered only after its acknowledgement
+  has played. If a newer request from the Phone is accepted first, replies move to the Phone, the
+  older request's acknowledgement can play there, and that request can then be delivered.
 - **Nothing restarts by itself.** A session the system ended (force stop, the system's own Stop,
   a revoked permission, a reboot, an app update) shows as paused. The Phone's relay starts again
   when you next open the Phone app; the Watch waits for your "Tap to start". There is no boot
@@ -530,7 +536,11 @@ anything on the Watch.
   (the pause, a back-off or retry of up to a minute, and a reachability check of at most
   5 seconds). A new lock is taken before the one it replaces is let go. So the CPU and the speech
   recognizer keep running: expect a clearly shorter battery life while it is on. While it waits
-  to retry (recognizer failing, Phone unreachable) it says "retrying", not "listening". Waiting
+  to retry (recognizer failing, Phone unreachable, microphone muted) it says "retrying", not
+  "listening". Each retry's lock is short and time-limited, but retries have no overall limit. A
+  Phone that stays unreachable, a muted microphone or a recognizer that keeps failing can
+  therefore keep the Watch's CPU awake indefinitely, until you tap Stop or the cause goes away.
+  That can drain the battery, and the impact hasn't been measured. Waiting
   for the Phone's answer after a request is sent holds nothing; the Phone's messages wake the
   Watch. Every wake lock has a reason and a time limit (a window, a handoff, a gap, a recording, a
   transfer, a turn, an utterance) and is released when that ends. No battery figure has been
@@ -595,7 +605,7 @@ is a simulated recognizer result for the window open at that moment (again never
 
 Only the following has been run:
 
-- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **368 JUnit tests**, all
+- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **381 JUnit tests**, all
   passing. They use an in-process fake dashboard and cover sign-in, session ownership, chat and
   attachments, routing, playback routing, the Watch link and reader contracts, the wake contract
   (final-only, leading wake phrase, contradicted or empty finals, 30/60/120-second recognizer
@@ -648,7 +658,9 @@ Only the following has been run:
   finishes after the app was hidden never asks for the microphone, whether the platform would
   grant or refuse it; normal reopen and visible Stop then Start listen again; a session never says
   it listens when it can't; no microphone without a visible notification, with notifications
-  allowed later arming only at a visible show; no recognizer narrows it to playback; a hold covers
+  allowed later arming only at a visible show; a Start before the show's settings check, or
+  leaving before it finishes, plays replies only and never says it listens, while a session
+  already listening keeps its loop; no recognizer narrows it to playback; a hold covers
   every step from window to handoff to recorder and every gap, taken before the previous one is
   let go and released once), the device-local opt-ins (a restored or updated install never
   starts the relay from a backed-up copy; the backup rules exclude the files the apps use),

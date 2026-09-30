@@ -62,11 +62,14 @@ interface WatchVoiceHost {
  * ([BackgroundSession]), whether the wake flow follows the screen or the session ([WakePresence])
  * and the session's CPU holds ([WakeHolds]).
  *
- * - The microphone is armed only while the app is visible, only from the current visit (a
- *   settings read that finishes after the app was hidden is ignored), and only when nothing blocks
- *   it ([block]): the Phone's settings include the Watch, the microphone is allowed, a recognizer
- *   exists and the session's notification with its Stop can be seen. Anything that blocks it
- *   later disarms at once, wherever it comes from; nothing arms it from the background.
+ * - The microphone is armed only while the app is visible, only once the current visit's
+ *   settings read has applied (a read that finishes after the app was hidden, or belongs to an
+ *   earlier show, is ignored; a Start before it runs the session for replies until it applies),
+ *   and only when nothing blocks it ([block]): the Phone's settings include the Watch, the
+ *   microphone is allowed, a recognizer exists and the session's notification with its Stop can
+ *   be seen. Anything that blocks it later disarms at once, wherever it comes from; nothing arms
+ *   it from the background. A session already armed by an earlier show keeps its loop while a
+ *   new show's read is pending.
  * - A session never says it listens while its loop can't: a microphone the platform grants to a
  *   hidden app is dropped again, and a loop that stops (no recognizer) narrows the session to replies.
  * - While armed, some finite hold covers every step that can be under way with the screen off:
@@ -92,6 +95,13 @@ class WatchVoiceCoordinator(
 
     /** Counts the app's shows and hides; a settings read belongs to the show that started it. */
     var visit = 0L
+        private set
+
+    /**
+     * The current visit's settings read has applied ([onSettingsPulled] of this visit, while visible).
+     * Cleared by every show and hide; nothing else sets it.
+     */
+    var settingsReady = false
         private set
 
     private var syncPosted = false
@@ -166,18 +176,26 @@ class WatchVoiceCoordinator(
                 // Nothing can listen: say so instead of claiming to.
                 WakeBlock.PERMISSION -> session.onMicrophoneBlock(MicBlock.PERMISSION, presence.visible)
                 WakeBlock.NOT_FOREGROUND -> session.onMicrophoneStalled(session.generation)
+                // Armed, included by the settings, yet the flow can't open a window: a stall, never a silent no-op.
+                WakeBlock.DISABLED -> if (wake.enabledHere) session.onMicrophoneStalled(session.generation)
                 else -> Unit
             }
             sync()
         }
     }
 
-    /** What stands in the way of arming the microphone now, from live platform facts; null when nothing does. */
+    /**
+     * What stands in the way of arming the microphone now, from live platform facts; null when
+     * nothing does. A pending settings read of the visible show is the last precondition, and only
+     * for a NEW arming: it never disarms a session that is already armed, and while the app is
+     * hidden visibility itself keeps a new arming out.
+     */
     fun block(): MicBlock? = when {
         !host.settings().watchWakeEnabled -> MicBlock.NOT_WANTED
         !host.microphonePermission() -> MicBlock.PERMISSION
         !host.recognizerAvailable() -> MicBlock.NO_RECOGNIZER
         !host.notifications().shown -> MicBlock.NOTIFICATIONS
+        presence.visible && !settingsReady && !session.status.microphone -> MicBlock.SETTINGS_PENDING
         else -> null
     }
 
@@ -186,7 +204,10 @@ class WatchVoiceCoordinator(
     /** The app is on screen. Returns this visit; the settings read it starts reports back with it. */
     fun onActivityResumed(): Long {
         visit += 1
+        settingsReady = false
         presence.onActivityResumed(settingsPending = true)
+        // A session running for replies now waits for this show's read (and says so).
+        session.onMicrophoneBlock(block(), visible = false)
         sync()
         return visit
     }
@@ -201,6 +222,7 @@ class WatchVoiceCoordinator(
             host.log("settings read of an earlier visit ignored (visit=$visit current=${this.visit} visible=${presence.visible})")
             return false
         }
+        settingsReady = true
         wake.onSettings(host.settings())
         presence.onSettingsCurrent()
         session.onVisible(block())
@@ -210,7 +232,10 @@ class WatchVoiceCoordinator(
 
     fun onActivityPaused() {
         visit += 1
+        settingsReady = false
         presence.onActivityPaused()
+        // Hidden: a pending read no longer applies; the session says it replies until opened (it can only disarm here).
+        session.onMicrophoneBlock(block(), visible = false)
         sync()
     }
 
