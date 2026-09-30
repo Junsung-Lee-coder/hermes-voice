@@ -158,6 +158,17 @@ class AndroidWiringGateTest {
     }
 
     @Test
+    fun `the phone's session data is saved with a confirmed commit, never a fire-and-forget apply`() {
+        val stores = source("$phone/AndroidStores.kt")
+        assertTrue(stores.contains("override fun commitString(key: String, value: String): Boolean = prefs.edit().putString(key, value).commit()"))
+        val sessions = source("core/src/main/kotlin/com/rumi/hermesvoice/core/sessions/AppSessions.kt")
+        assertFalse("registry, journal and migration marker never use the unconfirmed write", sessions.contains("putString("))
+        assertTrue("and their writes run off the main thread", sessions.contains("private val io: CoroutineDispatcher = Dispatchers.IO") &&
+            Regex("withContext\\(io\\) \\{ (journal|registry)\\.").findAll(sessions).count() >= 6)
+        assertTrue(source("$phone/PhoneViewModel.kt").contains("wiring.core.sessions.updateDestination(session.storedSessionId, alias, description)"))
+    }
+
+    @Test
     fun `settings migrate at phone start and the watch validates what it receives`() {
         assertTrue(source("$phone/PhoneApp.kt").contains("settings.migrate()"))
         val app = source("$watch/WatchApp.kt")

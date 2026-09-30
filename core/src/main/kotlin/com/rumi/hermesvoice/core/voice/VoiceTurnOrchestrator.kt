@@ -72,7 +72,10 @@ class VoiceTurnRequest(
 enum class VoiceTurnStage { TRANSCRIBING, ROUTING, CREATING, ACKNOWLEDGING, DELIVERING, RESPONDING }
 
 /** What is durably known about a turn that asked for a new conversation (see [RecipientCreator]). */
-data class PriorCreate(val intent: CreateIntent, val ackText: String, val submitted: Boolean)
+data class PriorCreate(val intent: CreateIntent, val submitted: Boolean)
+
+/** A conversation the Phone created and registered for a turn: the destination and its actual title. */
+data class CreatedRecipient(val destination: DestinationEntry, val title: String)
 
 /**
  * Creates the conversation a router asked for. The Phone implements it over its session
@@ -83,11 +86,24 @@ interface RecipientCreator {
     /** Non-null when [turnId] already asked for a new conversation, even before a restart. */
     fun previous(turnId: String): PriorCreate?
 
-    /** The created (or, for the same [turnId], previously created) destination; throws on failure or ambiguity. */
-    suspend fun create(turnId: String, intent: CreateIntent, ackText: String): DestinationEntry
+    /**
+     * The created (or, for the same [turnId], previously created) destination, verified on the
+     * dashboard and saved durably in the registry; throws on failure, a failed save, or ambiguity.
+     */
+    suspend fun create(turnId: String, intent: CreateIntent): CreatedRecipient
 
-    /** Called right before the transcript is submitted; false when it already was (never submit twice). */
-    fun markSubmitted(turnId: String): Boolean
+    /**
+     * Called after the acknowledgement played and right before any transcript is submitted: throws
+     * unless [storedSessionId] is still this app's unarchived conversation.
+     */
+    suspend fun requireDeliverable(storedSessionId: String)
+
+    /**
+     * Called right before a created turn's transcript is submitted. It saves "submitted" durably
+     * first: false when it already was (never submit twice); throws when it could not be saved
+     * (then nothing may be submitted).
+     */
+    suspend fun markSubmitted(turnId: String): Boolean
 }
 
 interface VoiceTurnListener {
@@ -187,7 +203,13 @@ class VoiceTurnOrchestrator(
         }
         // A turn that already created a conversation and submitted its transcript (even before a
         // restart) is a replay: it must not submit again, and it does not move the playback route.
-        if (recipientCreator?.previous(request.turnId)?.submitted == true) return VoiceTurnOutcome.Duplicate(request.turnId)
+        val prior = try {
+            recipientCreator?.previous(request.turnId)
+        } catch (error: HermesException) {
+            // The Phone's saved record of created conversations can't be trusted: fail closed.
+            return VoiceTurnOutcome.NotDelivered(VoiceTurnStage.TRANSCRIBING, error.message ?: error.javaClass.simpleName)
+        }
+        if (prior?.submitted == true) return VoiceTurnOutcome.Duplicate(request.turnId)
         if (!accept(request)) return VoiceTurnOutcome.Duplicate(request.turnId)
         listener.onAccepted(request.turnId, request.origin)
         request.listener?.onAccepted(request.turnId, request.origin)
@@ -220,7 +242,7 @@ class VoiceTurnOrchestrator(
             // A replayed turn that already asked for a new conversation resumes with that one
             // (or fails closed if its creation is unresolved); it is not routed a second time.
             val prior = recipientCreator?.previous(request.turnId)
-            val decision: RoutingDecision = if (prior != null) RoutingDecision.Create(prior.intent, prior.ackText) else {
+            val decision: RoutingDecision = if (prior != null) RoutingDecision.Create(prior.intent) else {
                 stage = VoiceTurnStage.ROUTING
                 notifyStage(request, stage)
                 val routingTurn = conversations.submit(cfg.routingStoredSessionId,
@@ -241,8 +263,11 @@ class VoiceTurnOrchestrator(
                         ?: return VoiceTurnOutcome.RoutingRejected(transcript, "routing_create_unsupported")
                     stage = VoiceTurnStage.CREATING
                     notifyStage(request, stage)
-                    val destination = creator.create(request.turnId, decision.intent, decision.ackText)
-                    AssembledRoute(request.turnId, request.origin, transcript, destination, decision.ackText, created = true)
+                    val created = creator.create(request.turnId, decision.intent)
+                    // Only now, with the conversation verified and saved, is the acknowledgement worded, by the
+                    // Phone, from what really exists: its title and the alias the Phone assigned.
+                    AssembledRoute(request.turnId, request.origin, transcript, created.destination,
+                        CreateAck.compose(created.title, created.destination.alias, transcript), created = true)
                 }
             }
             notifyRouted(request, route)
@@ -255,6 +280,8 @@ class VoiceTurnOrchestrator(
 
             stage = VoiceTurnStage.DELIVERING
             notifyStage(request, stage)
+            // After the acknowledgement, which can take a while: the destination must still be deliverable.
+            recipientCreator?.requireDeliverable(route.destination.storedSessionId)
             if (route.created && recipientCreator?.markSubmitted(request.turnId) == false) {
                 return VoiceTurnOutcome.Duplicate(request.turnId)
             }

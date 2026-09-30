@@ -171,25 +171,31 @@ The flow is the same whether a turn starts on the Phone or the Watch:
    transcript.
 3. **Route.** The transcript goes to a **persistent routing session**. It is created hidden
    (`source = "recorder-phone-router"`) on first use, then reused, and never appears in lists. The
-   prompt restates the routing contract (version 2), lists the allowlisted aliases (possibly none),
-   and marks the transcript as untrusted data.
+   prompt restates the routing contract (version 2), lists the allowlisted destinations (possibly
+   none) as one JSON object per line, and marks both their descriptions and the transcript as
+   untrusted data. A routing session created by an older version of the app is replaced once (see
+   [New conversations from the router](#new-conversations-from-the-router)).
 4. **Fail closed.** The router must reply with exactly one JSON object, one of:
    - `{"action":"route","destination":"<alias>","ack":"<text>"}` to use an existing conversation.
      The older `{"destination","ack"}` form without `action` still means this.
-   - `{"action":"create","title":"<title>","alias":"<alias>","description":"<text>","ack":"<text>"}`
-     to ask for a **new conversation**, only when none of the listed ones fits (see
-     [New conversations from the router](#new-conversations-from-the-router)).
+   - `{"action":"create","title":"<title>","alias":"<alias>","description":"<text>"}` to ask for a
+     **new conversation**, only when none of the listed ones fits (see
+     [New conversations from the router](#new-conversations-from-the-router)). It carries no ack:
+     the Phone words that one itself, and ignores any the model adds.
    - The allowlist is built only from your **unarchived** conversations (at most 32). Archiving a
      conversation removes it as a destination. The routing session can never be a destination.
    - A `destination` must match an allowlist entry exactly, and the ack must be 1–240 characters.
-   - The two forms can't be mixed: a route with a title or alias, a create with a destination, an
-     unknown `action`, or anything else fails closed: nothing is spoken, nothing is created and
-     nothing is delivered. Extra keys, including a session id, source or role the model invents,
+   - The two forms can't be mixed: a route (with or without `action`) that also has a title, alias
+     or description, a create with a destination, an unknown `action`, or anything else fails
+     closed: nothing is spoken, nothing is created and nothing is delivered. Extra keys, including a session id, source or role the model invents,
      are ignored. Session ids never come from the model.
-5. **Acknowledge.** The ack is synthesized with `POST /api/audio/speak` and played. If it can't be
-   played, the transcript isn't delivered. For a Watch turn, only a `/hv/v1/played` ACK from that
+5. **Acknowledge.** The ack is synthesized with `POST /api/audio/speak` and played. For an
+   existing conversation it is the router's sentence (its wording is the model's, so it can be
+   imprecise). If it can't be played, the transcript isn't delivered. For a Watch turn, only a `/hv/v1/played` ACK from that
    Watch's node counts. The Watch sends `ok=true` only when its player completes normally.
-6. **Deliver.** Only then is the original transcript submitted to the chosen conversation.
+6. **Deliver.** Only then is the original transcript submitted to the chosen conversation, after
+   one more check that it is still the app's and not archived, on the Phone or on the dashboard.
+   If it was archived while the ack played, nothing is sent, to it or anywhere else.
 7. **Speak replies.** The final reply (`message.complete`) is always spoken. The first and middle
    interim replies are spoken only if enabled in Settings (both are off by default). Text you
    already heard isn't repeated, and the app never makes up interim events.
@@ -209,26 +215,45 @@ may ask for a new one. You are not asked to confirm; the request itself is the a
   anything; its turns go through the Phone.
 - **The alias is assigned by the Phone.** If the suggested alias is already in use, the Phone adds
   a short suffix derived from the turn (`garden-3fa2`). An existing conversation is never used in
-  its place.
-- **Order.** Create → read the new row back from the dashboard and check it is the app's and not
-  archived → register it → speak the ack and wait for playback to finish → deliver your words
-  unchanged → speak the reply. If creating or checking fails, the turn ends with a message saying
-  so: no ack is spoken and nothing is sent to any other conversation.
+  its place. Titles don't have to be unique, so two conversations can share one; the alias is what
+  tells them apart, and the ack names it. Creating by hand, renaming, unarchiving and the router's
+  creations all go through one lock, so an alias can't be taken twice and the limit of 32 active
+  conversations holds; a manual alias that is already used is refused, never changed for you.
+- **The Phone words the ack.** For a new conversation the spoken ack is composed by the Phone
+  from what it actually created: "Creating a new conversation called *title*, alias *alias*, and
+  sending this there." (in Korean when your request contains Hangul). Whatever sentence the
+  model wrote for it is not used, so the ack can't name another conversation or claim nothing was
+  created.
+- **Order.** Save "about to create" → create → save the new id → read the new row back from the
+  dashboard and check it is the app's and not archived → save it in the registry → speak the ack
+  and wait for playback to finish → check again that it can receive → save "sent" → deliver your
+  words unchanged → speak the reply. Every "save" is written to the Phone's storage and
+  confirmed before the next step. If creating, checking or saving fails, the turn ends with a
+  message saying so: no ack is spoken and nothing is sent to any other conversation.
 - **Afterwards** the new conversation is a normal one: it is in the Phone list and the Watch
   browser, and the router can pick its alias for later requests.
-- **At most once per request.** The Phone keeps a small journal (turn id, title, alias, the ack,
-  the created session id; never your words) next to its registry. A repeated or replayed turn,
-  even after the app restarts, reuses the conversation it created and never sends your words
-  twice: a turn already handed to the conversation is reported as a duplicate.
+- **At most once per request.** The Phone keeps a small journal (turn id, title, alias, the
+  created session id; never your words) next to its registry. A repeated or replayed turn, even
+  after the app restarts, reuses the conversation it created and never sends your words twice: a
+  turn already marked as sent is reported as a duplicate.
+- **If the Phone's storage fails.** A save that isn't confirmed stops the turn, and the app then
+  refuses to create, acknowledge or send anything from that data until it is restarted and has
+  read what really is on storage. Saved data that can't be read (damaged) is never replaced or
+  emptied: voice and lists fail with a message until it is dealt with.
 - **What can't be guaranteed.** Hermes's create call has no idempotency key or lookup. If the app
   stops or the connection drops after the dashboard created the conversation but before the Phone
-  recorded its id, the Phone can't tell whether one exists. That turn then fails with "a new
+  saved its id, the Phone can't tell whether one exists. That turn then fails with "a new
   conversation may already have been created" and is never retried automatically, so there is no
   duplicate, but an unused conversation may be left on the dashboard that the app doesn't list.
-  Likewise, if the app stops in the instant between marking the turn as sent and sending it, a
-  replay is treated as already sent.
-- **The ack is the router's sentence.** The prompt asks it to say a new conversation with that
-  title is being created; the title is used as given, but the wording is the model's.
+  Likewise, if the app stops in the instant between saving "sent" and sending, a replay is treated
+  as already sent, so that request can be lost. It is at most once, not exactly once.
+- **Text from the model is cleaned.** Titles, descriptions and acks lose control characters,
+  invisible and direction-changing characters and line separators; ordinary letters of any
+  language stay. Descriptions reach later routing prompts only as quoted data.
+- **Upgrading.** An install whose hidden routing session was seeded for the old contract gets a
+  new hidden one, once. The old one is kept on the dashboard and stays the app's; it is just no
+  longer used. If that replacement is interrupted or can't be verified, it is not tried again
+  and the old routing session keeps being used (every request restates the current contract).
 
 ### Where audio plays: the latest accepted voice sender
 
@@ -435,7 +460,7 @@ builds ignore them.
 
 Only the following has been run:
 
-- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **257 JUnit tests**, all
+- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **279 JUnit tests**, all
   passing. They use an in-process fake dashboard and cover sign-in, session ownership, chat and
   attachments, routing, playback routing, the Watch link and reader contracts, the wake contract
   (final-only, leading wake phrase, contradicted or empty finals, 30/60/120-second recognizer
@@ -458,7 +483,11 @@ Only the following has been run:
   requests), routing to a new conversation (contract v2 parsing and rejections, an empty list,
   reuse on the next request, alias collisions, refused and unverifiable creations, the same turn
   repeated or run concurrently, and restarts after delivery, before delivery and with an
-  unresolved creation), the recording loop of both recorders (Phone and Watch read sizes), the recording input
+  unresolved creation; the Phone-worded create ack; storage whose writes fail at each step, with
+  restarts that see only what was confirmed saved; unreadable saved data; alias and limit races
+  between manual and router creation, rename and unarchive; invisible characters and quoted
+  prompt data; a destination archived while the ack plays; the one-time routing-session
+  replacement and its interruption), the recording loop of both recorders (Phone and Watch read sizes), the recording input
   check, haptic timing, gesture arbitration, bezel scrolling, and source checks of the Android wiring.
 - **Paired debug build:** `gradle :phone:assembleDebug :watch:assembleDebug` succeeded with
   Gradle 8.13 and JDK 17. Both APKs have the same package and are v2-signed by the same debug

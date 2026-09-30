@@ -15,7 +15,7 @@ import okhttp3.OkHttpClient
 class CoreHarness(
     /** Pass an earlier harness's [fake] and [store] to model an app restart against the same dashboard. */
     val fake: FakeHermesDashboard = FakeHermesDashboard(),
-    val store: InMemoryKeyValueStore = InMemoryKeyValueStore(),
+    val store: KeyValueStore = InMemoryKeyValueStore(),
 ) : AutoCloseable {
     val http: OkHttpClient = OkHttpClient.Builder().readTimeout(10, TimeUnit.SECONDS).build()
     val tokens = InMemoryHermesTokenStore(HermesBearerSession(fake.accessToken, fake.refreshToken, null, "basic", "jun"))

@@ -50,8 +50,8 @@ class VoiceEndToEndTest {
         assertEquals(listOf("watch:ACK:0:Sending that to work.", "watch:FINAL:1:Moved it to 3pm."), played.toList())
         val router = h.registry.router()!!.storedSessionId
         assertEquals(listOf(router, workId), h.fake.prompts.map { it.first })
-        assertTrue(h.fake.prompts[0].second.contains("- work: Calendar"))
-        assertTrue(h.fake.prompts[0].second.contains("- home: Home"))
+        assertTrue(h.fake.prompts[0].second.contains("""{"alias":"work","description":"Calendar"}"""))
+        assertTrue(h.fake.prompts[0].second.contains("""{"alias":"home","description":"Home"}"""))
         assertEquals("move my 2pm meeting to 3", h.fake.prompts[1].second)
         assertEquals("move my 2pm meeting to 3", outcome.route.originalTranscript)
         val timeline = h.fake.timeline.toList()
@@ -99,7 +99,7 @@ class VoiceEndToEndTest {
         h.tokens.clear()
         val before = h.fake.server.requestCount
         val outcome = run("w4", VoiceOrigin.WATCH) as VoiceTurnOutcome.NotDelivered
-        assertTrue(outcome.authRequired)
+        assertTrue("$outcome", outcome.authRequired)
         assertEquals(before, h.fake.server.requestCount)
     }
 }
