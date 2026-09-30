@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark window so launch never flashes white; Compose draws the chosen Dark/Light/System theme. -->
+    <style name="Theme.HermesVoice" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/hv_window_dark</item>
+    </style>
+    <color name="hv_window_dark">#FF0F1216</color>
+</resources>

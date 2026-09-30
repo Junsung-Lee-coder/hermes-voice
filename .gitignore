@@ -1,0 +1,49 @@
+# Gradle / Android build output
+.gradle/
+build/
+local.properties
+*.apk
+*.aab
+*.apks
+build-artifacts/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# IDEs and OS
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Signing material and keys
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+signing.properties
+keystore.properties
+
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+*.secret
+secrets/
+google-services.json
+
+# Logs, databases and temporary files
+*.log
+logs/
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+tmp/
+*.tmp
+*.hprof
