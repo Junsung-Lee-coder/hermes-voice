@@ -10,6 +10,7 @@ import com.rumi.hermesvoice.core.sessions.OwnedSessionRegistry
 import com.rumi.hermesvoice.core.VoiceOrigin
 import com.rumi.hermesvoice.core.audio.AudioInputVerdict
 import com.rumi.hermesvoice.core.settings.AppSettings
+import com.rumi.hermesvoice.core.voice.AssembledRoute
 import com.rumi.hermesvoice.core.voice.PlaybackCue
 import com.rumi.hermesvoice.core.voice.PlaybackRoute
 import com.rumi.hermesvoice.core.voice.VoiceTurnListener
@@ -89,6 +90,9 @@ class PhoneApp : Application() {
 
     private val currentRoute = MutableStateFlow<PlaybackRoute?>(null)
 
+    /** Counts conversations created by voice turns (Phone or Watch origin), so the UI can reload its list. */
+    val conversationsCreated = MutableStateFlow(0)
+
     /**
      * Where spoken acks and replies play now: the device of the latest accepted voice request (null
      * before any). Read from the route itself, which updates it under the same lock that picks the
@@ -108,6 +112,12 @@ class PhoneApp : Application() {
             log("accepted turn=${turnId.take(12)} origin=$origin playback_target=$origin")
 
         override fun onStage(turnId: String, stage: VoiceTurnStage) = log("stage turn=${turnId.take(12)} $stage")
+
+        override fun onRouted(route: AssembledRoute) {
+            log("routed turn=${route.turnId.take(12)} alias=${route.destination.alias} created=${route.created}")
+            // A conversation the router asked for now exists: lists on screen should show it.
+            if (route.created) conversationsCreated.value += 1
+        }
 
         override fun onPlayed(cue: PlaybackCue) = log("played turn=${cue.turnId.take(12)} seq=${cue.sequence} " +
             "role=${cue.role} origin=${cue.origin} device=${cue.device} " +

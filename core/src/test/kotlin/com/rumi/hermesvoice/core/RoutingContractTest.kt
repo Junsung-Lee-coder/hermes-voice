@@ -21,9 +21,9 @@ class RoutingContractTest {
         routingStoredSessionId = "20260930_router",
     )
 
-    private fun accepted(text: String, status: String? = "complete"): RoutingDecision =
+    private fun accepted(text: String, status: String? = "complete"): RoutingDecision.Route =
         when (val result = RoutingContract.parse(text, status, allowlist)) {
-            is RoutingParseResult.Accepted -> result.decision
+            is RoutingParseResult.Accepted -> result.decision as RoutingDecision.Route
             is RoutingParseResult.Rejected -> throw AssertionError("expected accepted, got ${result.reason}")
         }
 

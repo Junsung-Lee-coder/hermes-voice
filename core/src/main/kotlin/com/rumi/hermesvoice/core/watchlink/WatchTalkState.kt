@@ -44,6 +44,7 @@ data class WatchTalkState(
         val line = when (message.stage) {
             "transcribing" -> "Transcribing…"
             "routing" -> "Choosing where to send…"
+            "creating" -> "Creating a conversation…"
             "routed" -> "→ ${message.detail}"
             "acknowledging", "delivering" -> line
             "responding" -> "Waiting for reply…"

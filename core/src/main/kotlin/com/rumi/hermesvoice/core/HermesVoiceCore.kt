@@ -11,7 +11,6 @@ import com.rumi.hermesvoice.core.net.OutgoingAttachment
 import com.rumi.hermesvoice.core.net.SubmittedTurn
 import com.rumi.hermesvoice.core.sessions.AppSessionRepository
 import com.rumi.hermesvoice.core.sessions.HermesSessionsApi
-import com.rumi.hermesvoice.core.sessions.OwnedRole
 import com.rumi.hermesvoice.core.sessions.OwnedSessionRegistry
 import com.rumi.hermesvoice.core.settings.AppSettings
 import com.rumi.hermesvoice.core.voice.RecipientEvent
@@ -77,15 +76,13 @@ class HermesVoiceCore(
 ) {
     val sessions = AppSessionRepository(sessionsApi, conversations, registry)
     val chat = ChatService(sessions)
-    val orchestrator = VoiceTurnOrchestrator(speech, sessions.guardedPort(), config = ::voiceConfig, listener = voiceListener)
+    val orchestrator = VoiceTurnOrchestrator(speech, sessions.guardedPort(), config = ::voiceConfig, listener = voiceListener,
+        recipientCreator = sessions.recipientCreator())
     val watchAcks = WatchAckRegistry()
     val watchIntake = WatchTurnIntake(orchestrator, watchAcks)
 
-    /** Snapshotted per turn: fails closed (config_invalid) when there is no unarchived conversation to route to. */
+    /** Snapshotted per turn. The allowlist may be empty: the router can then ask for a new conversation. */
     private suspend fun voiceConfig(): VoiceTurnConfig {
-        require(sessions.registry.all().any { it.role == OwnedRole.CONVERSATION && !it.archived }) {
-            "create a conversation before using voice"
-        }
         val router = sessions.ensureRoutingSession()
         return VoiceTurnConfig(router.storedSessionId, sessions.allowlist(router.storedSessionId), settings.playback())
     }

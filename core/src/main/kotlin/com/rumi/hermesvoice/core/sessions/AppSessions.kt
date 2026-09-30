@@ -1,5 +1,8 @@
 package com.rumi.hermesvoice.core.sessions
 
+import com.rumi.hermesvoice.core.HermesAuthRequiredException
+import com.rumi.hermesvoice.core.HermesException
+import com.rumi.hermesvoice.core.HermesRpcException
 import com.rumi.hermesvoice.core.KeyValueStore
 import com.rumi.hermesvoice.core.SessionNotOwnedException
 import com.rumi.hermesvoice.core.net.ArchivedFilter
@@ -9,9 +12,16 @@ import com.rumi.hermesvoice.core.net.OutgoingAttachment
 import com.rumi.hermesvoice.core.net.StoredSession
 import com.rumi.hermesvoice.core.net.StoredSessionPage
 import com.rumi.hermesvoice.core.net.SubmittedTurn
+import com.rumi.hermesvoice.core.voice.CreateIntent
 import com.rumi.hermesvoice.core.voice.DestinationAllowlist
 import com.rumi.hermesvoice.core.voice.DestinationEntry
+import com.rumi.hermesvoice.core.voice.PriorCreate
+import com.rumi.hermesvoice.core.voice.RecipientCreator
 import com.rumi.hermesvoice.core.voice.RoutingContract
+import java.security.MessageDigest
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
@@ -65,7 +75,7 @@ data class OwnedSession(
  * is only a categorization filter; this registry is what makes a session "ours". A session id
  * that is not in here is never listed, read, archived or submitted to.
  */
-class OwnedSessionRegistry(private val store: KeyValueStore) {
+class OwnedSessionRegistry(internal val store: KeyValueStore) {
     @Synchronized
     fun all(): List<OwnedSession> {
         val raw = store.getString(KEY) ?: return emptyList()
@@ -100,6 +110,80 @@ class OwnedSessionRegistry(private val store: KeyValueStore) {
     }
 }
 
+/** How far a voice turn that asked for a new conversation got. Persisted, so it survives a restart. */
+enum class TurnCreateState {
+    /** `session.create` was about to be sent; whether the server created a session is unknown. */
+    PENDING,
+
+    /** The server session exists, its id is recorded here; the transcript has not been submitted. */
+    CREATED,
+
+    /** The transcript was handed to `prompt.submit` (or that was about to happen): never submit again. */
+    SUBMITTED,
+}
+
+data class TurnCreateRecord(
+    val turnId: String,
+    val state: TurnCreateState,
+    val title: String,
+    val alias: String,
+    val description: String,
+    val ackText: String,
+    val storedSessionId: String = "",
+    val createdAtMs: Long = 0L,
+) {
+    fun toJson(): JSONObject = JSONObject().put("turn_id", turnId).put("state", state.name).put("title", title)
+        .put("alias", alias).put("description", description).put("ack", ackText).put("id", storedSessionId)
+        .put("created_at_ms", createdAtMs)
+
+    companion object {
+        fun fromJson(json: JSONObject): TurnCreateRecord = TurnCreateRecord(json.getString("turn_id"),
+            TurnCreateState.valueOf(json.getString("state")), json.optString("title"), json.optString("alias"),
+            json.optString("description"), json.optString("ack"), json.optString("id"), json.optLong("created_at_ms"))
+    }
+}
+
+/**
+ * Durable journal of voice turns that created a conversation, kept next to the registry (same
+ * dashboard and profile). It is what makes a replayed turn id create at most one session and
+ * submit its transcript at most once, across a process restart. It holds no transcript.
+ */
+class TurnCreateJournal(private val store: KeyValueStore) {
+    @Synchronized
+    fun all(): List<TurnCreateRecord> {
+        val raw = store.getString(KEY) ?: return emptyList()
+        return try {
+            val array = JSONArray(raw)
+            (0 until array.length()).map { TurnCreateRecord.fromJson(array.getJSONObject(it)) }
+        } catch (_: JSONException) {
+            emptyList()
+        } catch (_: IllegalArgumentException) {
+            emptyList()
+        }
+    }
+
+    fun find(turnId: String): TurnCreateRecord? = all().firstOrNull { it.turnId == turnId }
+
+    @Synchronized
+    fun put(record: TurnCreateRecord) {
+        val next = (all().filterNot { it.turnId == record.turnId } + record).takeLast(MAX_RECORDS)
+        store.putString(KEY, JSONArray().apply { next.forEach { put(it.toJson()) } }.toString())
+    }
+
+    @Synchronized
+    fun remove(turnId: String) {
+        store.putString(KEY, JSONArray().apply { all().filterNot { it.turnId == turnId }.forEach { put(it.toJson()) } }.toString())
+    }
+
+    companion object {
+        const val KEY = "turn_create_journal_v1"
+        const val MAX_RECORDS = 64
+    }
+}
+
+/** The router asked for a new conversation and the Phone could not provide one. Nothing was delivered. */
+class RecipientCreateException(val reason: String, message: String) : HermesException(message)
+
 /** A conversation row for the Phone UI: our registry entry joined with the dashboard's row. */
 data class AppConversation(val owned: OwnedSession, val stored: StoredSession)
 
@@ -117,6 +201,108 @@ class AppSessionRepository(
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
     private val verifiedSources = HashSet<String>()
+    private val journal = TurnCreateJournal(registry.store)
+    private val createLock = Mutex()
+
+    /** What the journal knows about [turnId], if it ever asked for a new conversation. */
+    fun turnCreateRecord(turnId: String): TurnCreateRecord? = journal.find(turnId)
+
+    /**
+     * Creates the conversation a voice turn's router asked for, at most once per [turnId]:
+     * serialized, journalled before and after the server call, and registered only after the
+     * created row is read back with this app's source and not archived. A repeated call for the
+     * same turn returns the same conversation. If an earlier attempt may or may not have created a
+     * session (the app stopped, or the connection failed, between the server call and the journal
+     * entry), it fails closed as `create_ambiguous` rather than create a second one: the server
+     * offers no idempotency key or lookup for `session.create`. The alias is the router's
+     * suggestion, or that plus a suffix derived from the turn id when it is already in use; an
+     * existing conversation is never reused in its place.
+     */
+    suspend fun createForTurn(turnId: String, intent: CreateIntent, ackText: String): OwnedSession = createLock.withLock {
+        journal.find(turnId)?.let { record ->
+            if (record.state == TurnCreateState.PENDING) {
+                throw RecipientCreateException("create_ambiguous",
+                    "create_ambiguous: a new conversation may already have been created for this request; not creating another")
+            }
+            return@withLock registerCreated(record)
+        }
+        val active = registry.all().filter { it.role == OwnedRole.CONVERSATION && !it.archived }
+        if (active.size >= DestinationAllowlist.MAX_ENTRIES) {
+            throw RecipientCreateException("create_limit", "create_limit: there are already ${DestinationAllowlist.MAX_ENTRIES} conversations")
+        }
+        val alias = uniqueAlias(intent.alias, turnId, active.map { it.alias }.toSet())
+        val title = intent.title.trim().take(MAX_TITLE_CHARS)
+        val pending = TurnCreateRecord(turnId, TurnCreateState.PENDING, title, alias, intent.description, ackText)
+        journal.put(pending)
+        val created = try {
+            conversations.create(AppSources.CONVERSATION, title, CONVERSATION_SEED, hidden = false)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            // Only an answer from the server (an RPC error) or a failure before anything was sent
+            // (no sign-in) proves nothing was created; otherwise the journal entry stays PENDING.
+            if (error is HermesRpcException || error is HermesAuthRequiredException) {
+                journal.remove(turnId)
+                if (error is HermesAuthRequiredException) throw error
+                throw RecipientCreateException("create_failed", "create_failed: the dashboard refused to create a conversation")
+            }
+            throw RecipientCreateException("create_ambiguous", "create_ambiguous: creating a conversation did not finish; not retrying")
+        }
+        val record = pending.copy(state = TurnCreateState.CREATED, storedSessionId = created.storedSessionId, createdAtMs = clock())
+        journal.put(record)
+        registerCreated(record)
+    }
+
+    /** The [RecipientCreator] the voice orchestrator uses: creation only ever goes through this repository. */
+    fun recipientCreator(): RecipientCreator = object : RecipientCreator {
+        override fun previous(turnId: String): PriorCreate? = journal.find(turnId)?.let {
+            PriorCreate(CreateIntent(it.title, it.alias, it.description), it.ackText, it.state == TurnCreateState.SUBMITTED)
+        }
+
+        override suspend fun create(turnId: String, intent: CreateIntent, ackText: String): DestinationEntry =
+            createForTurn(turnId, intent, ackText).let { DestinationEntry(it.alias, it.storedSessionId, it.description.ifBlank { it.title }) }
+
+        override fun markSubmitted(turnId: String): Boolean = markTurnSubmitted(turnId)
+    }
+
+    /** Must be called right before the turn's transcript is submitted; false if it already was. */
+    fun markTurnSubmitted(turnId: String): Boolean {
+        val record = journal.find(turnId) ?: return true
+        if (record.state != TurnCreateState.CREATED) return false
+        journal.put(record.copy(state = TurnCreateState.SUBMITTED))
+        return true
+    }
+
+    /** Registers a journalled created session once the server row proves it is ours, visible and active. */
+    private suspend fun registerCreated(record: TurnCreateRecord): OwnedSession {
+        registry.find(record.storedSessionId)?.let { existing ->
+            if (existing.role != OwnedRole.CONVERSATION || existing.archived) {
+                throw RecipientCreateException("create_unavailable", "create_unavailable: the conversation created for this request is no longer available")
+            }
+            return existing
+        }
+        if (!DestinationAllowlist.isValidSessionId(record.storedSessionId)) {
+            throw RecipientCreateException("create_unverified", "create_unverified: the dashboard returned an unusable session id")
+        }
+        val row = api.getSession(record.storedSessionId)
+        if (row == null || row.id != record.storedSessionId || row.source != AppSources.CONVERSATION || row.archived) {
+            throw RecipientCreateException("create_unverified", "create_unverified: the new conversation could not be verified on the dashboard")
+        }
+        synchronized(verifiedSources) { verifiedSources += "${AppSources.CONVERSATION}|${row.id}" }
+        return OwnedSession(row.id, OwnedRole.CONVERSATION, record.title, record.alias, record.description,
+            archived = false, createdAtMs = record.createdAtMs).also(registry::put)
+    }
+
+    private fun uniqueAlias(suggested: String, turnId: String, taken: Set<String>): String {
+        if (suggested !in taken) return suggested
+        val digest = MessageDigest.getInstance("SHA-256").digest(turnId.toByteArray()).joinToString("") { "%02x".format(it) }
+        for (length in listOf(4, 8, 16)) {
+            val suffix = "-" + digest.take(length)
+            val candidate = suggested.take(32 - suffix.length) + suffix
+            if (candidate !in taken) return candidate
+        }
+        throw RecipientCreateException("create_alias", "create_alias: no free alias for the new conversation")
+    }
 
     suspend fun createConversation(title: String, alias: String, description: String): OwnedSession {
         val cleanTitle = title.trim().ifEmpty { "Hermes Voice" }.take(MAX_TITLE_CHARS)
@@ -188,7 +374,7 @@ class AppSessionRepository(
         return conversations.submit(storedSessionId, text.trim(), attachments)
     }
 
-    /** The voice router's allowlist: our unarchived conversations. Throws when there is nothing to route to. */
+    /** The voice router's allowlist: our unarchived conversations (possibly none: the router may then ask for one). */
     fun allowlist(routingStoredSessionId: String): DestinationAllowlist = DestinationAllowlist.create(
         registry.all().filter { it.role == OwnedRole.CONVERSATION && !it.archived }
             .map { DestinationEntry(it.alias, it.storedSessionId, it.description.ifBlank { it.title }) },

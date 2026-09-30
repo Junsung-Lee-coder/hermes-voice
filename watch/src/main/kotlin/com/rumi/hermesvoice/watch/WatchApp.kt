@@ -159,8 +159,12 @@ class WatchApp : Application() {
         Log.i(TAG, "phone state turn=${message.turnId.take(12)} stage=${message.stage} terminal=${message.terminal}")
         val ownTurn = message.turnId == _talk.value.turnId
         _talk.update { it.onPhoneState(message) }
-        // A finished Watch turn may have added messages to the conversation being read.
-        if (message.terminal && ownTurn) refreshSelected()
+        // A finished Watch turn may have added messages to the conversation being read, or created
+        // a new conversation: re-read both through the Phone.
+        if (message.terminal && ownTurn) {
+            refreshSelected()
+            loadSessions()
+        }
     }
 
     // ── haptics ──────────────────────────────────────────────────────────────────────────────

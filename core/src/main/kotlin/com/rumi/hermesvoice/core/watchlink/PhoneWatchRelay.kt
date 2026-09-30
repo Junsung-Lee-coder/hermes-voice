@@ -155,7 +155,8 @@ class WatchTurnIntake(
 /** Short user-facing text for a turn outcome (Phone status line and Watch terminal state). */
 object VoiceOutcomeText {
     fun describe(outcome: VoiceTurnOutcome): String = when (outcome) {
-        is VoiceTurnOutcome.Completed -> "Delivered to ${outcome.route.destination.alias}"
+        is VoiceTurnOutcome.Completed ->
+            "Delivered to ${outcome.route.destination.alias}" + if (outcome.route.created) " (new conversation)" else ""
         is VoiceTurnOutcome.Interrupted -> "Delivered to ${outcome.route.destination.alias}; playback interrupted"
         is VoiceTurnOutcome.DeliveredUnattributed ->
             "Delivered to ${outcome.route.destination.alias}; reply not spoken (destination busy)"

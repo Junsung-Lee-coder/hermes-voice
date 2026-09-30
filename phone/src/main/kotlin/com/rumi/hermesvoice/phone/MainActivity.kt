@@ -404,7 +404,7 @@ private fun ConversationsTab(state: PhoneUiState, model: PhoneViewModel, onOpen:
             }
         }
         if (state.conversations.isEmpty()) item {
-            Text(if (state.showArchived) "No archived conversations." else "No conversations yet.",
+            Text(if (state.showArchived) "No archived conversations." else "No conversations yet. Create one below, or just talk: one is created when nothing fits.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         if (!state.showArchived) item {

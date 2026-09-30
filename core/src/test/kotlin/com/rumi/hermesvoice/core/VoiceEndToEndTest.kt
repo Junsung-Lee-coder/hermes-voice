@@ -87,20 +87,6 @@ class VoiceEndToEndTest {
     }
 
     @Test
-    fun `no conversations means no router is created and nothing is transcribed`() {
-        val fresh = CoreHarness()
-        try {
-            val outcome = runBlocking {
-                fresh.core.orchestrator.run(VoiceTurnRequest("x1", VoiceOrigin.PHONE, TestAudio.speechWav(), "audio/wav", PlaybackSink { _, _ -> }))
-            } as VoiceTurnOutcome.NotDelivered
-            assertTrue(outcome.reason, outcome.reason.startsWith("config_invalid"))
-            assertEquals(0, fresh.fake.server.requestCount)
-        } finally {
-            fresh.close()
-        }
-    }
-
-    @Test
     fun `expired access token is refreshed transparently mid-turn`() {
         h.fake.rejectAccessTokens = setOf("AT-1")
         run("w3", VoiceOrigin.WATCH) as VoiceTurnOutcome.Completed

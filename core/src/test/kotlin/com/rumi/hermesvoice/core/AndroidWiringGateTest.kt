@@ -107,6 +107,17 @@ class AndroidWiringGateTest {
     }
 
     @Test
+    fun `a conversation created by a voice turn is shown on the phone and the watch without asking`() {
+        val app = source("$phone/PhoneApp.kt")
+        assertTrue(app.contains("if (route.created) conversationsCreated.value += 1"))
+        assertTrue(source("$phone/PhoneViewModel.kt").contains("app.conversationsCreated.collect { count -> if (count > 0 && _state.value.signedIn) refresh() }"))
+        val watchApp = source("$watch/WatchApp.kt")
+        assertTrue(watchApp.substringAfter("if (message.terminal && ownTurn) {").substringBefore("}").contains("loadSessions()"))
+        assertFalse("the Watch never creates sessions or talks to Hermes", watchApp.contains("session.create") || watchApp.contains("OkHttp"))
+        assertFalse("creation only goes through the session repository", source("$phone/PhoneViewModel.kt").contains("conversations.create("))
+    }
+
+    @Test
     fun `settings migrate at phone start and the watch validates what it receives`() {
         assertTrue(source("$phone/PhoneApp.kt").contains("settings.migrate()"))
         val app = source("$watch/WatchApp.kt")

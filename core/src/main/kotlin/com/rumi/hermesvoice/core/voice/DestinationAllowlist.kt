@@ -11,8 +11,9 @@ data class DestinationEntry(
 
 /**
  * The only mapping from a model-chosen alias to a Hermes session id. It is built from the
- * app's own (unarchived) session registry; construction validates every entry and rejects the
- * routing session itself as a destination. Lookups are exact on the normalized alias, so
+ * app's own (unarchived) session registry (it may be empty: the router can then only ask for a
+ * new conversation); construction validates every entry and rejects the routing session itself
+ * as a destination. Lookups are exact on the normalized alias, so
  * anything the router invents resolves to null (fail closed).
  */
 class DestinationAllowlist private constructor(val entries: List<DestinationEntry>) {
@@ -37,7 +38,6 @@ class DestinationAllowlist private constructor(val entries: List<DestinationEntr
         /** Throws [IllegalArgumentException] naming the first invalid entry; never silently drops one. */
         fun create(entries: List<DestinationEntry>, routingStoredSessionId: String): DestinationAllowlist {
             require(isValidSessionId(routingStoredSessionId)) { "routing session id is invalid" }
-            require(entries.isNotEmpty()) { "at least one destination is required" }
             require(entries.size <= MAX_ENTRIES) { "at most $MAX_ENTRIES destinations are allowed" }
             val seen = HashSet<String>()
             val clean = entries.map { entry ->

@@ -168,15 +168,21 @@ The flow is the same whether a turn starts on the Phone or the Watch:
    transcript.
 3. **Route.** The transcript goes to a **persistent routing session**. It is created hidden
    (`source = "recorder-phone-router"`) on first use, then reused, and never appears in lists. The
-   prompt restates the routing contract, lists the allowlisted aliases, and marks the transcript as
-   untrusted data.
-4. **Fail closed.** The router must reply with exactly one JSON object
-   `{"destination":"<alias>","ack":"<text>"}`.
+   prompt restates the routing contract (version 2), lists the allowlisted aliases (possibly none),
+   and marks the transcript as untrusted data.
+4. **Fail closed.** The router must reply with exactly one JSON object, one of:
+   - `{"action":"route","destination":"<alias>","ack":"<text>"}` to use an existing conversation.
+     The older `{"destination","ack"}` form without `action` still means this.
+   - `{"action":"create","title":"<title>","alias":"<alias>","description":"<text>","ack":"<text>"}`
+     to ask for a **new conversation**, only when none of the listed ones fits (see
+     [New conversations from the router](#new-conversations-from-the-router)).
    - The allowlist is built only from your **unarchived** conversations (at most 32). Archiving a
      conversation removes it as a destination. The routing session can never be a destination.
-   - The alias must match an allowlist entry exactly, and the ack must be 1–240 characters.
-   - Anything else fails closed: nothing is spoken and nothing is delivered. Extra keys, including
-     a session id the model invents, are ignored. Session ids never come from the model.
+   - A `destination` must match an allowlist entry exactly, and the ack must be 1–240 characters.
+   - The two forms can't be mixed: a route with a title or alias, a create with a destination, an
+     unknown `action`, or anything else fails closed: nothing is spoken, nothing is created and
+     nothing is delivered. Extra keys, including a session id, source or role the model invents,
+     are ignored. Session ids never come from the model.
 5. **Acknowledge.** The ack is synthesized with `POST /api/audio/speak` and played. If it can't be
    played, the transcript isn't delivered. For a Watch turn, only a `/hv/v1/played` ACK from that
    Watch's node counts. The Watch sends `ok=true` only when its player completes normally.
@@ -187,6 +193,39 @@ The flow is the same whether a turn starts on the Phone or the Watch:
 
 Turns are serialized from capture to delivery. Replayed turn ids, such as Data Layer retries, are
 ignored.
+
+### New conversations from the router
+
+When nothing you have fits what you said, including when you have no conversations yet, the router
+may ask for a new one. You are not asked to confirm; the request itself is the authorization.
+
+- **The router only proposes.** It suggests a title (up to 80 characters), an alias and a short
+  description, with the same limits as conversations you make by hand. The Phone creates the
+  conversation through the same dashboard call and the same ownership rules as the Create button:
+  visible, tagged with the app's source, recorded in the local registry. The Watch never creates
+  anything; its turns go through the Phone.
+- **The alias is assigned by the Phone.** If the suggested alias is already in use, the Phone adds
+  a short suffix derived from the turn (`garden-3fa2`). An existing conversation is never used in
+  its place.
+- **Order.** Create → read the new row back from the dashboard and check it is the app's and not
+  archived → register it → speak the ack and wait for playback to finish → deliver your words
+  unchanged → speak the reply. If creating or checking fails, the turn ends with a message saying
+  so: no ack is spoken and nothing is sent to any other conversation.
+- **Afterwards** the new conversation is a normal one: it is in the Phone list and the Watch
+  browser, and the router can pick its alias for later requests.
+- **At most once per request.** The Phone keeps a small journal (turn id, title, alias, the ack,
+  the created session id; never your words) next to its registry. A repeated or replayed turn,
+  even after the app restarts, reuses the conversation it created and never sends your words
+  twice: a turn already handed to the conversation is reported as a duplicate.
+- **What can't be guaranteed.** Hermes's create call has no idempotency key or lookup. If the app
+  stops or the connection drops after the dashboard created the conversation but before the Phone
+  recorded its id, the Phone can't tell whether one exists. That turn then fails with "a new
+  conversation may already have been created" and is never retried automatically, so there is no
+  duplicate, but an unused conversation may be left on the dashboard that the app doesn't list.
+  Likewise, if the app stops in the instant between marking the turn as sent and sending it, a
+  replay is treated as already sent.
+- **The ack is the router's sentence.** The prompt asks it to say a new conversation with that
+  title is being created; the title is used as given, but the wording is the model's.
 
 ### Where audio plays: the latest accepted voice sender
 
@@ -202,6 +241,8 @@ accepted voice request**. That covers the ack and the first, middle and final re
 - For example, if you talk on the Watch and then on the Phone before the Watch turn's reply
   arrives, that reply plays on the Phone.
 - The Phone's Talk bar shows the current target. The route is held only in memory on the Phone.
+- Creating a conversation for a request doesn't change any of this: the request's device was
+  already the target when the request was accepted.
 
 ## Watch conversation reader
 
@@ -340,7 +381,7 @@ builds ignore them.
 
 Only the following has been run:
 
-- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **214 JUnit tests**, all
+- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **228 JUnit tests**, all
   passing. They use an in-process fake dashboard and cover sign-in, session ownership, chat and
   attachments, routing, playback routing, the Watch link and reader contracts, the wake contract
   (final-only, leading wake phrase, contradicted or empty finals, 30/60/120-second recognizer
@@ -353,7 +394,10 @@ Only the following has been run:
   wake-location modes, durable migration from the old Watch switch, strict Watch-side validation,
   stale snapshots), the per-device wake flow both apps delegate to (which device listens for each
   mode, turning a device off mid-window or mid-recording, the silence snapshot, same-breath
-  requests), the recording loop of both recorders (Phone and Watch read sizes), the recording input
+  requests), routing to a new conversation (contract v2 parsing and rejections, an empty list,
+  reuse on the next request, alias collisions, refused and unverifiable creations, the same turn
+  repeated or run concurrently, and restarts after delivery, before delivery and with an
+  unresolved creation), the recording loop of both recorders (Phone and Watch read sizes), the recording input
   check, haptic timing, gesture arbitration, bezel scrolling, and source checks of the Android wiring.
 - **Paired debug build:** `gradle :phone:assembleDebug :watch:assembleDebug` succeeded with
   Gradle 8.13 and JDK 17. Both APKs have the same package and are v2-signed by the same debug

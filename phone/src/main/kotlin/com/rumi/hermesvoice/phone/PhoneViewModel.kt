@@ -116,6 +116,8 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         viewModelScope.launch { app.playbackDevice.collect { device -> _state.update { it.copy(playbackDevice = device) } } }
+        // A voice turn (from the Phone or the Watch) created a conversation: show it.
+        viewModelScope.launch { app.conversationsCreated.collect { count -> if (count > 0 && _state.value.signedIn) refresh() } }
         refreshWatchStatus()
     }
 
