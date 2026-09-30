@@ -117,7 +117,7 @@ class VadUnsteadyBackgroundTest {
         // 40 seeds × 30 s per cell, through the recorder: qualified as speech / uploaded after the recording check.
         // A floor that sits at the background's quietest moments takes its ordinary louder moments for speech
         // (most seeds at 3 dB); following the typical level keeps that to the rates below.
-        val bounds = mapOf(1.0 to (0 to 0), 2.0 to (0 to 0), 3.0 to (1 to 1), 4.5 to (16 to 13))
+        val bounds = mapOf(1.0 to (0 to 0), 2.0 to (0 to 0), 3.0 to (0 to 0), 4.5 to (10 to 10))
         for (room in listOf(100.0, 300.0)) for ((sigma, bound) in bounds) {
             val qualified = ArrayList<Int>()
             val uploaded = ArrayList<Int>()
@@ -161,7 +161,7 @@ class VadUnsteadyBackgroundTest {
     @Test
     fun `the recording check refuses most recordings of a drifting background alone`() {
         // 6 s of noise alone at the send check: a fixed "half again above the floor" lets nearly all of it through.
-        val bounds = mapOf(1.0 to 0, 2.0 to 2, 3.0 to 5, 4.5 to 25)
+        val bounds = mapOf(1.0 to 0, 2.0 to 2, 3.0 to 4, 4.5 to 24)
         for ((sigma, bound) in bounds) {
             val usable = (1..40).filter { gate(UnsteadyNoise.drift(rate, it, 6_000, 300.0, sigma)) == AudioInputVerdict.USABLE }
             assertTrue("drift $sigma dB: usable for seeds $usable", usable.size <= bound)
@@ -177,7 +177,7 @@ class VadUnsteadyBackgroundTest {
     fun `a background whose level jumps every 100 ms - rarely a request, and a request in it still ends`() {
         // Level jumps look like syllables: at 4.5 dB and above such noise is often taken for speech, which an
         // energy detector cannot avoid; a request in it must still end.
-        val alone = mapOf(2.0 to 0, 3.0 to 0, 4.5 to 8, 6.0 to 34)
+        val alone = mapOf(2.0 to 0, 3.0 to 0, 4.5 to 8, 6.0 to 33)
         val meanEnd = mapOf(2.0 to 2_050L, 3.0 to 2_100L, 4.5 to 2_400L, 6.0 to 6_000L)
         for ((sigma, bound) in alone) {
             val qualified = ArrayList<Int>()
@@ -363,6 +363,32 @@ class VadUnsteadyBackgroundTest {
         val word = endpoint(s.concat(s.noise(600, bg), s.over(s.syllable(300, 1_500.0), bg), s.noise(5_000, bg)))
         assertEquals(EndpointDecision.END_OF_SPEECH, word.decision)
         assertEquals(2_000L, word.endMs - word.lastVoicedMs)
+    }
+
+    @Test
+    fun `a string of short knocks does not start a request however dense, a word of the same total length does`() {
+        // Starting a request takes one unbroken 100 ms at or above the onset, which a syllable has. Knocks of 40–80 ms
+        // in quick succession are voiced half the time, enough by density alone, but never unbroken for that long.
+        val s = Signals(rate, 44)
+        fun knocks(ms: Long, everyMs: Long, knockMs: Long): ShortArray {
+            val parts = ArrayList<ShortArray>()
+            var t = 0L
+            while (t < ms) {
+                parts += s.noise(knockMs, 4_000.0)
+                parts += s.noise(everyMs - knockMs, bg)
+                t += everyMs
+            }
+            return s.concat(*parts.toTypedArray())
+        }
+        for ((every, knock) in listOf(120L to 60L, 100L to 60L, 160L to 80L, 80L to 40L)) {
+            val pcm = s.concat(s.noise(600, bg), knocks(12_000, every, knock))
+            assertEquals("$knock ms knocks every $every ms", EndpointDecision.NO_SPEECH, endpoint(pcm).decision)
+            assertEquals("$knock ms knocks every $every ms, as a recording", AudioInputVerdict.NO_SPEECH_ENERGY, gate(pcm.copyOf(s.samples(6_600))))
+        }
+        // The same sound unbroken for 140 ms is a (very short) word; and once a request is under way such knocks are
+        // loud sound like any other: they can hold it open, which a request's end may wait out, never cut.
+        val short = endpoint(s.concat(s.noise(600, bg), s.over(s.syllable(160, 3_000.0), bg), s.noise(5_000, bg)))
+        assertEquals(EndpointDecision.END_OF_SPEECH, short.decision)
     }
 
     // ── the recording check: nearby controls ─────────────────────────────────────────────────

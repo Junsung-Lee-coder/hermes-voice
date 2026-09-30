@@ -16,7 +16,11 @@ enum class VadClass { VOICED, GRAY, QUIET }
  *   fading tail is not a pause, but background that rose after speech cannot keep "speaking").
  * - Speech is qualified after [minSpeechMs] of voiced audio in a run whose gaps never exceeded
  *   [maxDipMs] and in which at least [minDensity] of the time was voiced: syllables separated by
- *   short dips count; an isolated click or knock, or sparse clicks such as typing, do not.
+ *   short dips count; an isolated click or knock, or sparse clicks such as typing, do not. To
+ *   START a request (and in the recording check) the run must also hold one unbroken stretch of
+ *   [minSolidMs] at or above the onset, which a syllable has and a string of clicks or clatter
+ *   mostly has not; continuing a request needs no such stretch, so nothing that could start a
+ *   request fails to continue one.
  * - The floor (when [adaptive]) follows the last [windowMs] of frame levels, differently before
  *   and after speech was heard in the request:
  *   - **Before speech**, the background is the typical level. When that second is one level (its
@@ -46,6 +50,7 @@ data class VadProfile(
     val minSpeechMs: Long = MIN_SPEECH_MS,
     val maxDipMs: Long = 200,
     val minDensity: Double = 0.45,
+    val minSolidMs: Long = 100,
     val hangoverMs: Long = 200,
     val adaptive: Boolean = true,
     val windowMs: Long = 1_000,
@@ -109,6 +114,10 @@ class EnergyVad(val profile: VadProfile, initialFloor: Double, history: DoubleAr
 
     /** Time since the current run started, dips included. */
     private var spanMs = 0L
+
+    /** The unbroken stretch at or above the onset now in progress, and the longest of the current run. */
+    private var solidMs = 0L
+    private var longestSolidMs = 0L
     private var dipMs = 0L
     private var inRun = false
     private var hangMs = 0L
@@ -133,10 +142,10 @@ class EnergyVad(val profile: VadProfile, initialFloor: Double, history: DoubleAr
     private var speechLevel = 0.0
     private var speechFrames = 0L
 
-    /** The current run is long and dense enough to be speech. */
-    val qualified: Boolean get() = qualifiedFor(profile.minSpeechMs)
+    /** The current run is long, dense and unbroken enough to start a request. */
+    val qualified: Boolean get() = qualifiedFor(profile.minSpeechMs) && longestSolidMs >= profile.minSolidMs
 
-    /** The current run has at least [voicedMs] of voiced audio and is dense enough to be speech. */
+    /** The current run has at least [voicedMs] of voiced audio and is dense enough to be (continuing) speech. */
     fun qualifiedFor(voicedMs: Long): Boolean = runMs >= voicedMs && runMs >= spanMs * profile.minDensity
 
     fun observe(level: Double, frameMs: Long): VadClass {
@@ -155,6 +164,8 @@ class EnergyVad(val profile: VadProfile, initialFloor: Double, history: DoubleAr
         val cls = when {
             level >= base * profile.onsetRatio -> {
                 hangMs = 0
+                solidMs += frameMs
+                if (solidMs > longestSolidMs) longestSolidMs = solidMs
                 VadClass.VOICED
             }
             inRun && level >= base * profile.releaseRatio && hangMs + frameMs <= profile.hangoverMs -> {
@@ -164,6 +175,7 @@ class EnergyVad(val profile: VadProfile, initialFloor: Double, history: DoubleAr
             level >= base * profile.releaseRatio -> VadClass.GRAY
             else -> VadClass.QUIET
         }
+        if (hangMs > 0 || cls != VadClass.VOICED) solidMs = 0
         inRun = cls == VadClass.VOICED
         if (profile.adaptive) flag(inRun)
         if (inRun) {
@@ -200,6 +212,8 @@ class EnergyVad(val profile: VadProfile, initialFloor: Double, history: DoubleAr
         runMs = 0
         spanMs = 0
         dipMs = 0
+        solidMs = 0
+        longestSolidMs = 0
     }
 
     /** What qualified was steady noise, not a request: forget it and what it taught about the talker. */

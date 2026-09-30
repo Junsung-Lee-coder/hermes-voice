@@ -410,8 +410,9 @@ Both devices end a hands-free request with the same voice-activity detector (VAD
 - **How it listens:** in 20 ms frames, it compares loudness with the room's background, which it
   measures for 0.4 s before the "speak now" buzz. Speech is three times the background or louder
   for at least 140 ms, with gaps between syllables of up to 200 ms tolerated and at least 45% of
-  that stretch voiced. A fading syllable stays "speech" for at most 200 ms. The same 140 ms
-  starts a request and continues it after a pause, so words said one at a time keep it open. The
+  that stretch voiced. A fading syllable stays "speech" for at most 200 ms. To start a request,
+  100 ms of it must also be unbroken, as a syllable is and a string of knocks is not. The same
+  140 ms continues a request after a pause, so words said one at a time keep it open. The
   timing is the same on the Phone and the Watch and doesn't depend on how the microphone delivers
   audio.
 - **The background estimate** comes from the last second of sound:
@@ -439,17 +440,18 @@ Both devices end a hands-free request with the same voice-activity detector (VAD
     rather than being cut. Quieter steady noise ends it 2–3.5 s after the speech.
   - Your voice has to stand clearly above the room. In tests with recorded speech mixed into
     recordings of real rooms, no request was cut short with the speech 15 dB or more above the
-    room noise; at 10 dB about one in twenty was sent without its last words, and at 6 dB about
-    one in three. In a noisy place use push-to-talk, or a longer trailing silence.
+    room noise; at 10 dB about one in twenty was sent without its last words; at 6 dB about one
+    in four was, and one in five wasn't heard at all. In a noisy place use push-to-talk, or a
+    longer trailing silence.
   - A room whose noise swings widely (by about 5 dB or more from moment to moment) can still be
     taken for a request now and then, and a request there can take several seconds longer to end.
     The recording check then refuses most recordings that hold nothing but such noise.
   - A word has to be voiced for 140 ms: very short words with long pauses between them, spoken
     softly, may not count.
   - A single click or knock of 100 ms or less doesn't count, and neither does sparse clicking
-    such as slow typing. Dense tapping or knocking (voiced nearly half the time) can count, and a
-    burst of noise longer than 140 ms, like a cough, can start a request, which speech-to-text
-    may then find empty.
+    such as slow typing, nor a quick string of short knocks. Sounds that ring on for longer
+    (dishes, a door), and a burst of noise longer than 140 ms, like a cough, can start a request,
+    which speech-to-text may then find empty or mishear.
 
 ## Text chat and history
 
@@ -489,7 +491,7 @@ builds ignore them.
 
 Only the following has been run:
 
-- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **311 JUnit tests**, all
+- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **312 JUnit tests**, all
   passing. They use an in-process fake dashboard and cover sign-in, session ownership, chat and
   attachments, routing, playback routing, the Watch link and reader contracts, the wake contract
   (final-only, leading wake phrase, contradicted or empty finals, 30/60/120-second recognizer
@@ -504,10 +506,10 @@ Only the following has been run:
   and steady noise alone (throughout, or between quiet margins) are refused; whenever the ending finds speech the recording check
   accepts the same audio), its behaviour in unsteady backgrounds (synthetic, 40 seeds per cell:
   a background drifting by 1, 2, 3 and 4.5 dB with nobody speaking is recorded as a request in 0,
-  0, 1 and 16 of 40 half-minutes and uploaded in 0, 0, 1 and 11–13; one whose level jumps every
-  100 ms by 2–6 dB in 0, 0, 8 and 34; a request in such a background is never cut and ends on
+  0, 0 and 10 of 40 half-minutes and uploaded in 0, 0, 0 and 9–10; one whose level jumps every
+  100 ms by 2–6 dB in 0, 0, 8 and 33; a request in such a background is never cut and ends on
   average 2.0–3.1 s after the speech, at worst 10 s; six seconds of drifting noise alone pass the
-  recording check in 0, 2, 5 and 25 of 40; steady noise of 2.5–30 times the background that starts
+  recording check in 0, 2, 4 and 24 of 40; strings of short knocks never start a request; steady noise of 2.5–30 times the background that starts
   with nobody speaking ends as "no request"; a held voice first, then speech, is kept whole; noise
   after speech ends the request only when clearly quieter than the speech; words of 100–300 ms
   said one at a time keep a request open at both the 0.5 s and the 2 s setting; soft speech 3.2–5
