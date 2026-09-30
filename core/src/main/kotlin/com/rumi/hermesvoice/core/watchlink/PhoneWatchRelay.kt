@@ -138,7 +138,9 @@ class WatchTurnIntake(
             }
             val outcome = try {
                 orchestrator.run(VoiceTurnRequest(upload.turnId, VoiceOrigin.WATCH, upload.audio, upload.mimeType,
-                    WatchPlaybackSink(transport, acks), listener, recognizedText = upload.recognizedText))
+                    WatchPlaybackSink(transport, acks), listener, recognizedText = upload.recognizedText,
+                    wakeTurn = upload.trigger == TurnTrigger.WAKE_PHRASE, wakeClaimId = upload.wakeClaimId,
+                    originNodeId = transport.nodeId))
             } finally {
                 states.close()
             }
@@ -167,5 +169,8 @@ object VoiceOutcomeText {
             if (outcome.authRequired) "Not delivered: sign in on the phone" else "Not delivered: ${outcome.reason.take(120)}"
         VoiceTurnOutcome.NoSpeech -> "No speech detected"
         is VoiceTurnOutcome.Duplicate -> "Duplicate turn ignored"
+        is VoiceTurnOutcome.NotAdmitted ->
+            if (outcome.reason.startsWith("wake_claim")) "Not sent: the wake phrase was answered elsewhere or timed out. Say it again"
+            else "Not sent: ${outcome.reason.take(120)}"
     }
 }

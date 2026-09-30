@@ -9,6 +9,7 @@ import com.google.android.gms.wearable.PutDataMapRequest
 import com.google.android.gms.wearable.Wearable
 import com.google.android.gms.wearable.WearableListenerService
 import com.rumi.hermesvoice.core.settings.WatchSettings
+import com.rumi.hermesvoice.core.wake.WakeClaimService
 import com.rumi.hermesvoice.core.watchlink.BoundedRead
 import com.rumi.hermesvoice.core.watchlink.PhoneReaderService
 import com.rumi.hermesvoice.core.watchlink.ReaderError
@@ -93,6 +94,24 @@ class PhoneWatchListenerService : WearableListenerService() {
                 if (accepted.getOrNull() != true) Log.w(TAG, "ignored playback ack from ${event.sourceNodeId.take(8)}")
             }
             WatchLinkPaths.READER_REQUEST -> answerReader(event.sourceNodeId, event.data)
+            WatchLinkPaths.WAKE_CLAIM -> answerWakeClaim(event.sourceNodeId, event.data)
+        }
+    }
+
+    /**
+     * "Both": the Watch asks for, renews or releases the wake claim. The Phone decides
+     * ([com.rumi.hermesvoice.core.wake.WakeAdmission]) with the Watch's node id taken from the Data
+     * Layer, and answers that node only. No answer (Phone not set up) makes the Watch fail closed.
+     */
+    private fun answerWakeClaim(nodeId: String, data: ByteArray) {
+        val context = applicationContext
+        val app = PhoneApp.from(context)
+        val wiring = runCatching { app.wiring() }.getOrNull() ?: return
+        val verdict = WakeClaimService.handle(wiring.core.wakeAdmission, nodeId, data)
+        Log.i(TAG, "wake claim from=${nodeId.take(8)} verdict=${verdict?.verdict ?: "released"} holder=${wiring.core.wakeAdmission.holder()}")
+        verdict ?: return
+        app.appScope.launch {
+            runCatching { Wearable.getMessageClient(context).sendMessage(nodeId, WatchLinkPaths.WAKE_VERDICT, verdict.encode()).await() }
         }
     }
 

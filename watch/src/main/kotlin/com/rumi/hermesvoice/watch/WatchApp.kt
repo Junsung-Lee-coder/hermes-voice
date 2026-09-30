@@ -14,6 +14,9 @@ import android.util.Log
 import com.google.android.gms.wearable.CapabilityClient
 import com.google.android.gms.wearable.Wearable
 import com.rumi.hermesvoice.core.settings.ReplicaUpdate
+import com.rumi.hermesvoice.core.wake.ClaimVerdict
+import com.rumi.hermesvoice.core.wake.WakeClaimMessage
+import com.rumi.hermesvoice.core.wake.WakeVerdictMessage
 import com.rumi.hermesvoice.core.settings.WatchSettings
 import com.rumi.hermesvoice.core.settings.WatchSettingsReplica
 import com.rumi.hermesvoice.core.watchlink.HapticEvent
@@ -128,11 +131,44 @@ class WatchApp : Application() {
     fun cue(line: String) = _talk.update { it.recordingCue(line) }
 
     /** Uploads the finished recording to the reachable Phone node that advertises the app capability. */
-    fun upload(turnId: String, trigger: TurnTrigger, wav: ByteArray) =
-        send(turnId, WatchTurnUpload(turnId, trigger, WatchTurnUpload.MIME_WAV, wav))
+    fun upload(turnId: String, trigger: TurnTrigger, wav: ByteArray, wakeClaimId: String? = null) =
+        send(turnId, WatchTurnUpload(turnId, trigger, WatchTurnUpload.MIME_WAV, wav, wakeClaimId?.takeIf { trigger == TurnTrigger.WAKE_PHRASE }))
 
     /** Sends a wake-phrase request the recognizer already heard (no second utterance was recorded). */
-    fun uploadRecognized(turnId: String, request: String) = send(turnId, WatchTurnUpload.recognized(turnId, request))
+    fun uploadRecognized(turnId: String, request: String, wakeClaimId: String? = null) =
+        send(turnId, WatchTurnUpload.recognized(turnId, request, wakeClaimId))
+
+    // ── wake arbitration ("Both") ────────────────────────────────────────────────────────────
+
+    /** The Phone node each wake claim was sent to; a verdict from any other node is ignored. */
+    private val claimTargets = ConcurrentHashMap<String, String>()
+
+    /** Receives the Phone's verdicts (claim id, verdict); set by the visible activity. */
+    @Volatile var wakeVerdictListener: ((String, ClaimVerdict) -> Unit)? = null
+
+    /**
+     * Asks the Phone for, renews or releases the wake claim. The Phone is the only coordinator; if
+     * it cannot be reached nothing comes back and the wake flow fails closed on its timer.
+     */
+    fun sendWakeClaim(message: WakeClaimMessage) {
+        scope.launch {
+            val node = claimTargets[message.claimId] ?: phoneNode() ?: return@launch
+            if (message.op == WakeClaimMessage.Op.RELEASE) claimTargets.remove(message.claimId) else claimTargets[message.claimId] = node
+            val sent = runCatching { Wearable.getMessageClient(this@WatchApp).sendMessage(node, WatchLinkPaths.WAKE_CLAIM, message.encode()).await() }
+            Log.i(TAG, "wake claim ${message.op} ${message.claimId.take(10)} sent=${sent.isSuccess}")
+        }
+    }
+
+    fun onWakeVerdict(sourceNodeId: String, bytes: ByteArray) {
+        val verdict = WakeVerdictMessage.decode(bytes) ?: return
+        if (claimTargets[verdict.claimId] != sourceNodeId) {
+            Log.w(TAG, "wake verdict ignored ${verdict.claimId.take(10)} (not pending from this node)")
+            return
+        }
+        if (verdict.verdict != ClaimVerdict.GRANTED) claimTargets.remove(verdict.claimId)
+        Log.i(TAG, "wake verdict ${verdict.claimId.take(10)} ${verdict.verdict}")
+        wakeVerdictListener?.invoke(verdict.claimId, verdict.verdict)
+    }
 
     private fun send(turnId: String, upload: WatchTurnUpload) {
         _talk.update { if (it.turnId == turnId) it.sending() else it }

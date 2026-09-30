@@ -38,6 +38,8 @@ import com.rumi.hermesvoice.core.audio.QaAudio
 import com.rumi.hermesvoice.core.audio.QaLaunchGuard
 import com.rumi.hermesvoice.core.audio.SilenceEndpoint
 import com.rumi.hermesvoice.core.wake.WakeArmInputs
+import com.rumi.hermesvoice.core.wake.WakeClaimMessage
+import com.rumi.hermesvoice.core.wake.WakeClaimPort
 import com.rumi.hermesvoice.core.wake.WakeBlock
 import com.rumi.hermesvoice.core.wake.WakeContract
 import com.rumi.hermesvoice.core.wake.WakeDevicePort
@@ -53,6 +55,7 @@ import com.rumi.hermesvoice.core.watchlink.SwipeDirection
 import com.rumi.hermesvoice.core.watchlink.TurnTrigger
 import com.rumi.hermesvoice.core.watchlink.WatchLinkPaths
 import java.io.File
+import java.util.UUID
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 
@@ -73,10 +76,39 @@ class WatchActivity : ComponentActivity() {
     private val wakeListening = mutableStateOf(false)
     private val wakeUnavailable = mutableStateOf(false)
     private var qaWakeHandoffPending = false
+    private var qaHeardPending: Pair<String, Boolean>? = null
     private lateinit var wake: WakeController
     private val handoffRunnable: Runnable = Runnable {
         if (!wake.wake.onHandoffDue(captureIdle = captures.activeId == null)) {
             Log.i(TAG, "wake handoff dropped gen=${wake.wake.generation}")
+        }
+    }
+
+    /** The wake claim of the hands-free capture in progress ("Both"), and of a recognized request being sent. */
+    private var captureClaimId: String? = null
+    private var recognizedClaimId: String? = null
+    private var endedTrigger: TurnTrigger? = null
+
+    private val claimTimer: Runnable = Runnable { wake.wake.onClaimTimer() }
+
+    /**
+     * "Both": the Watch asks the Phone, the only coordinator, over the Data Layer before it records
+     * or sends a wake request. No answer in time fails closed (see [WakeController.wake]).
+     */
+    private val claimPort: WakeClaimPort = object : WakeClaimPort {
+        override fun newClaimId(): String = "w-" + UUID.randomUUID().toString()
+        override fun request(claimId: String, settingsRevision: Long, generation: Long) =
+            app.sendWakeClaim(WakeClaimMessage(WakeClaimMessage.Op.CLAIM, claimId, settingsRevision, generation))
+        override fun renew(claimId: String) = app.sendWakeClaim(WakeClaimMessage(WakeClaimMessage.Op.RENEW, claimId))
+        override fun release(claimId: String) = app.sendWakeClaim(WakeClaimMessage(WakeClaimMessage.Op.RELEASE, claimId))
+
+        override fun scheduleTimer(delayMs: Long) {
+            window.decorView.removeCallbacks(claimTimer)
+            window.decorView.postDelayed(claimTimer, delayMs)
+        }
+
+        override fun cancelTimer() {
+            window.decorView.removeCallbacks(claimTimer)
         }
     }
 
@@ -98,7 +130,13 @@ class WatchActivity : ComponentActivity() {
             window.decorView.removeCallbacks(handoffRunnable)
         }
 
-        override fun startRequestCapture(silenceMs: Long): Boolean = hasMic() && startCapture(TurnTrigger.WAKE_PHRASE, silenceMs)
+        override fun startRequestCapture(silenceMs: Long): Boolean = startRequestCapture(silenceMs, null)
+
+        override fun startRequestCapture(silenceMs: Long, claimId: String?): Boolean {
+            if (!hasMic()) return false
+            captureClaimId = claimId
+            return startCapture(TurnTrigger.WAKE_PHRASE, silenceMs).also { if (!it) captureClaimId = null }
+        }
 
         override fun cancelRequestCapture(reason: String) {
             val active = recorder?.takeIf { it.trigger == TurnTrigger.WAKE_PHRASE } ?: return
@@ -106,9 +144,17 @@ class WatchActivity : ComponentActivity() {
             end(active.turnId, CaptureStop.LIFECYCLE)
         }
 
-        override fun sendRecognized(request: String) {
+        override fun sendRecognized(request: String) = sendRecognized(request, null)
+
+        override fun sendRecognized(request: String, claimId: String?) {
             // The recognizer's FINAL result had the request after a leading wake phrase: send it whole.
-            val turnId = app.newTurn(TurnTrigger.WAKE_PHRASE) ?: return
+            val turnId = app.newTurn(TurnTrigger.WAKE_PHRASE)
+            if (turnId == null) {
+                // Busy meanwhile: say so instead of dropping it silently, and give the claim back.
+                claimId?.let { app.sendWakeClaim(WakeClaimMessage(WakeClaimMessage.Op.RELEASE, it)) }
+                return onWakeClosed("unfinished_request")
+            }
+            recognizedClaimId = claimId
             captures.sendRecognized(turnId, request)
         }
 
@@ -140,6 +186,7 @@ class WatchActivity : ComponentActivity() {
     private val capturePort: CapturePort = object : CapturePort {
         override fun stopRecorder(captureId: String, reason: CaptureStop): ByteArray? {
             val active = recorder?.takeIf { it.turnId == captureId }
+            endedTrigger = active?.trigger
             recorder = null
             val wav = active?.stop()
             active?.stats()?.let { stats ->
@@ -159,10 +206,23 @@ class WatchActivity : ComponentActivity() {
         }
 
         override fun cue(line: String) = app.cue(line)
-        override fun upload(captureId: String, trigger: TurnTrigger, wav: ByteArray) = app.upload(captureId, trigger, wav)
-        override fun uploadRecognized(turnId: String, text: String) = app.uploadRecognized(turnId, text)
+        override fun upload(captureId: String, trigger: TurnTrigger, wav: ByteArray) {
+            val claimId = captureClaimId.takeIf { trigger == TurnTrigger.WAKE_PHRASE }
+            if (trigger == TurnTrigger.WAKE_PHRASE) {
+                captureClaimId = null
+                wake.wake.onRequestCaptureEnded(sent = true)
+            }
+            app.upload(captureId, trigger, wav, claimId)
+        }
+
+        override fun uploadRecognized(turnId: String, text: String) = app.uploadRecognized(turnId, text, recognizedClaimId)
+
         override fun discard(message: String) {
             Log.i(TAG, "capture discarded: $message")
+            if (endedTrigger == TurnTrigger.WAKE_PHRASE) {
+                captureClaimId = null
+                wake.wake.onRequestCaptureEnded(sent = false)
+            }
             app.discard(message)
         }
     }
@@ -173,8 +233,9 @@ class WatchActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        wake = WakeController(this, wakePort, app.settings.value)
+        wake = WakeController(this, wakePort, app.settings.value, claimPort)
         lifecycle.addObserver(wake)
+        app.wakeVerdictListener = { claimId, verdict -> wake.wake.onClaimVerdict(claimId, verdict) }
         setContent {
             val talk by app.talk.collectAsStateWithLifecycle()
             val settings by app.settings.collectAsStateWithLifecycle()
@@ -242,6 +303,11 @@ class WatchActivity : ComponentActivity() {
         if (app.reader.value.sessions.status == LoadStatus.IDLE) app.loadSessions()
         if (app.reader.value.selectedSessionId != null) app.refreshSelected()
         if (!hasMic()) micPermission.launch(Manifest.permission.RECORD_AUDIO)
+        qaHeardPending?.let { (text, final) ->
+            qaHeardPending = null
+            // After this resume's window opened (it waits for the synced settings): the simulated recognizer's result.
+            window.decorView.postDelayed({ wake.qaHeard(text, final) }, QA_HEARD_DELAY_MS)
+        }
         if (qaWakeHandoffPending) {
             qaWakeHandoffPending = false
             // Posted: lifecycle observers (the wake window's new generation) run after onResume returns.
@@ -253,8 +319,15 @@ class WatchActivity : ComponentActivity() {
         }
     }
 
+    override fun onDestroy() {
+        app.wakeVerdictListener = null
+        super.onDestroy()
+    }
+
     override fun onPause() {
         window.decorView.removeCallbacks(handoffRunnable)
+        window.decorView.removeCallbacks(talkAfterRelease)
+        talkPending = false
         captures.activeId?.let { end(it, CaptureStop.LIFECYCLE) }
         super.onPause()
     }
@@ -297,8 +370,24 @@ class WatchActivity : ComponentActivity() {
             micPermission.launch(Manifest.permission.RECORD_AUDIO)
             return
         }
+        if (talkPending) return
+        val listening = wakeListening.value
         wake.wake.onBusy()
-        startCapture(TurnTrigger.PUSH_TO_TALK)
+        if (!listening) {
+            startCapture(TurnTrigger.PUSH_TO_TALK)
+            return
+        }
+        // The wake window was open: the recognizer was just released; give its microphone the same
+        // short pause as the wake handoff before push-to-talk opens it.
+        talkPending = true
+        Log.i(TAG, "talk tapped in the wake window: recognizer released, recording in ${WakeContract.MIC_HANDOFF_MS} ms")
+        window.decorView.postDelayed(talkAfterRelease, WakeContract.MIC_HANDOFF_MS)
+    }
+
+    private var talkPending = false
+    private val talkAfterRelease: Runnable = Runnable {
+        talkPending = false
+        if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) && captures.activeId == null) startCapture(TurnTrigger.PUSH_TO_TALK)
     }
 
     // ── capture ──────────────────────────────────────────────────────────────────────────────
@@ -352,6 +441,8 @@ class WatchActivity : ComponentActivity() {
             "unfinished_request" -> "Didn't catch that. Tap or say it again"
             "request_too_long" -> "That was too long for the watch. Use the phone"
             "unavailable" -> "Wake phrase unavailable on this watch"
+            "wake_taken" -> "The phone answered that wake phrase"
+            "wake_claim_timeout", "wake_claim_failed" -> "Couldn't confirm with the phone. Say it again"
             "recognizer_error_12", "recognizer_error_13" -> "The speech recognizer lacks the wake phrase language"
             else -> return
         }
@@ -377,16 +468,23 @@ class WatchActivity : ComponentActivity() {
         val wav = intent.getStringExtra(QaAudio.EXTRA)
         val handoff = intent.getStringExtra(QA_WAKE_HANDOFF)
         val seed = intent.getIntExtra(QA_SEED_READER, 0)
-        if (wav == null && handoff == null && seed <= 0) return
+        val recognizer = intent.getStringExtra(QA_RECOGNIZER)
+        val heard = intent.getStringExtra(QA_WAKE_HEARD)
+        val heardFinal = intent.getBooleanExtra(QA_WAKE_FINAL, true)
+        if (wav == null && handoff == null && seed <= 0 && recognizer == null && heard == null) return
         val fromHistory = intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0
         val handled = intent.getBooleanExtra(QA_HANDLED, false)
         intent.removeExtra(QaAudio.EXTRA)
         intent.removeExtra(QA_WAKE_HANDOFF)
         intent.removeExtra(QA_SEED_READER)
+        listOf(QA_RECOGNIZER, QA_WAKE_HEARD, QA_WAKE_FINAL).forEach(intent::removeExtra)
         intent.putExtra(QA_HANDLED, true)
         setIntent(intent)
         if (!QaLaunchGuard.shouldHandle(restored, fromHistory, handled)) return
         if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0 || captures.activeId != null) return
+        if (recognizer != null) wake.qaFixtureRecognizer = recognizer == "fixture"
+        if (heard != null) qaHeardPending = heard to heardFinal
+        if (recognizer != null || heard != null) return
         if (seed > 0) {
             app.seedReaderForQa(seed.coerceAtMost(40), intent.getLongExtra(QA_SEED_NEWEST, seed.toLong()))
             return
@@ -406,6 +504,10 @@ class WatchActivity : ComponentActivity() {
         private const val TAG = "HermesVoiceWatch"
         private const val MIC_HANDOFF_MS = 300L
         private const val QA_WAKE_HANDOFF = "hv_qa_wake_handoff"
+        private const val QA_RECOGNIZER = "hv_qa_recognizer"
+        private const val QA_WAKE_HEARD = "hv_qa_wake_heard"
+        private const val QA_WAKE_FINAL = "hv_qa_wake_final"
+        private const val QA_HEARD_DELAY_MS = 1_500L
         private const val QA_HANDLED = "hv_qa_handled"
         private const val QA_SEED_READER = "hv_qa_seed_reader"
         private const val QA_SEED_NEWEST = "hv_qa_seed_newest"

@@ -84,6 +84,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import java.io.File
+import java.util.UUID
 import kotlin.math.roundToInt
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
@@ -95,7 +96,10 @@ import com.rumi.hermesvoice.core.sessions.AppConversation
 import com.rumi.hermesvoice.core.settings.ThemeMode
 import com.rumi.hermesvoice.core.settings.VadSilence
 import com.rumi.hermesvoice.core.settings.WakeLocation
+import com.rumi.hermesvoice.core.wake.ClaimVerdict
 import com.rumi.hermesvoice.core.wake.WakeArmInputs
+import com.rumi.hermesvoice.core.wake.WakeClaim
+import com.rumi.hermesvoice.core.wake.WakeClaimPort
 import com.rumi.hermesvoice.core.wake.WakeBlock
 import com.rumi.hermesvoice.core.wake.WakeContract
 import com.rumi.hermesvoice.core.wake.WakeDevicePort
@@ -104,6 +108,7 @@ class MainActivity : ComponentActivity() {
     private val model: PhoneViewModel by viewModels()
     private lateinit var phoneWake: PhoneWakeController
     private var qaWakeHandoffPending = false
+    private var qaHeardPending: Pair<String, Boolean>? = null
     private var recognizerAvailable by mutableStateOf(false)
     private val handoffRunnable: Runnable = Runnable {
         if (!phoneWake.wake.onHandoffDue(captureIdle = model.voiceIdle())) Log.i(TAG, "phone wake handoff dropped gen=${phoneWake.wake.generation}")
@@ -122,9 +127,11 @@ class MainActivity : ComponentActivity() {
         override fun cancelHandoff() {
             window.decorView.removeCallbacks(handoffRunnable)
         }
-        override fun startRequestCapture(silenceMs: Long): Boolean = hasMic() && model.startHandsFree(silenceMs)
+        override fun startRequestCapture(silenceMs: Long): Boolean = startRequestCapture(silenceMs, null)
+        override fun startRequestCapture(silenceMs: Long, claimId: String?): Boolean = hasMic() && model.startHandsFree(silenceMs, claimId)
         override fun cancelRequestCapture(reason: String) = model.cancelHandsFree(reason)
-        override fun sendRecognized(request: String) = model.sendRecognizedRequest(request)
+        override fun sendRecognized(request: String) = sendRecognized(request, null)
+        override fun sendRecognized(request: String, claimId: String?) = model.sendRecognizedRequest(request, claimId)
 
         override fun closed(reason: String) {
             Log.i(TAG, "phone wake window closed reason=$reason")
@@ -154,11 +161,73 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val claimTimer: Runnable = Runnable { phoneWake.wake.onClaimTimer() }
+
+    /**
+     * "Both": the Phone is the coordinator, so its own claims are direct calls to the shared
+     * [com.rumi.hermesvoice.core.wake.WakeAdmission] the Watch's claims also go to. Answers are
+     * posted, like the Watch's arrive, so a claim is never answered re-entrantly.
+     */
+    private val claimPort: WakeClaimPort = object : WakeClaimPort {
+        private fun admission() = runCatching { PhoneApp.from(this@MainActivity).wiring().core.wakeAdmission }.getOrNull()
+
+        override fun newClaimId(): String = "p-" + UUID.randomUUID().toString()
+
+        override fun request(claimId: String, settingsRevision: Long, generation: Long) {
+            val verdict = admission()?.claim(WakeClaim(claimId, VoiceOrigin.PHONE, "", settingsRevision, generation)) ?: ClaimVerdict.EXPIRED
+            Log.i(TAG, "phone wake claim ${claimId.take(10)} gen=$generation verdict=$verdict")
+            window.decorView.post { phoneWake.wake.onClaimVerdict(claimId, verdict) }
+        }
+
+        override fun renew(claimId: String) {
+            val verdict = admission()?.renew(claimId, VoiceOrigin.PHONE, "") ?: ClaimVerdict.EXPIRED
+            if (verdict != ClaimVerdict.GRANTED) window.decorView.post { phoneWake.wake.onClaimVerdict(claimId, verdict) }
+        }
+
+        override fun release(claimId: String) {
+            admission()?.release(claimId, VoiceOrigin.PHONE, "")
+            Log.i(TAG, "phone wake claim ${claimId.take(10)} released")
+        }
+
+        override fun scheduleTimer(delayMs: Long) {
+            window.decorView.removeCallbacks(claimTimer)
+            window.decorView.postDelayed(claimTimer, delayMs)
+        }
+
+        override fun cancelTimer() {
+            window.decorView.removeCallbacks(claimTimer)
+        }
+    }
+
+    /** A Talk tap waiting for the recognizer's microphone to be released. */
+    private var talkPending = false
+    private val talkAfterRelease: Runnable = Runnable {
+        talkPending = false
+        if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) model.toggleRecording()
+    }
+
+    /**
+     * The Talk button. During a hands-free recording it sends it now. While the wake window is
+     * open, the recognizer is released first and push-to-talk starts after the same short pause
+     * as the wake handoff, so the two never hold the microphone together.
+     */
+    private fun onTalk() {
+        if (talkPending) return
+        if (model.handsFreeCapturing() || model.state.value.recording) return model.toggleRecording()
+        val listening = model.state.value.handsFree == HandsFree.LISTENING
+        phoneWake.wake.onBusy()
+        if (!listening) return model.toggleRecording()
+        talkPending = true
+        Log.i(TAG, "phone talk tapped in the wake window: recognizer released, recording in ${WakeContract.MIC_HANDOFF_MS} ms")
+        window.decorView.postDelayed(talkAfterRelease, WakeContract.MIC_HANDOFF_MS)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         applySystemBars(dark = PhoneApp.from(this).settings.themeMode.isDark(systemDark = isSystemNight()))
-        phoneWake = PhoneWakeController(this, wakePort, model.state.value.watch)
+        phoneWake = PhoneWakeController(this, wakePort, model.state.value.watch, claimPort)
         lifecycle.addObserver(phoneWake)
+        model.onHandsFreeEnded = { sent -> phoneWake.wake.onRequestCaptureEnded(sent) }
         recognizerAvailable = phoneWake.recognizerAvailable()
         setContent {
             val state by model.state.collectAsStateWithLifecycle()
@@ -168,8 +237,7 @@ class MainActivity : ComponentActivity() {
                 onDispose {}
             }
             HermesVoiceTheme(dark) {
-                // The wake window releases the microphone before push-to-talk opens it.
-                PhoneScreen(model, recognizerAvailable, beforeTalk = { if (!model.handsFreeCapturing()) phoneWake.wake.onBusy() })
+                PhoneScreen(model, recognizerAvailable, onTalk = ::onTalk)
             }
         }
         // Phone-owned settings: a mode that excludes the Phone stops listening and any hands-free capture at once.
@@ -187,6 +255,11 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         recognizerAvailable = phoneWake.recognizerAvailable()
+        qaHeardPending?.let { (text, final) ->
+            qaHeardPending = null
+            // After the resume's window opened: the simulated recognizer reports this result.
+            window.decorView.postDelayed({ phoneWake.qaHeard(text, final) }, QA_HEARD_DELAY_MS)
+        }
         if (qaWakeHandoffPending) {
             qaWakeHandoffPending = false
             // Posted: lifecycle observers (the wake window's new generation) run after onResume returns.
@@ -200,7 +273,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         window.decorView.removeCallbacks(handoffRunnable)
+        window.decorView.removeCallbacks(talkAfterRelease)
+        talkPending = false
         super.onPause()
+    }
+
+    override fun onDestroy() {
+        model.onHandsFreeEnded = null
+        super.onDestroy()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -216,7 +296,10 @@ class MainActivity : ComponentActivity() {
      * `--es hv_qa_wake_handoff second_utterance` runs the phrase-only wake handoff exactly as a
      * recognizer match would (fixture: it proves the recorder path, not recognition);
      * `--es hv_qa_wake_location <OFF|WATCH|PHONE|BOTH>` and `--es hv_qa_vad_silence <seconds>` save
-     * and publish the settings through the same path as the Settings screen (invalid values are refused).
+     * and publish the settings through the same path as the Settings screen (invalid values are refused);
+     * `--es hv_qa_recognizer fixture` replaces the platform recognizer with a simulated one (`real`
+     * restores it) and `--es hv_qa_wake_heard "<text>" [--ez hv_qa_wake_final false]` is its result
+     * for the window this launch opens (it tests the wake flow and arbitration, never recognition).
      */
     private fun handleQaIntent(intent: Intent?, restored: Boolean) {
         intent ?: return
@@ -224,10 +307,13 @@ class MainActivity : ComponentActivity() {
         val handoff = intent.getStringExtra(QA_WAKE_HANDOFF)
         val location = intent.getStringExtra(QA_WAKE_LOCATION)
         val silence = intent.getStringExtra(QA_VAD_SILENCE)
-        if (name == null && handoff == null && location == null && silence == null) return
+        val recognizer = intent.getStringExtra(QA_RECOGNIZER)
+        val heard = intent.getStringExtra(QA_WAKE_HEARD)
+        val heardFinal = intent.getBooleanExtra(QA_WAKE_FINAL, true)
+        if (name == null && handoff == null && location == null && silence == null && recognizer == null && heard == null) return
         val fromHistory = intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0
         val handled = intent.getBooleanExtra(QA_HANDLED, false)
-        listOf(QaAudio.EXTRA, QA_WAKE_HANDOFF, QA_WAKE_LOCATION, QA_VAD_SILENCE).forEach(intent::removeExtra)
+        listOf(QaAudio.EXTRA, QA_WAKE_HANDOFF, QA_WAKE_LOCATION, QA_VAD_SILENCE, QA_RECOGNIZER, QA_WAKE_HEARD, QA_WAKE_FINAL).forEach(intent::removeExtra)
         intent.putExtra(QA_HANDLED, true)
         setIntent(intent)
         if (!QaLaunchGuard.shouldHandle(restored, fromHistory, handled)) return
@@ -239,6 +325,8 @@ class MainActivity : ComponentActivity() {
             model.updateWatch(current.copy(wakeLocation = mode ?: current.wakeLocation, vadSilenceSeconds = seconds ?: current.vadSilenceSeconds))
         }
         if (handoff == "second_utterance") qaWakeHandoffPending = true
+        if (recognizer != null) phoneWake.qaFixtureRecognizer = recognizer == "fixture"
+        if (heard != null) qaHeardPending = heard to heardFinal
         val file = name?.let { QaAudio.resolve(File(filesDir, QaAudio.DIR), it) } ?: return
         Log.i("HermesVoice", "qa audio submitted as a phone voice request bytes=${file.length()}")
         model.submitQaWav(file.readBytes())
@@ -250,6 +338,10 @@ class MainActivity : ComponentActivity() {
         const val QA_WAKE_HANDOFF = "hv_qa_wake_handoff"
         const val QA_WAKE_LOCATION = "hv_qa_wake_location"
         const val QA_VAD_SILENCE = "hv_qa_vad_silence"
+        const val QA_RECOGNIZER = "hv_qa_recognizer"
+        const val QA_WAKE_HEARD = "hv_qa_wake_heard"
+        const val QA_WAKE_FINAL = "hv_qa_wake_final"
+        const val QA_HEARD_DELAY_MS = 600L
     }
 
     private fun isSystemNight(): Boolean =
@@ -268,13 +360,13 @@ private enum class Tab(val label: String) { CONVERSATIONS("Conversations"), CHAT
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-private fun PhoneScreen(model: PhoneViewModel, recognizerAvailable: Boolean, beforeTalk: () -> Unit) {
+private fun PhoneScreen(model: PhoneViewModel, recognizerAvailable: Boolean, onTalk: () -> Unit) {
     val state by model.state.collectAsStateWithLifecycle()
     var tab by rememberSaveable { mutableStateOf(Tab.CONVERSATIONS) }
     val context = androidx.compose.ui.platform.LocalContext.current
     val view = LocalView.current
     val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) model.toggleRecording()
+        if (granted) onTalk()
     }
     // Hands-free recording start ("speak now") and end: a short system haptic, no sound (a tone would be recorded).
     LaunchedEffect(state.hapticTick) {
@@ -297,8 +389,7 @@ private fun PhoneScreen(model: PhoneViewModel, recognizerAvailable: Boolean, bef
                     TalkBar(state) {
                         val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
                             PackageManager.PERMISSION_GRANTED
-                        beforeTalk()
-                        if (granted) model.toggleRecording() else micPermission.launch(Manifest.permission.RECORD_AUDIO)
+                        if (granted) onTalk() else micPermission.launch(Manifest.permission.RECORD_AUDIO)
                     }
                 }
                 NavigationBar(containerColor = MaterialTheme.colorScheme.surfaceContainer) {

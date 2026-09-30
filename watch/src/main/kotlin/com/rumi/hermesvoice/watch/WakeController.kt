@@ -18,6 +18,8 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import com.rumi.hermesvoice.core.VoiceOrigin
 import com.rumi.hermesvoice.core.settings.WatchSettings
+import com.rumi.hermesvoice.core.wake.RecognizerGuard
+import com.rumi.hermesvoice.core.wake.WakeClaimPort
 import com.rumi.hermesvoice.core.wake.WakeContract
 import com.rumi.hermesvoice.core.wake.WakeDeviceController
 import com.rumi.hermesvoice.core.wake.WakeDevicePort
@@ -37,28 +39,46 @@ class WakeController(
     private val activity: ComponentActivity,
     port: WakeDevicePort,
     initial: WatchSettings,
+    claims: WakeClaimPort,
 ) : DefaultLifecycleObserver {
     private val handler = Handler(Looper.getMainLooper())
     private var recognizer: SpeechRecognizer? = null
+    private val guard = RecognizerGuard()
+
+    /**
+     * Debug QA only: a simulated recognizer. The window opens without the platform recognizer and
+     * [qaHeard] supplies its results. It exercises the wake flow and arbitration, not recognition.
+     */
+    var qaFixtureRecognizer = false
+
+    /** Debug QA only: a result of the simulated recognizer for the open window. */
+    fun qaHeard(text: String, final: Boolean) {
+        if (!qaFixtureRecognizer) return
+        Log.i(TAG, "qa recognizer fixture result gen=${wake.generation} final=$final chars=${text.length} (simulated, not recognition)")
+        wake.onResults(wake.generation, listOf(text), final)
+    }
     private var receiverRegistered = false
 
     private val recognizerPort: WakeRecognizerPort = object : WakeRecognizerPort {
-        override fun available(): Boolean =
+        override fun available(): Boolean = qaFixtureRecognizer ||
             runCatching { SpeechRecognizer.isRecognitionAvailable(activity) }.getOrDefault(false) || onDeviceAvailable()
 
-        override fun start(generation: Long): Boolean = startRecognizer(generation, onDevice = onDeviceAvailable())
-
-        override fun release() {
-            recognizer?.let { runCatching { it.cancel() }; runCatching { it.destroy() } }
-            recognizer = null
+        override fun start(generation: Long): Boolean {
+            if (qaFixtureRecognizer) {
+                Log.i(TAG, "wake window opened gen=$generation mode=FIXTURE window_ms=${WakeContract.WINDOW_MS} (simulated recognizer)")
+                return true
+            }
+            return startRecognizer(generation, onDevice = onDeviceAvailable())
         }
+
+        override fun release() = destroyRecognizer()
     }
 
     /** On-device recognition is preferred; [onDevice] false uses the system's default recognition service. */
     private fun startRecognizer(generation: Long, onDevice: Boolean): Boolean = runCatching {
         val created = if (onDevice) SpeechRecognizer.createOnDeviceSpeechRecognizer(activity) else SpeechRecognizer.createSpeechRecognizer(activity)
         recognizer = created
-        created.setRecognitionListener(listenerFor(generation, onDevice))
+        created.setRecognitionListener(listenerFor(generation, onDevice, guard.open()))
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
             .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
@@ -73,6 +93,13 @@ class WakeController(
         Log.i(TAG, "wake window opened gen=$generation mode=${if (onDevice) "ON_DEVICE" else "SYSTEM"} window_ms=${WakeContract.WINDOW_MS}")
     }.onFailure { Log.w(TAG, "wake recognizer start failed ${it.javaClass.simpleName}") }.isSuccess
 
+    /** Cancels and destroys the recognizer; its late callbacks are ignored from here on ([guard]). */
+    private fun destroyRecognizer() {
+        guard.close()
+        recognizer?.let { runCatching { it.cancel() }; runCatching { it.destroy() } }
+        recognizer = null
+    }
+
     private val deadlineCheck: Runnable = Runnable { wake.onTimer() }
 
     private val timerPort: WakeTimerPort = object : WakeTimerPort {
@@ -85,7 +112,7 @@ class WakeController(
     }
 
     /** The shared wake flow; the activity feeds it settings, busy/idle and handoff timing. */
-    val wake: WakeDeviceController = WakeDeviceController(VoiceOrigin.WATCH, recognizerPort, timerPort, port, SystemClock::elapsedRealtime, initial)
+    val wake: WakeDeviceController = WakeDeviceController(VoiceOrigin.WATCH, recognizerPort, timerPort, port, SystemClock::elapsedRealtime, initial, claims)
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -129,7 +156,7 @@ class WakeController(
     private fun onDeviceAvailable(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
         runCatching { SpeechRecognizer.isOnDeviceRecognitionAvailable(activity) }.getOrDefault(false)
 
-    private fun listenerFor(gen: Long, onDevice: Boolean) = object : RecognitionListener {
+    private fun listenerFor(gen: Long, onDevice: Boolean, token: Long) = object : RecognitionListener {
         override fun onReadyForSpeech(params: Bundle?) { Log.i(TAG, "wake recognizer ready gen=$gen") }
         override fun onBeginningOfSpeech() { Log.i(TAG, "wake recognizer speech_begin gen=$gen") }
         override fun onEndOfSpeech() { Log.i(TAG, "wake recognizer speech_end gen=$gen") }
@@ -138,16 +165,18 @@ class WakeController(
         override fun onEvent(eventType: Int, params: Bundle?) {}
         override fun onError(error: Int) {
             Log.i(TAG, "wake recognizer error gen=$gen code=$error mode=${if (onDevice) "ON_DEVICE" else "SYSTEM"}")
-            // The on-device model may lack the wake phrases' language: try the system recognizer once, in the same window.
-            if (onDevice && error in LANGUAGE_ERRORS && recognizer != null) {
-                recognizer?.let { runCatching { it.cancel() }; runCatching { it.destroy() } }
-                recognizer = null
+            // A late callback of a recognizer that was already released must not touch the current one.
+            if (!guard.isCurrent(token)) return
+            // The on-device model may lack the wake phrases' language: try the system's default recognition
+            // service once, in the same window (that service may use the network).
+            if (onDevice && error in LANGUAGE_ERRORS) {
+                destroyRecognizer()
                 if (startRecognizer(gen, onDevice = false)) return
             }
             wake.onError(gen, error)
         }
-        override fun onResults(results: Bundle?) = onRecognized(gen, results, final = true)
-        override fun onPartialResults(partialResults: Bundle?) = onRecognized(gen, partialResults, final = false)
+        override fun onResults(results: Bundle?) { if (guard.isCurrent(token)) onRecognized(gen, results, final = true) }
+        override fun onPartialResults(partialResults: Bundle?) { if (guard.isCurrent(token)) onRecognized(gen, partialResults, final = false) }
     }
 
     private fun onRecognized(gen: Long, bundle: Bundle?, final: Boolean) {

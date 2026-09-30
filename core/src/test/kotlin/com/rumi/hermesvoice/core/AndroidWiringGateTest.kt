@@ -74,7 +74,14 @@ class AndroidWiringGateTest {
     fun `both wake adapters delegate to the shared device controller, foreground only`() {
         for ((path, device) in listOf("$watch/WakeController.kt" to "WATCH", "$phone/PhoneWakeController.kt" to "PHONE")) {
             val wake = source(path)
-            assertTrue(path, wake.contains("WakeDeviceController(VoiceOrigin.$device, recognizerPort, timerPort, port, SystemClock::elapsedRealtime, initial)"))
+            assertTrue(path, wake.contains("WakeDeviceController(VoiceOrigin.$device, recognizerPort, timerPort, port, SystemClock::elapsedRealtime, initial, claims)"))
+            // Stale callbacks of a released recognizer are dropped by token, for errors and results alike.
+            assertTrue(path, wake.contains("created.setRecognitionListener(listenerFor(generation, onDevice, guard.open()))"))
+            assertTrue(path, wake.contains("if (!guard.isCurrent(token)) return") &&
+                wake.contains("if (guard.isCurrent(token)) onRecognized(gen, results, final = true)") &&
+                wake.contains("if (guard.isCurrent(token)) onRecognized(gen, partialResults, final = false)"))
+            assertTrue(path, wake.substringAfter("private fun destroyRecognizer()").substringBefore("}").contains("guard.close()"))
+            assertFalse("the fallback no longer tests only for a non-null recognizer", wake.contains("error in LANGUAGE_ERRORS && recognizer != null"))
             assertFalse("receiver never touches the microphone", wake.substringAfter("override fun onReceive").substringBefore("override fun onStart")
                 .contains("startListening"))
             assertFalse(wake.contains("EXTRA_PREFER_OFFLINE"))
@@ -86,12 +93,45 @@ class AndroidWiringGateTest {
         assertTrue(watchActivity.contains("app.settings.collect { wake.wake.onSettings(it) }") && watchActivity.contains("wake.wake.onSettingsCurrent()"))
         val phoneActivity = source("$phone/MainActivity.kt")
         assertTrue(phoneActivity.contains("collect { phoneWake.wake.onSettings(it) }"))
-        assertTrue("the Phone recorder gets the snapshot", phoneActivity.contains("model.startHandsFree(silenceMs)"))
+        assertTrue("the Phone recorder gets the snapshot", phoneActivity.contains("model.startHandsFree(silenceMs, claimId)"))
         val model = source("$phone/PhoneViewModel.kt")
         assertTrue(model.contains("SilenceEndpoint(sampleRate = PhoneCapture.SAMPLE_RATE, silenceMs = silenceMs)"))
         assertTrue("the same capture lifecycle as the Watch", model.contains("private val captures = CaptureCoordinator(") &&
             model.contains("captures.stop(id, CaptureStop.of(reason))"))
         assertTrue(source("$phone/PhoneCapture.kt").contains("PcmCaptureLoop({ recorder.read(it, 0, it.size) }, LIMIT_BYTES, endpoint, listener"))
+    }
+
+    @Test
+    fun `both apps carry the wake claim with their requests and the phone answers claims from the transport's node`() {
+        val bridge = source("$phone/PhoneWatchBridge.kt")
+        assertTrue(bridge.contains("WatchLinkPaths.WAKE_CLAIM -> answerWakeClaim(event.sourceNodeId, event.data)"))
+        assertTrue(bridge.contains("WakeClaimService.handle(wiring.core.wakeAdmission, nodeId, data)"))
+        assertTrue(source("phone/src/main/AndroidManifest.xml").contains("android:path=\"/hv/v1/wake/claim\""))
+        val phoneActivity = source("$phone/MainActivity.kt")
+        assertTrue(phoneActivity.contains("model.startHandsFree(silenceMs, claimId)") && phoneActivity.contains("model.sendRecognizedRequest(request, claimId)"))
+        assertTrue(phoneActivity.contains("admission()?.claim(WakeClaim(claimId, VoiceOrigin.PHONE, \"\", settingsRevision, generation))"))
+        val model = source("$phone/PhoneViewModel.kt")
+        assertTrue(model.contains("submitVoice(wav, wakeTurn = true, wakeClaimId = claimId)") && model.contains("wakeTurn = true, wakeClaimId = claimId)"))
+        assertTrue("a busy phone says so instead of dropping the request", model.substringAfter("fun sendRecognizedRequest").substringBefore("recognizedClaimId = claimId")
+            .contains("return onWakeClosed(\"unfinished_request\")"))
+        val watchActivity = source("$watch/WatchActivity.kt")
+        assertTrue(watchActivity.contains("app.upload(captureId, trigger, wav, claimId)") && watchActivity.contains("app.uploadRecognized(turnId, text, recognizedClaimId)"))
+        assertTrue(watchActivity.contains("wake.wake.onRequestCaptureEnded(sent = true)") && watchActivity.contains("wake.wake.onRequestCaptureEnded(sent = false)"))
+        val watchApp = source("$watch/WatchApp.kt")
+        assertTrue("a verdict counts only from the node the claim went to", watchApp.contains("if (claimTargets[verdict.claimId] != sourceNodeId)"))
+        assertTrue(source("$watch/WatchListenerService.kt").contains("WatchLinkPaths.WAKE_VERDICT ->"))
+    }
+
+    @Test
+    fun `talk tapped in an open wake window releases the recognizer and waits the handoff pause on both devices`() {
+        val phoneActivity = source("$phone/MainActivity.kt")
+        val phoneTalk = phoneActivity.substringAfter("private fun onTalk()").substringBefore("override fun onCreate")
+        assertTrue(phoneTalk.contains("phoneWake.wake.onBusy()") && phoneTalk.contains("postDelayed(talkAfterRelease, WakeContract.MIC_HANDOFF_MS)"))
+        assertTrue(phoneActivity.contains("PhoneScreen(model, recognizerAvailable, onTalk = ::onTalk)"))
+        val watchTalk = source("$watch/WatchActivity.kt").substringAfter("private fun onTalkPressed()").substringBefore("// ── capture")
+        assertTrue(watchTalk.contains("wake.wake.onBusy()") && watchTalk.contains("postDelayed(talkAfterRelease, WakeContract.MIC_HANDOFF_MS)"))
+        // Leaving the screen (rotation included) cancels a hands-free recording unsent: the documented lifecycle contract.
+        assertTrue(source("$phone/PhoneWakeController.kt").contains("override fun onPause(owner: LifecycleOwner) = wake.onPause()"))
     }
 
     @Test

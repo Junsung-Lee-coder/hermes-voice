@@ -2,6 +2,8 @@ package com.rumi.hermesvoice.core.wake
 
 import com.rumi.hermesvoice.core.VoiceOrigin
 import com.rumi.hermesvoice.core.settings.VadSilence
+import com.rumi.hermesvoice.core.settings.WakeLocation
+import com.rumi.hermesvoice.core.settings.WakePhrasePatterns
 import com.rumi.hermesvoice.core.settings.WatchSettings
 
 /** What a device (Phone or Watch) does for its wake flow besides the recognizer and the timer. */
@@ -31,6 +33,28 @@ interface WakeDevicePort {
 
     /** A request to listen was refused; for logs and availability status. */
     fun armBlocked(source: String, block: WakeBlock) {}
+
+    /** As [startRequestCapture]; [claimId] is the wake claim the recording must be sent with ("Both"), or null. */
+    fun startRequestCapture(silenceMs: Long, claimId: String?): Boolean = startRequestCapture(silenceMs)
+
+    /** As [sendRecognized]; [claimId] is the wake claim the request must be sent with ("Both"), or null. */
+    fun sendRecognized(request: String, claimId: String?) = sendRecognized(request)
+}
+
+/**
+ * How a device asks the Phone for the wake claim when both devices listen (see [WakeAdmission]).
+ * On the Phone these are direct calls; on the Watch, Data Layer messages. Answers come back through
+ * [WakeDeviceController.onClaimVerdict], the timer through [WakeDeviceController.onClaimTimer].
+ */
+interface WakeClaimPort {
+    fun newClaimId(): String
+    fun request(claimId: String, settingsRevision: Long, generation: Long)
+    fun renew(claimId: String)
+    fun release(claimId: String)
+
+    /** (Re)schedules the single claim timer, replacing any earlier one. */
+    fun scheduleTimer(delayMs: Long)
+    fun cancelTimer()
 }
 
 /**
@@ -45,6 +69,13 @@ interface WakeDevicePort {
  * handoff and stops a hands-free capture without sending it; later callbacks of that window are
  * ignored. A device the mode excludes never listens, hands off or sends. A capture keeps the
  * trailing silence it started with; a changed setting applies to the next capture.
+ *
+ * When both devices listen ("Both") and a [WakeClaimPort] is given, the device asks the Phone for
+ * the wake claim as soon as its recognizer reports a leading wake phrase (partial or final) and
+ * records or sends only once the claim is granted; it renews the claim until its request is
+ * handed over, and releases it when the episode ends without one. A refused, unanswered or lost
+ * claim fails closed: the window closes with a notice, a recording in progress is stopped unsent.
+ * Verdicts and timers for an older claim are ignored.
  */
 class WakeDeviceController(
     val device: VoiceOrigin,
@@ -53,12 +84,28 @@ class WakeDeviceController(
     private val port: WakeDevicePort,
     clock: () -> Long,
     initial: WatchSettings = WatchSettings(),
+    private val claims: WakeClaimPort? = null,
 ) {
     private val host = object : WakeHostPort {
         override fun windowChanged(open: Boolean) = port.windowChanged(open)
         override fun handoff(generation: Long, handoff: WakeOutcome.Handoff) = onHandoff(generation, handoff)
-        override fun closed(reason: String) = port.closed(reason)
+        override fun closed(reason: String) {
+            // The window ended without a request: an episode claimed on a partial result is over.
+            if (heldHandoff == null && !capturing) releaseClaim()
+            port.closed(reason)
+        }
     }
+
+    private class Claim(val id: String, var granted: Boolean = false)
+
+    private var claim: Claim? = null
+
+    /** A handoff waiting for the Phone's answer to the claim. */
+    private var heldHandoff: Pair<Long, WakeOutcome.Handoff>? = null
+    private var capturing = false
+
+    /** Both devices may listen, so one wake episode must be admitted from one of them. */
+    private val arbitrated: Boolean get() = claims != null && settings.wakeLocation == WakeLocation.BOTH
     private val window = WakeWindowCoordinator(recognizer, timer, host, clock)
     private val handoffGate = WakeHandoffGate()
     private var handoffGeneration = -1L
@@ -78,8 +125,12 @@ class WakeDeviceController(
 
     /** New settings: listen if this device is (still) included, otherwise stop everything wake-related now. */
     fun onSettings(next: WatchSettings) {
+        val revised = next.revision != settings.revision
         settings = next
-        if (enabledHere) requestArm("settings") else disable("opt_out")
+        if (!enabledHere) return disable("opt_out")
+        // A claim was made under the old settings: the Phone would refuse its request anyway.
+        if (revised && claim != null && !capturing) failClaim("wake_claim_failed")
+        requestArm("settings")
     }
 
     /** The app became visible. [settingsPending]: wait for [onSettingsCurrent] before listening. */
@@ -103,8 +154,11 @@ class WakeDeviceController(
 
     fun onScreenOff() {
         cancelHandoff()
+        heldHandoff = null
         window.newGeneration("screen_off")
         port.cancelRequestCapture("screen_off")
+        capturing = false
+        releaseClaim()
     }
 
     fun onScreenOn() = requestArm("screen_on")
@@ -112,7 +166,9 @@ class WakeDeviceController(
     /** Something else owns the microphone or speaker (push-to-talk, a turn, playback). */
     fun onBusy() {
         cancelHandoff()
+        heldHandoff = null
         window.close("busy")
+        if (!capturing) releaseClaim()
     }
 
     fun onIdle() = requestArm("idle")
@@ -132,7 +188,39 @@ class WakeDeviceController(
 
     fun onResults(generation: Long, hypotheses: List<String>, final: Boolean) {
         if (!enabledHere) return
+        // Claim the episode at the first leading wake phrase, before anything is recorded or sent.
+        if (arbitrated && claim == null && generation == this.generation && window.listening &&
+            hypotheses.any { WakePhrasePatterns.leadingRequest(settings.wakePatterns, it) != null }) beginClaim()
         window.onResults(generation, hypotheses, final, settings.wakePatterns)
+    }
+
+    /** The Phone's answer to a claim or renewal. Answers about any other claim are ignored. */
+    fun onClaimVerdict(claimId: String, verdict: ClaimVerdict) {
+        val current = claim?.takeIf { it.id == claimId } ?: return
+        if (verdict != ClaimVerdict.GRANTED) {
+            return failClaim(if (verdict == ClaimVerdict.HELD_BY_OTHER) "wake_taken" else "wake_claim_failed", release = false)
+        }
+        if (current.granted) return
+        current.granted = true
+        claims?.scheduleTimer(WakeContract.CLAIM_RENEW_MS)
+        heldHandoff?.let { (generation, handoff) ->
+            heldHandoff = null
+            proceed(generation, handoff)
+        }
+    }
+
+    /** The claim timer fired: no answer in time fails closed; a held claim is renewed (without limit). */
+    fun onClaimTimer() {
+        val current = claim ?: return
+        if (!current.granted) return failClaim("wake_claim_timeout")
+        claims?.renew(current.id)
+        claims?.scheduleTimer(WakeContract.CLAIM_RENEW_MS)
+    }
+
+    /** The hands-free recording ended. [sent]: it was handed to the Phone with its claim. */
+    fun onRequestCaptureEnded(sent: Boolean) {
+        capturing = false
+        if (sent) forgetClaim() else releaseClaim()
     }
 
     fun onError(generation: Long, code: Int) = window.onError(generation, code)
@@ -144,8 +232,14 @@ class WakeDeviceController(
      * generation, the app is resumed, nothing is capturing, and this device still listens.
      */
     fun onHandoffDue(captureIdle: Boolean): Boolean {
-        if (!handoffGate.claim(handoffGeneration, generation, resumed, captureIdle && enabledHere)) return false
-        return port.startRequestCapture(VadSilence.millis(settings.vadSilenceSeconds))
+        if (!handoffGate.claim(handoffGeneration, generation, resumed, captureIdle && enabledHere)) {
+            releaseClaim()
+            return false
+        }
+        if (arbitrated && claim?.granted != true) return false
+        capturing = port.startRequestCapture(VadSilence.millis(settings.vadSilenceSeconds), claim?.id)
+        if (!capturing) releaseClaim()
+        return capturing
     }
 
     /**
@@ -159,9 +253,26 @@ class WakeDeviceController(
     }
 
     private fun onHandoff(generation: Long, handoff: WakeOutcome.Handoff) {
-        if (!enabledHere || !resumed) return
+        if (!enabledHere || !resumed) return releaseClaim()
+        if (arbitrated) {
+            if (claim == null) beginClaim()
+            if (claim?.granted != true) {
+                // Wait for the Phone: nothing is recorded or sent until this device owns the episode.
+                heldHandoff = generation to handoff
+                return
+            }
+        }
+        proceed(generation, handoff)
+    }
+
+    private fun proceed(generation: Long, handoff: WakeOutcome.Handoff) {
+        if (!enabledHere || !resumed || generation != this.generation) return releaseClaim()
         when (handoff.contract) {
-            WakeHandoff.RECOGNIZED_REQUEST -> port.sendRecognized(handoff.request)
+            WakeHandoff.RECOGNIZED_REQUEST -> {
+                val claimId = claim?.id
+                forgetClaim()
+                port.sendRecognized(handoff.request, claimId)
+            }
             WakeHandoff.SECOND_UTTERANCE -> {
                 handoffGeneration = generation
                 handoffGate.schedule(generation)
@@ -170,7 +281,42 @@ class WakeDeviceController(
         }
     }
 
+    private fun beginClaim() {
+        val port = claims ?: return
+        val started = Claim(port.newClaimId())
+        claim = started
+        port.scheduleTimer(WakeContract.CLAIM_TIMEOUT_MS)
+        port.request(started.id, settings.revision, generation)
+    }
+
+    /** The claim was refused, unanswered or lost: stop everything of this episode, unsent, and say so. */
+    private fun failClaim(reason: String, release: Boolean = true) {
+        heldHandoff = null
+        cancelHandoff()
+        if (release) releaseClaim() else forgetClaim()
+        capturing = false
+        port.cancelRequestCapture(reason)
+        if (window.listening) window.close(reason) else port.closed(reason)
+    }
+
+    /** Gives the claim back to the Phone (the episode ended without a request). */
+    private fun releaseClaim() {
+        val current = claim ?: return
+        forgetClaim()
+        claims?.release(current.id)
+    }
+
+    /** Stops tracking the claim without releasing it (the Phone uses it up when it admits the request). */
+    private fun forgetClaim() {
+        if (claim == null) return
+        claim = null
+        claims?.cancelTimer()
+    }
+
     private fun disable(reason: String) {
+        heldHandoff = null
+        capturing = false
+        releaseClaim()
         cancelHandoff()
         window.close(reason)
         port.cancelRequestCapture(reason)

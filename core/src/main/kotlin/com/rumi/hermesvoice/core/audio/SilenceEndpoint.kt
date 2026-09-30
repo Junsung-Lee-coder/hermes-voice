@@ -99,7 +99,7 @@ class SilenceEndpoint(
             }
             Phase.SILENCE -> {
                 if (cls != VadClass.VOICED) quietMs += weight(cls)
-                if (vad.runMs >= respeechMs) {
+                if (vad.qualifiedFor(respeechMs)) {
                     phase = Phase.SPEECH
                     quietMs = 0
                 }

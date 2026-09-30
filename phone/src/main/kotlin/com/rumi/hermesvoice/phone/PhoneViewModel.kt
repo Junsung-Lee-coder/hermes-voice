@@ -81,6 +81,12 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
     /** The hands-free recorder of the active wake capture; its lifecycle lives in [captures]. */
     private var handsFreeRecorder: PhoneCapture? = null
 
+    /** The wake claim the active hands-free capture was started under ("Both"), or null. */
+    private var handsFreeClaimId: String? = null
+
+    /** Told when a hands-free capture ended: true if it was handed on as a request (with its claim). */
+    var onHandsFreeEnded: ((sent: Boolean) -> Unit)? = null
+
     /** The same capture lifecycle as the Watch's: exactly-once stop, eligibility check, never a partial send. */
     private val captures = CaptureCoordinator(object : CapturePort {
         override fun stopRecorder(captureId: String, reason: CaptureStop): ByteArray? {
@@ -104,10 +110,19 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         override fun cue(line: String) = _state.update { it.copy(handsFree = HandsFree.SPEAK_NOW, voiceStatus = line) }
-        override fun upload(captureId: String, trigger: TurnTrigger, wav: ByteArray) = submitVoice(wav)
-        override fun uploadRecognized(turnId: String, text: String) = submitRecognized(turnId, text)
+        override fun upload(captureId: String, trigger: TurnTrigger, wav: ByteArray) {
+            val claimId = handsFreeClaimId
+            handsFreeClaimId = null
+            onHandsFreeEnded?.invoke(true)
+            submitVoice(wav, wakeTurn = true, wakeClaimId = claimId)
+        }
+
+        override fun uploadRecognized(turnId: String, text: String) = submitRecognized(turnId, text, recognizedClaimId)
+
         override fun discard(message: String) {
             Log.i(TAG, "phone hands-free discarded: $message")
+            handsFreeClaimId = null
+            onHandsFreeEnded?.invoke(false)
             _state.update { it.copy(voiceStatus = message) }
         }
     })
@@ -310,13 +325,19 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         submitVoice(wav)
     }
 
-    private fun submitVoice(wav: ByteArray) = runPhoneTurn(UUID.randomUUID().toString()) { turnId ->
-        VoiceTurnRequest(turnId, VoiceOrigin.PHONE, wav, "audio/wav", PhoneSpeakerSink(getApplication()))
-    }
+    private fun submitVoice(wav: ByteArray, wakeTurn: Boolean = false, wakeClaimId: String? = null) =
+        runPhoneTurn(UUID.randomUUID().toString()) { turnId ->
+            VoiceTurnRequest(turnId, VoiceOrigin.PHONE, wav, "audio/wav", PhoneSpeakerSink(getApplication()),
+                wakeTurn = wakeTurn, wakeClaimId = wakeClaimId)
+        }
+
+    /** The wake claim of the recognized request being sent; read once by [submitRecognized]. */
+    private var recognizedClaimId: String? = null
 
     /** A request the Phone's recognizer heard in full after the wake phrase: routed like speech, as text. */
-    private fun submitRecognized(turnId: String, text: String) = runPhoneTurn(turnId) { id ->
-        VoiceTurnRequest(id, VoiceOrigin.PHONE, ByteArray(0), "text/plain", PhoneSpeakerSink(getApplication()), recognizedText = text)
+    private fun submitRecognized(turnId: String, text: String, claimId: String?) = runPhoneTurn(turnId) { id ->
+        VoiceTurnRequest(id, VoiceOrigin.PHONE, ByteArray(0), "text/plain", PhoneSpeakerSink(getApplication()), recognizedText = text,
+            wakeTurn = true, wakeClaimId = claimId)
     }
 
     /** Runs one Phone voice turn; [PhoneUiState.voiceBusy] holds while it is sent, answered and played. */
@@ -353,8 +374,9 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
      * trailing silence (the setting now; a later change applies to the next request), on no
      * speech, or on a tap; a pause or opt-out cancels it unsent ([cancelHandsFree]).
      */
-    fun startHandsFree(silenceMs: Long): Boolean {
+    fun startHandsFree(silenceMs: Long, claimId: String? = null): Boolean {
         if (recorder.isRecording || _state.value.voiceBusy) return false
+        handsFreeClaimId = claimId
         val id = UUID.randomUUID().toString()
         if (!captures.begin(id, TurnTrigger.WAKE_PHRASE)) return false
         val capture = PhoneCapture(id, SilenceEndpoint(sampleRate = PhoneCapture.SAMPLE_RATE, silenceMs = silenceMs),
@@ -381,8 +403,14 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** The recognizer heard the whole request with the wake phrase: one end pulse, then send it as text. */
-    fun sendRecognizedRequest(text: String) {
-        if (!voiceIdle()) return
+    fun sendRecognizedRequest(text: String, claimId: String? = null) {
+        if (!voiceIdle()) {
+            // Something else took the microphone or speaker in the meantime: say so instead of dropping it silently.
+            Log.i(TAG, "phone recognized request not sent: busy (retry notice)")
+            claimId?.let { id -> runCatching { app.wiring().core.wakeAdmission.release(id, VoiceOrigin.PHONE, "") } }
+            return onWakeClosed("unfinished_request")
+        }
+        recognizedClaimId = claimId
         captures.sendRecognized(UUID.randomUUID().toString(), text)
     }
 
@@ -391,6 +419,8 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
             "unfinished_request" -> "Didn't catch that. Tap Talk or say it again"
             "request_too_long" -> "That was too long to send as text. Use Talk"
             "unavailable" -> "Wake phrase unavailable on this phone (no speech recognizer)"
+            "wake_taken" -> "The Watch answered that wake phrase"
+            "wake_claim_timeout", "wake_claim_failed" -> "Couldn't confirm the wake phrase. Say it again"
             "recognizer_error_12", "recognizer_error_13" -> "The speech recognizer lacks the wake phrase language"
             else -> return
         }

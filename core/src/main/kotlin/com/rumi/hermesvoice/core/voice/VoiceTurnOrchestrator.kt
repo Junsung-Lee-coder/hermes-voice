@@ -61,6 +61,12 @@ class VoiceTurnRequest(
      * transcription and is treated exactly like a transcript (untrusted data for the router).
      */
     val recognizedText: String? = null,
+    /** The turn came from the wake phrase (hands-free), not push-to-talk. */
+    val wakeTurn: Boolean = false,
+    /** The wake claim the turn was made under when both devices listen (see WakeAdmission). */
+    val wakeClaimId: String? = null,
+    /** The Watch node the turn came from; empty for the Phone. */
+    val originNodeId: String = "",
 )
 
 enum class VoiceTurnStage { TRANSCRIBING, ROUTING, CREATING, ACKNOWLEDGING, DELIVERING, RESPONDING }
@@ -88,6 +94,9 @@ interface VoiceTurnListener {
     /** A recording was refused before acceptance because it had no usable audio ([verdict]); nothing else happens. */
     fun onInputRejected(turnId: String, origin: VoiceOrigin, verdict: AudioInputVerdict) {}
 
+    /** A turn was refused before acceptance ([reason]); nothing else happens. */
+    fun onNotAdmitted(turnId: String, origin: VoiceOrigin, reason: String) {}
+
     /** A new voice request was accepted; its [origin] device is now the playback target. */
     fun onAccepted(turnId: String, origin: VoiceOrigin) {}
     fun onStage(turnId: String, stage: VoiceTurnStage) {}
@@ -100,6 +109,9 @@ interface VoiceTurnListener {
 
 sealed class VoiceTurnOutcome {
     data class Duplicate(val turnId: String) : VoiceTurnOutcome()
+
+    /** Refused before acceptance (e.g. the other device answered this wake phrase): nothing happened, the playback target is unchanged. */
+    data class NotAdmitted(val reason: String) : VoiceTurnOutcome()
     object NoSpeech : VoiceTurnOutcome()
     data class RoutingRejected(val transcript: String, val reason: String) : VoiceTurnOutcome()
 
@@ -148,6 +160,8 @@ class VoiceTurnOrchestrator(
     val playbackRoute: PlaybackRoute = PlaybackRoute(),
     private val inputGate: (ByteArray, String) -> AudioInputVerdict = AudioInputGate::assess,
     private val recipientCreator: RecipientCreator? = null,
+    /** Asked once per turn after the input check and before acceptance; a non-null reason refuses the turn. */
+    private val admission: (VoiceTurnRequest) -> String? = { null },
 ) {
     private val deliveryLock = Mutex()
     private val floorLock = Any()
@@ -166,6 +180,10 @@ class VoiceTurnOrchestrator(
                 listener.onInputRejected(request.turnId, request.origin, verdict)
                 return VoiceTurnOutcome.NoSpeech
             }
+        }
+        admission(request)?.let { reason ->
+            listener.onNotAdmitted(request.turnId, request.origin, reason)
+            return VoiceTurnOutcome.NotAdmitted(reason)
         }
         // A turn that already created a conversation and submitted its transcript (even before a
         // restart) is a replay: it must not submit again, and it does not move the playback route.

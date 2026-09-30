@@ -17,6 +17,7 @@ import com.rumi.hermesvoice.core.voice.RecipientEvent
 import com.rumi.hermesvoice.core.voice.VoiceTurnConfig
 import com.rumi.hermesvoice.core.voice.VoiceTurnListener
 import com.rumi.hermesvoice.core.voice.VoiceTurnOrchestrator
+import com.rumi.hermesvoice.core.wake.WakeAdmission
 import com.rumi.hermesvoice.core.watchlink.WatchAckRegistry
 import com.rumi.hermesvoice.core.watchlink.WatchTurnIntake
 import java.io.IOException
@@ -76,8 +77,11 @@ class HermesVoiceCore(
 ) {
     val sessions = AppSessionRepository(sessionsApi, conversations, registry)
     val chat = ChatService(sessions)
+    /** Arbitrates the wake phrase when both devices listen: one spoken wake episode, one admitted device. */
+    val wakeAdmission = WakeAdmission(System::currentTimeMillis, settings::watchSettings)
     val orchestrator = VoiceTurnOrchestrator(speech, sessions.guardedPort(), config = ::voiceConfig, listener = voiceListener,
-        recipientCreator = sessions.recipientCreator())
+        recipientCreator = sessions.recipientCreator(),
+        admission = { request -> wakeAdmission.admitTurn(request.wakeTurn, request.origin, request.originNodeId, request.wakeClaimId) })
     val watchAcks = WatchAckRegistry()
     val watchIntake = WatchTurnIntake(orchestrator, watchAcks)
 

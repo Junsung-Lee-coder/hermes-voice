@@ -42,6 +42,18 @@ object WakeContract {
 
     /** Pause between releasing the recognizer and opening the app's recorder. */
     const val MIC_HANDOFF_MS = 300L
+
+    /** How long a wake claim lasts without renewal (see [WakeAdmission]). */
+    const val CLAIM_TTL_MS = 10_000L
+
+    /** How often the holder renews its claim while it listens, hands off and records. */
+    const val CLAIM_RENEW_MS = 3_000L
+
+    /** How long a device waits for the Phone's answer to a claim before failing closed. */
+    const val CLAIM_TIMEOUT_MS = 2_500L
+
+    /** How long after a wake episode ends the other device's claim for it is still refused. */
+    const val CLAIM_SETTLE_MS = 3_000L
 }
 
 enum class WakeHandoff { SECOND_UTTERANCE, RECOGNIZED_REQUEST }
@@ -215,6 +227,9 @@ class WakeWindowCoordinator(
     var generation = 0L
         private set
 
+    /** A recognizer window is open. */
+    val listening: Boolean get() = session.active
+
     /** Starts a new visibility generation (resume, or screen off); an open window closes with [reason]. */
     fun newGeneration(reason: String) {
         close(reason)
@@ -300,4 +315,29 @@ class WakeHandoffGate {
         pendingGeneration = null
         return generation == currentGeneration && resumed && captureIdle
     }
+}
+
+/**
+ * Tells a platform recognizer's callbacks apart from those of one that was already released:
+ * each recognizer gets a token from [open]; a callback acts only while its token [isCurrent]. A
+ * late error or result from a destroyed recognizer can then never touch the next window's.
+ */
+class RecognizerGuard {
+    private var current = 0L
+    private var open = false
+
+    @Synchronized
+    fun open(): Long {
+        current += 1
+        open = true
+        return current
+    }
+
+    @Synchronized
+    fun close() {
+        open = false
+    }
+
+    @Synchronized
+    fun isCurrent(token: Long): Boolean = open && token == current
 }

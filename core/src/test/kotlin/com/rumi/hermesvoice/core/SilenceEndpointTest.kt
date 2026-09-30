@@ -97,14 +97,16 @@ class SilenceEndpointTest {
     }
 
     @Test
-    fun `a steady tone held for seconds is not speech - it becomes background and ends the request`() {
-        // Documented limit of an energy VAD with a stationary-noise floor: a sustained, unmodulated
-        // sound (a hum, a held note) is absorbed into the background after about a second, so it
-        // cannot hold a request open; real speech is modulated (see SharedVadTest).
-        val endpoint = SilenceEndpoint()
-        val (decision, index) = feed(endpoint, quiet(4) + speech(300) + quiet(40))
-        assertEquals(EndpointDecision.END_OF_SPEECH, decision)
-        assertTrue("ended ${index - 4} frames into the tone", index - 4 in 20..80)
+    fun `a steady sound at speech level is never taken for background - 30, 60 and 120 seconds end only after it stops`() {
+        // A sustained sound as loud as speech (a held note, a vacuum next to the microphone) cannot be
+        // told from a voice by loudness, so it is never absorbed into the floor: the request stays open
+        // until it stops (or the user taps), and is never cut while it lasts.
+        for (seconds in listOf(30, 60, 120)) {
+            val endpoint = SilenceEndpoint()
+            val (decision, index) = feed(endpoint, quiet(4) + speech(seconds * 10) + quiet(40))
+            assertEquals("$seconds s", EndpointDecision.END_OF_SPEECH, decision)
+            assertEquals("$seconds s", 4 + seconds * 10 + 19, index)
+        }
     }
 
     @Test

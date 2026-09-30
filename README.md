@@ -159,10 +159,11 @@ The flow is the same whether a turn starts on the Phone or the Watch:
    isn't sent, transcribed, routed or delivered, and it doesn't change where replies play. The Watch
    checks before uploading and the Phone checks again before accepting. The check runs the same
    voice-activity detector as the hands-free ending (see [Hands-free ending](#hands-free-ending-shared-vad)),
-   with a lower bar: it only refuses a recording in which nothing was at least twice as loud as its
-   own background for 140 ms. It is a loudness check, not speech recognition: it lets soft and
-   short speech through, so loud non-speech sound still reaches speech-to-text, which can mistake
-   it for words. Otherwise the Phone calls `POST /api/audio/transcribe`. If that finds no speech,
+   with a lower bar: it only refuses a recording in which nothing rose at least half again above
+   its own background for 140 ms, i.e. silence or steady noise. Speech in loud steady noise
+   (tested down to 3 dB above it) passes. It is a loudness check, not speech recognition: it lets
+   soft and short speech through, so changing non-speech sound still reaches speech-to-text, which
+   can mistake it for words. Otherwise the Phone calls `POST /api/audio/transcribe`. If that finds no speech,
    the turn ends without routing or delivering anything. A wake-phrase request the recognizer
    already heard in full arrives as text instead and skips this step; it is treated exactly like a
    transcript.
@@ -291,13 +292,46 @@ signed in, Watch not reachable).
 
 It works only while that device's app is open on screen (foreground), never in the background,
 and needs no permission beyond the microphone. Each time the app is shown, or the screen turns
-back on with the app shown, the platform `SpeechRecognizer` listens for 5 seconds (on-device
-recognition when available). It never runs while recording, sending, waiting for a reply, playing
+back on with the app shown, the platform `SpeechRecognizer` listens for 5 seconds. On-device
+recognition is used when available; if it reports that it lacks the wake phrases' language, the
+app falls back once to the system's default recognition service, which may send audio over the
+network. It never runs while recording, sending, waiting for a reply, playing
 audio, or for 4 seconds after playback. A device the setting excludes doesn't listen or respond;
 turning it off, leaving the app or the screen going off closes the recognizer and stops a
 hands-free recording without sending it. The recognizer and the app's recorder never use the
-microphone at the same time. The Watch never holds credentials: its requests always go through the
-Phone.
+microphone at the same time: tapping Talk while the recognizer is listening releases it first and
+starts recording after the same short pause. Leaving the screen, which includes rotating the
+Phone, cancels a hands-free recording with "Cancelled"; nothing is sent. The Watch never holds
+credentials: its requests always go through the Phone.
+
+**Both** means both devices may hear the wake phrase, but one spoken wake phrase is answered by
+one device:
+
+- When a device's recognizer hears the wake phrase at the start of what you say, in a partial or
+  final result, it asks the Phone for the claim on that wake phrase before it records or sends
+  anything. The Phone is the only referee. The Watch asks over the paired link and the Phone
+  identifies it by the link, not by anything the Watch says.
+- The first to ask wins and keeps the claim while it listens, hands over to its recorder and
+  records, renewing it every few seconds for as long as that takes (this is not a time limit on
+  the recording). The other device is refused: it stops listening, shows that the other device
+  answered, and sends nothing.
+- The Phone accepts a wake-phrase request in Both only with the claim it gave that device, once.
+  A request without it, with another device's, with one that ran out, or made before the Phone
+  app restarted is refused before it is accepted: nothing is transcribed or delivered and where
+  replies play doesn't change.
+- If the answer doesn't arrive within 2.5 seconds, the claim was made under settings the Phone has
+  since changed, or a renewal is refused, the device stops without sending and asks you to say it
+  again. A claim that is no longer renewed (the app closed, the link dropped) runs out after 10
+  seconds. Late messages about an old claim can't affect a newer one.
+- For 3 seconds after a request is accepted, the other device still can't claim, because its
+  recognizer may only just be finishing the same spoken phrase. The same device can start its
+  next request at once. Requests are never compared or merged by their words: saying the same
+  thing twice on purpose is two requests.
+- Push-to-talk and typed messages are never arbitrated, and with Watch or Phone alone there is
+  nothing to arbitrate.
+- Where a recognizer gives no partial results, the claim is made at its final result, so both
+  devices may listen to the whole phrase before one is refused; still only one request is
+  accepted.
 
 The wake phrase must come first: at the start of what you say, or right after one short greeting
 ("hey", "hi", "hello", "ok", "okay", "안녕", "저기"). A mention in the middle of a sentence is
@@ -334,17 +368,32 @@ Both devices end a hands-free request with the same voice-activity detector (VAD
   phrases (0.5 s ends in a 0.7 s pause); long values wait through them.
 - **How it listens:** in 20 ms frames, it compares loudness with the room's background, which it
   measures for 0.4 s before the "speak now" buzz. Speech is three times the background or louder
-  for at least 140 ms, with gaps between syllables of up to 200 ms tolerated; a click or knock of
-  100 ms or less never counts. A fading syllable stays "speech" for at most 200 ms. The background
-  estimate follows the room only during real pauses, never during speech; if the room gets louder
-  and stays steady (a fan starting), the detector adopts the new level within a second or two, so
-  it can't keep a request open. The timing is the same on the Phone and the Watch and doesn't
-  depend on how the microphone delivers audio.
-- **What it can't do:** it measures loudness, not speech. Loud changing sound (music, TV, other
-  people talking) keeps a request open until you tap Send. Speech that stays very soft, close to
-  the background, may count as silence and end the request early. A steady sound held for more
-  than about a second (a hum, a sung note) is treated as background. A burst of noise longer than
-  140 ms, like a cough, can start a request, which speech-to-text may then find empty.
+  for at least 140 ms, with gaps between syllables of up to 200 ms tolerated and at least 45% of
+  that stretch voiced. A fading syllable stays "speech" for at most 200 ms. The timing is the same
+  on the Phone and the Watch and doesn't depend on how the microphone delivers audio.
+- **The background estimate** comes from the last second of sound:
+  - It drops quickly to the quietest moments of that second. So if it started too high, because
+    you spoke before the buzz or a steady sound was taken for background, it recovers at the next
+    natural dips of your speech.
+  - It rises only when the whole last second is steady (no louder moment more than twice the
+    quietest), and only if that steady sound is not voiced, or is barely above the speech
+    threshold, or is clearly quieter than your speech so far (under about 45% of its typical
+    level). Speech changes loudness all the time, so it never raises the estimate. A fan that
+    starts after you stop is adopted within a second or two and the request ends; in tests,
+    background that rose to 2.5–10 times its level ended the request 2.7–3.6 s after the speech.
+  - A steady sound about as loud as your speech is never taken for background: a drawn-out "uhh",
+    a held note, or a vacuum cleaner while you talk does not end your request, however long it
+    lasts.
+- **What it can't do:** it measures loudness, not speech.
+  - Loud changing sound (music, TV, other people talking) keeps a request open until you tap Send.
+  - So does steady noise that is about as loud as your speech (in tests, from about 40% of its
+    level): it can't be told from a voice, so the request stays open rather than being cut.
+  - Speech that stays very soft, under about three times the background, may count as silence
+    and end the request early, or never start it.
+  - A single click or knock of 100 ms or less doesn't count, and neither does sparse clicking
+    such as slow typing. Dense tapping or knocking (voiced nearly half the time) can count, and a
+    burst of noise longer than 140 ms, like a cough, can start a request, which speech-to-text
+    may then find empty.
 
 ## Text chat and history
 
@@ -371,6 +420,9 @@ extra naming a `<name>.wav` file in the app's private `files/qa/` directory, and
 through the normal voice path in place of a recording. Both apps accept
 `hv_qa_wake_handoff=second_utterance` (runs the wake handoff as a match would, to test the
 recorder on the real microphone, not recognition; a device the wake setting excludes ignores it).
+Both also accept `hv_qa_recognizer=fixture` with `hv_qa_wake_heard=<text>` (and
+`hv_qa_wake_final=false` for a partial): a simulated recognizer result for the window that launch
+opens. It tests the wake flow and the Both arbitration, never recognition.
 The Phone accepts `hv_qa_wake_location=<OFF|WATCH|PHONE|BOTH>` and `hv_qa_vad_silence=<seconds>`
 (saved and sent to the Watch exactly as from Settings; invalid values are refused). The Watch
 accepts `hv_qa_seed_reader=<n>` (shows synthetic reader rows, to test the reader UI without a
@@ -381,16 +433,23 @@ builds ignore them.
 
 Only the following has been run:
 
-- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **228 JUnit tests**, all
+- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **255 JUnit tests**, all
   passing. They use an in-process fake dashboard and cover sign-in, session ownership, chat and
   attachments, routing, playback routing, the Watch link and reader contracts, the wake contract
   (final-only, leading wake phrase, contradicted or empty finals, 30/60/120-second recognizer
   streams), the shared VAD (every trailing-silence choice ends exactly that long after the last
   speech; identical timing at 8/16/32/48 kHz and 20–160 ms reads; all-zero, peak-2, clicks at any
   alignment and four background levels give no speech; 30, 60 and 120 seconds of modulated speech
-  are never cut and never raise the background estimate; background rises of 2.5× and 2.9× after
-  speech still end a request; short words and soft speech count; whenever the ending finds speech
-  the recording check accepts the same audio), the voice settings (0.5–10 s validation, the
+  are never cut and never raise the background estimate; background rises of 2.5× to 10× after
+  speech still end a request; a held sound or a steady noise burst in the middle of a request, a
+  shallow-modulated voice, and speaking before the buzz (40 seeds at four levels) never end it
+  early; isolated and sparse clicks don't count; short words and soft speech do; push-to-talk
+  speech 3, 5 and 7 dB above steady noise is accepted for 30 seeds at 4, 20 and 60 s while silence
+  and steady noise alone are refused; whenever the ending finds speech the recording check
+  accepts the same audio), wake arbitration in Both (the claim lease, its renewal, expiry and
+  stale messages; two simulated recognizers hearing the same phrase in either order, by partial or
+  final result, phrase-only and in one breath; unanswered, refused and lost claims; push-to-talk
+  and deliberate repeats; the Watch link), the voice settings (0.5–10 s validation, the
   wake-location modes, durable migration from the old Watch switch, strict Watch-side validation,
   stale snapshots), the per-device wake flow both apps delegate to (which device listens for each
   mode, turning a device off mid-window or mid-recording, the silence snapshot, same-breath

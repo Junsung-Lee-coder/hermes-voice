@@ -108,6 +108,9 @@ class PhoneApp : Application() {
         override fun onInputRejected(turnId: String, origin: VoiceOrigin, verdict: AudioInputVerdict) =
             log("input rejected turn=${turnId.take(12)} origin=$origin verdict=$verdict (not transcribed, target unchanged)")
 
+        override fun onNotAdmitted(turnId: String, origin: VoiceOrigin, reason: String) =
+            log("not admitted turn=${turnId.take(12)} origin=$origin reason=$reason (nothing sent, target unchanged)")
+
         override fun onAccepted(turnId: String, origin: VoiceOrigin) =
             log("accepted turn=${turnId.take(12)} origin=$origin playback_target=$origin")
 
