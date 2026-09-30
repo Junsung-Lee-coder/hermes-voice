@@ -10,6 +10,7 @@ import com.rumi.hermesvoice.core.sessions.OwnedSessionRegistry
 import com.rumi.hermesvoice.core.VoiceOrigin
 import com.rumi.hermesvoice.core.settings.AppSettings
 import com.rumi.hermesvoice.core.voice.PlaybackCue
+import com.rumi.hermesvoice.core.voice.PlaybackRoute
 import com.rumi.hermesvoice.core.voice.VoiceTurnListener
 import com.rumi.hermesvoice.core.voice.VoiceTurnStage
 import java.security.MessageDigest
@@ -18,9 +19,14 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.stateIn
 import okhttp3.OkHttpClient
 
 /**
@@ -60,26 +66,31 @@ class PhoneApp : Application() {
         wiring?.connector?.close()
         // Owned session ids are only meaningful on the dashboard/profile that minted them.
         val registry = OwnedSessionRegistry(SharedPreferencesKeyValueStore(prefs(REGISTRY_PREFS_PREFIX + digest(key))))
-        // A new core has a new (empty) playback route.
-        _playbackDevice.value = null
         val (core, connector) = HermesVoiceCore.connect(endpoint, http, tokens, registry, settings, voiceTrace)
         val dashboard = core.speech as HermesDashboardClient
+        // A new core has a new (empty) playback route.
+        currentRoute.value = core.orchestrator.playbackRoute
         return Wiring(key, endpoint, core, dashboard, connector).also { wiring = it }
     }
 
     private fun prefs(name: String) = getSharedPreferences(name, Context.MODE_PRIVATE)
 
-    private val _playbackDevice = MutableStateFlow<VoiceOrigin?>(null)
+    private val currentRoute = MutableStateFlow<PlaybackRoute?>(null)
 
-    /** Where spoken acks and replies play now: the device of the latest accepted voice request (null before any). */
-    val playbackDevice: StateFlow<VoiceOrigin?> = _playbackDevice
+    /**
+     * Where spoken acks and replies play now: the device of the latest accepted voice request (null
+     * before any). Read from the route itself, which updates it under the same lock that picks the
+     * playing device, so the label cannot disagree with where audio goes.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val playbackDevice: StateFlow<VoiceOrigin?> = currentRoute
+        .flatMapLatest { route -> route?.device ?: flowOf(null) }
+        .stateIn(appScope, SharingStarted.Eagerly, null)
 
     /** Turn ids, stages and where each utterance was confirmed played; no transcript or audio. */
     private val voiceTrace = object : VoiceTurnListener {
-        override fun onAccepted(turnId: String, origin: VoiceOrigin) {
-            _playbackDevice.value = origin
+        override fun onAccepted(turnId: String, origin: VoiceOrigin) =
             log("accepted turn=${turnId.take(12)} origin=$origin playback_target=$origin")
-        }
 
         override fun onStage(turnId: String, stage: VoiceTurnStage) = log("stage turn=${turnId.take(12)} $stage")
 

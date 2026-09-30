@@ -76,6 +76,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import java.io.File
 import com.rumi.hermesvoice.core.VoiceOrigin
 import com.rumi.hermesvoice.core.audio.QaAudio
+import com.rumi.hermesvoice.core.audio.QaLaunchGuard
 import com.rumi.hermesvoice.core.sessions.AppConversation
 import com.rumi.hermesvoice.core.settings.ThemeMode
 import com.rumi.hermesvoice.core.settings.WatchSettings
@@ -98,22 +99,34 @@ class MainActivity : ComponentActivity() {
             }
         }
         if (model.state.value.signedIn) model.refresh()
-        handleQaAudio(intent)
+        handleQaAudio(intent, restored = savedInstanceState != null)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        handleQaAudio(intent)
+        handleQaAudio(intent, restored = false)
     }
 
-    /** Debuggable builds only: `am start ... --es hv_qa_wav <name>.wav` submits files/qa/<name>.wav as a Phone voice request. */
-    private fun handleQaAudio(intent: Intent?) {
+    /**
+     * Debuggable builds only: `am start ... --es hv_qa_wav <name>.wav` submits files/qa/<name>.wav
+     * as a Phone voice request, once per fresh launch intent (see [QaLaunchGuard]).
+     */
+    private fun handleQaAudio(intent: Intent?, restored: Boolean) {
         val name = intent?.getStringExtra(QaAudio.EXTRA) ?: return
+        val fromHistory = intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0
+        val handled = intent.getBooleanExtra(QA_HANDLED, false)
         intent.removeExtra(QaAudio.EXTRA)
+        intent.putExtra(QA_HANDLED, true)
+        setIntent(intent)
+        if (!QaLaunchGuard.shouldHandle(restored, fromHistory, handled)) return
         if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0) return
         val file = QaAudio.resolve(File(filesDir, QaAudio.DIR), name) ?: return
         android.util.Log.i("HermesVoice", "qa audio submitted as a phone voice request bytes=${file.length()}")
         model.submitQaWav(file.readBytes())
+    }
+
+    private companion object {
+        const val QA_HANDLED = "hv_qa_handled"
     }
 
     private fun isSystemNight(): Boolean =
@@ -401,7 +414,10 @@ private fun SettingsTab(state: PhoneUiState, model: PhoneViewModel) {
         }
         OutlinedTextField(patterns, { patterns = it }, label = { Text("Wake phrases (space-separated, * wildcard)") },
             modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(seconds, { seconds = it.filter(Char::isDigit).take(3) }, label = { Text("Max recording seconds") },
+        Text("Wake-phrase requests end when you stop talking (no time limit). Say the phrase and pause for the buzz, " +
+            "or say your request right after it.",
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        OutlinedTextField(seconds, { seconds = it.filter(Char::isDigit).take(3) }, label = { Text("Push-to-talk max seconds") },
             singleLine = true, modifier = Modifier.fillMaxWidth())
         SwitchRow("Haptics", state.watch.hapticsEnabled) { model.updateWatch(state.watch.copy(hapticsEnabled = it)) }
         OutlinedButton(onClick = {

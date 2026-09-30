@@ -3,5 +3,8 @@
     <!-- The Watch is always dark: black window behind the Compose UI. -->
     <style name="Theme.HermesVoiceWatch" parent="@android:style/Theme.DeviceDefault">
         <item name="android:windowBackground">@android:color/black</item>
+        <!-- Horizontal swipes are the app's own: left switches reader surfaces, right backgrounds the
+             task (moveTaskToBack). The system swipe-to-dismiss would finish the activity instead. -->
+        <item name="android:windowSwipeToDismiss">false</item>
     </style>
 </resources>

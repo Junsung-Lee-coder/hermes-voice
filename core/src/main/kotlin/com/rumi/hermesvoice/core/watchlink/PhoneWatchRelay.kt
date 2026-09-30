@@ -107,12 +107,19 @@ class WatchTurnIntake(
     private val orchestrator: VoiceTurnOrchestrator,
     private val acks: WatchAckRegistry,
 ) {
-    suspend fun onTurnChannel(path: String, bytes: ByteArray, transport: WatchTransport): VoiceTurnOutcome? {
+    /**
+     * [bytes] is the channel content, or null when it could not be read or exceeded the frame
+     * bound. Anything that is not a valid upload is rejected to the Watch before the orchestrator
+     * sees it, so it is never accepted as a voice request and never moves the playback route.
+     */
+    suspend fun onTurnChannel(path: String, bytes: ByteArray?, transport: WatchTransport): VoiceTurnOutcome? {
         val upload = try {
+            if (bytes == null) throw LinkProtocolException("recording transfer failed or too large")
             WatchTurnUpload.fromFrame(path, LinkFrame.decode(bytes))
         } catch (error: LinkProtocolException) {
             WatchLinkPaths.turnIdFromPath(path)?.let { turnId ->
-                runCatching { transport.sendMessage(WatchLinkPaths.STATE, TurnStateMessage(turnId, "rejected", "Bad recording", true).encode()) }
+                val detail = if (bytes == null) "Recording transfer failed" else "Bad recording"
+                runCatching { transport.sendMessage(WatchLinkPaths.STATE, TurnStateMessage(turnId, "rejected", detail, true).encode()) }
             }
             return null
         }
@@ -131,7 +138,7 @@ class WatchTurnIntake(
             }
             val outcome = try {
                 orchestrator.run(VoiceTurnRequest(upload.turnId, VoiceOrigin.WATCH, upload.audio, upload.mimeType,
-                    WatchPlaybackSink(transport, acks), listener))
+                    WatchPlaybackSink(transport, acks), listener, recognizedText = upload.recognizedText))
             } finally {
                 states.close()
             }

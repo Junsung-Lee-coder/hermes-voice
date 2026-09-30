@@ -54,6 +54,11 @@ class VoiceTurnRequest(
     val sink: PlaybackSink,
     /** Per-turn observer (e.g. the Watch talk-state projection), called after the orchestrator-wide one. */
     val listener: VoiceTurnListener? = null,
+    /**
+     * A request the Watch's speech recognizer already heard with the wake phrase. It replaces
+     * transcription and is treated exactly like a transcript (untrusted data for the router).
+     */
+    val recognizedText: String? = null,
 )
 
 enum class VoiceTurnStage { TRANSCRIBING, ROUTING, ACKNOWLEDGING, DELIVERING, RESPONDING }
@@ -151,7 +156,7 @@ class VoiceTurnOrchestrator(
                 return VoiceTurnOutcome.NotDelivered(VoiceTurnStage.TRANSCRIBING, "config_invalid: ${error.message}")
             }
             notifyStage(request, stage)
-            val transcript = speech.transcribe(request.audio, request.mimeType).trim()
+            val transcript = (request.recognizedText ?: speech.transcribe(request.audio, request.mimeType)).trim()
             if (transcript.isEmpty()) return VoiceTurnOutcome.NoSpeech
 
             stage = VoiceTurnStage.ROUTING

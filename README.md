@@ -5,15 +5,15 @@ to an existing [Hermes](#hermes-dashboard-apis-used) dashboard by voice or text.
 
 - The **Phone** signs in to a Hermes dashboard and calls its authenticated APIs directly. It
   manages its own conversations, text chat with attachments, and push-to-talk voice turns.
-- The **Watch** never talks to Hermes and holds no credentials. It records audio and plays
-  replies, and talks only to the paired Phone over the Wear OS Data Layer.
+- The **Watch** never talks to Hermes and holds no credentials. It records audio, plays replies,
+  and reads the app's conversations, talking only to the paired Phone over the Wear OS Data Layer.
 - A voice turn is transcribed on the dashboard and then sent to a hidden **routing session**,
   which picks one of your conversations by alias. The transcript is delivered there only after a
   short spoken acknowledgement has played.
 
 > **Status: pre-release, debug builds only.** There is no release signing, R8/minification is
-> off, and the version is `0.1.0-dev`. Voice has been exercised end to end once, on a Phone
-> emulator with generated speech. The Watch has never run paired with a Phone. See
+> off, and the version is `0.1.0-dev`. Voice has run end to end on a Phone emulator, including
+> speech fed to the emulator microphone. The Watch has run only on an unpaired emulator. See
 > [Validation](#validation) and [Known limitations](#known-limitations) before relying on it.
 
 ## Repository layout
@@ -24,8 +24,8 @@ core/     Pure Kotlin/JVM library: dashboard sign-in, dashboard + gateway client
           and the Phone↔Watch link contract. Holds all unit tests.
 phone/    Android app (Jetpack Compose): sign-in, conversation list, history, text chat with
           attachments, push-to-talk, Phone and Watch settings, Data Layer bridge to the Watch.
-watch/    Wear OS app (Compose for Wear OS): push-to-talk, optional wake phrase with silence
-          endpointing, playback on the Watch.
+watch/    Wear OS app (Compose for Wear OS): conversation reader (session browser and history),
+          push-to-talk, optional wake phrase with silence endpointing, playback on the Watch.
 scripts/  core-jvm-check.sh: compiles :core and runs its JUnit tests without Gradle or the
           Android SDK.
 ```
@@ -140,17 +140,20 @@ each, which keeps base64 frames under the 16 MiB WebSocket frame limit of older 
 - **The registry is local.** After a reinstall or on a second phone, earlier sessions aren't listed,
   even though they still carry the app's source on the server.
 - **The Watch holds no credentials.** It never calls Hermes and only exchanges `/hv/v1/*` messages
-  with the Phone.
+  with the Phone. Its conversation reader goes through the Phone with the same checks (see
+  [Watch conversation reader](#watch-conversation-reader)).
 
 ## Voice turns
 
 The flow is the same whether a turn starts on the Phone or the Watch:
 
 1. **Record a WAV.** On the Phone, the Talk button toggles recording. On the Watch, use
-   push-to-talk or an optional wake phrase with silence endpointing. The Watch sends the recording
+   push-to-talk or the optional [wake phrase](#watch-wake-phrase). The Watch sends the recording
    to the Phone over the Data Layer (`/hv/v1/turn/<id>`).
 2. **Transcribe.** The Phone calls `POST /api/audio/transcribe`. If no speech is detected, the turn
-   ends without routing or delivering anything.
+   ends without routing or delivering anything. A wake-phrase request the Watch's recognizer
+   already heard arrives as text instead and skips this step; it is treated exactly like a
+   transcript.
 3. **Route.** The transcript goes to a **persistent routing session**. It is created hidden
    (`source = "recorder-phone-router"`) on first use, then reused, and never appears in lists. The
    prompt restates the routing contract, lists the allowlisted aliases, and marks the transcript as
@@ -188,6 +191,58 @@ accepted voice request**. That covers the ack and the first, middle and final re
   arrives, that reply plays on the Phone.
 - The Phone's Talk bar shows the current target. The route is held only in memory on the Phone.
 
+## Watch conversation reader
+
+The Watch shows the app's conversations without ever calling Hermes itself:
+
+- **Swipe left** (right to left) switches between the session browser and the open conversation.
+  **Swipe right** (left to right) sends the app to the background; the task and what you were
+  reading stay alive. Vertical touch and the bezel/crown scroll whichever list is on screen. A
+  gesture a list already scrolled with never counts as a swipe.
+- The browser lists the app-owned, unarchived conversations. The conversation shows your own
+  messages right-aligned in blue and replies left-aligned in grey, newest at the bottom, with
+  "Load older" at the top.
+- New messages don't move the view while you're reading older ones. The view follows new
+  messages only if the newest one was already on screen.
+- Loading, "Phone not reachable", sign-in and timeout states are shown explicitly with a Retry.
+- **Wire:** `/hv/v1/reader/request` (Watch → Phone) and `/hv/v1/reader/response` (Phone → the
+  asking node only). Every request has an id; a response is applied only if it answers the
+  request still pending for that list or conversation and comes from the node it was sent to, so
+  late or duplicate answers are dropped.
+- **Ownership:** the Phone answers from the same registry and server `source` checks as its own
+  history. Router, archived, foreign or unknown ids fail closed. Reading never submits anything and
+  never changes where voice replies play or which conversation a voice turn goes to.
+- **Bounds:** at most 24 conversations, 20 messages per page and 60 KB per response (long texts are
+  shortened, marked "more on phone"). The Watch caches 4 conversations and 200 messages each.
+- **Haptics:** a 10 ms tick per bezel step that actually scrolled (nothing at the ends), a 50 ms
+  pulse when the microphone really starts delivering audio, and a 2 × 30 ms pulse when recording
+  ends for any reason. The Phone's Watch **Haptics** setting turns them all off.
+
+## Watch wake phrase
+
+Off by default and edited only on the Phone (Settings → Watch). The Phone sends all Watch settings
+as one snapshot with an increasing revision; the Watch ignores older or equal-revision snapshots.
+Patterns are space-separated whole words; `*` matches any letters inside one word, and nothing
+else is special. A blank field restores the defaults.
+
+It works only while the Watch app is visible (foreground). Each time the app is shown, or the
+screen turns back on with the app shown, the platform `SpeechRecognizer` listens for 5 seconds
+(on-device recognition when available). It never runs while recording, sending, waiting on the
+Phone, playing audio, or for 4 seconds after playback. The recognizer and the app's recorder never
+use the microphone at the same time.
+
+What happens after a match depends on how you say it:
+
+- **Wake phrase, then pause:** the recognizer is released, the Watch's own recorder starts and
+  measures the room, and a buzz means "speak now". The request ends after about 2 seconds of
+  silence. There is no time limit while you keep talking. If you don't start within 8 seconds,
+  nothing is sent.
+- **Wake phrase and request in one breath:** the recognizer has already heard the request, so its
+  text is sent as the request (it isn't dropped or re-asked).
+
+The recognized text is never logged; only counts and outcomes are. Push-to-talk keeps its own
+limit (Settings → Watch → Push-to-talk max seconds).
+
 ## Text chat and history
 
 History shows user and assistant messages (hidden and tool rows are dropped), newest page first,
@@ -201,46 +256,51 @@ turn completes. Replies to text chat aren't spoken.
   responses** (off by default). There's deliberately no setting for the ack or the final reply.
   Settings also shows whether the Watch app is reachable.
 - **Watch settings** (edited on the Phone, synced as the `/hv/v1/settings` data item): wake phrase
-  on/off (off by default), the wake phrases, maximum recording length (5–300 seconds) and haptics.
+  on/off (off by default), the wake phrases, push-to-talk maximum length (5–300 seconds) and
+  haptics.
 - **Dark by default.** On the Phone, sign-in, lists, chat, Settings and dialogs follow the
   Appearance setting. The Watch is always dark and shows whether the Phone is reachable.
 - **Full-width Talk bar.** The Phone's Talk button is a full-width bar above the navigation bar,
   inset for the safe area. It never covers the chat composer, which moves above the keyboard.
 
-**Emulator QA input (debuggable builds only).** Emulator microphones on a headless host capture
-only silence. So a debuggable build accepts an `hv_qa_wav` string extra naming a `<name>.wav` file
-in the app's private `files/qa/` directory, and submits that file through the normal voice path in
-place of a recording. Non-debuggable builds ignore the extra.
+**Emulator QA input (debuggable builds only).** A debuggable build accepts an `hv_qa_wav` string
+extra naming a `<name>.wav` file in the app's private `files/qa/` directory, and submits that file
+through the normal voice path in place of a recording. The Watch also accepts
+`hv_qa_wake_handoff=second_utterance` (runs the wake handoff as a match would, to test the
+recorder, not recognition) and `hv_qa_seed_reader=<n>` (shows synthetic reader rows, to test the
+reader UI without a paired Phone). Each extra is honoured once, for a fresh launch intent only, and
+non-debuggable builds ignore them.
 
 ## Validation
 
 Only the following has been run:
 
-- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **97 JUnit tests**, all
+- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **148 JUnit tests**, all
   passing. They use an in-process fake dashboard and cover sign-in, session ownership, chat and
-  attachments, routing, playback routing and the Watch link contract.
+  attachments, routing, playback routing, the Watch link and reader contracts, the wake contract,
+  silence endpointing (30, 60 and 120 seconds of continuous speech are not cut), haptic timing,
+  gesture arbitration, and source checks of the Android wiring.
 - **Paired debug build:** `gradle :phone:assembleDebug :watch:assembleDebug` succeeded with
-  Gradle 8.13 and JDK 17. Both APKs were checked with `aapt2` and `apksigner`: they have the same
-  package, are v2-signed by the same debug certificate, and declare the expected `/hv/v1/*`
-  listener paths.
-- **One Phone emulator voice turn.** On an Android 15 (API 35) Phone emulator, a generated speech
-  WAV went in through the debug QA input. The dashboard backend used remote-whisper speech-to-text,
-  `glm-5.3-flash` for the routing and destination sessions, and edge text-to-speech. The turn
-  completed: routing JSON → ack played on the Phone → transcript delivered → final reply played.
-- **Real microphone, silence only.** The emulator microphone captured audio, but the headless host
-  fed it silence. The app correctly reported "No speech detected" and routed nothing.
-- **Watch, unpaired only.** The Watch app installed and ran on a Wear OS emulator with no paired
-  Phone. It recorded from the microphone and correctly reported the Phone as unreachable.
+  Gradle 8.13 and JDK 17. Both APKs have the same package and are v2-signed by the same debug
+  certificate.
+- **Phone emulator (Android 15), real microphone input.** Speech played into the emulator
+  microphone went through transcription, routing, the ack played on the Phone, delivery, and the
+  final reply played on the Phone. The Phone was signed in to a local test dashboard.
+- **Watch emulator (Wear OS 5), not paired.** Push-to-talk captured real (non-silent) audio from the
+  emulator microphone, with one start and one end haptic. The wake-phrase recorder path (cue after
+  calibration, end on silence, bounded no-speech timeout) ran through the debug handoff. Swipes,
+  bezel scrolling with scroll haptics, follow-latest and scroll preservation ran with synthetic
+  reader rows. Leaving the app while recording cancelled it without sending.
 
-**Never run on devices:** Watch↔Phone Data Layer transfer, playback on the Watch, the Watch
-`played` ACK, and switching playback between devices. These are covered only by core unit tests.
-Nothing has been tested on physical devices, including audio routing and haptics.
+**Never run:** Watch↔Phone Data Layer transfer (including the reader), playback on the Watch, the
+Watch `played` ACK, switching playback between devices, and wake-phrase recognition (the Watch
+emulator has no speech recognition service). These are covered only by core unit tests. Nothing has
+been tested on physical devices, including audio routing, haptic strength and a physical bezel.
 
 ## Known limitations
 
-- **Not release-ready.** Debug builds only: no release signing configuration and no R8. Voice has
-  one emulator run on generated audio, and the Watch has never been paired (see
-  [Validation](#validation)).
+- **Not release-ready.** Debug builds only: no release signing configuration and no R8. The Watch
+  has never been paired with a Phone (see [Validation](#validation)).
 - **Playback route is in memory.** After the Phone process restarts, nothing plays until the next
   accepted voice request. If the route points to a Watch that has become unreachable, that
   utterance fails and the Phone doesn't play it instead. If the failed utterance is an ack, the turn
@@ -252,21 +312,11 @@ Nothing has been tested on physical devices, including audio routing and haptics
   already queued, the message is still delivered, but its reply isn't spoken or shown inline.
 - **Server-to-client requests aren't answered.** A turn that needs a tool approval or a
   clarification ends at the 15-minute timeout.
-- **Wake phrase is foreground-only.** It uses the platform `SpeechRecognizer` while the Watch app is
-  open. There's no always-on hotword.
+- **Wake phrase is foreground-only** and depends on the Watch's speech recognition service. Where
+  none is installed, the Watch says the wake phrase is unavailable. There's no always-on hotword.
+- **Watch reader history is a window.** The Watch keeps at most 200 messages per conversation;
+  older ones are shown on the Phone.
 - **Unverified:** whether the agent reads an attached `@file:` reference during a turn.
-
-Additional known issues:
-
-- **Sender label race.** If the Phone and the Watch submit voice requests at almost the same time,
-  the Talk bar's playback-target label can briefly disagree with the device that actually plays.
-- **Listener service context lifetime.** The Phone's Data Layer listener service passes its own
-  context to a transport that app-scoped coroutines keep using, so that transport can outlive the
-  service.
-- **Debug QA intent replay.** In debuggable builds, the `hv_qa_wav` extra may be processed again if
-  the activity is re-created from its original launch intent.
-- **Missing malformed-upload regression test.** The core suite rejects a malformed Watch frame, but
-  no test covers malformed or oversized uploads arriving through the Android Data Layer service.
 
 ## License
 

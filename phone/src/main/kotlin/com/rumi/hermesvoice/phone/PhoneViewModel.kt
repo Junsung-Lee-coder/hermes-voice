@@ -287,15 +287,13 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Saves all Watch settings as one Phone-owned snapshot (new revision) and publishes it. */
     fun updateWatch(settings: WatchSettings) {
-        app.settings.watchWakePhraseEnabled = settings.wakePhraseEnabled
-        app.settings.watchWakePatterns = settings.wakePatterns
-        app.settings.watchMaxTurnSeconds = settings.maxTurnSeconds
-        app.settings.watchHapticsEnabled = settings.hapticsEnabled
-        val saved = app.settings.watchSettings()
+        val saved = app.settings.saveWatchSettings(settings)
         _state.update { it.copy(watch = saved) }
         viewModelScope.launch {
             val result = runCatching { WatchSettingsSync.publish(getApplication(), saved) }
+            Log.i(TAG, "watch settings published revision=${saved.revision} wake=${saved.wakePhraseEnabled} ok=${result.isSuccess}")
             _state.update { it.copy(status = if (result.isSuccess) "Watch settings sent" else "Watch not reachable; will apply when it syncs") }
         }
     }

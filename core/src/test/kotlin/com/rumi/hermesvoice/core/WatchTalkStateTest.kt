@@ -75,4 +75,12 @@ class WatchTalkStateTest {
         } catch (_: IllegalStateException) {
         }
     }
+
+    @Test
+    fun `a recording cue changes only the prompt of the capture in progress`() {
+        val recording = WatchTalkState().startRecording("turn-cue-01", TurnTrigger.WAKE_PHRASE)
+        assertEquals("Speak now…", recording.recordingCue("Speak now…").line)
+        assertEquals(WatchPhase.RECORDING, recording.recordingCue("Speak now…").phase)
+        assertEquals(WatchTalkState(), WatchTalkState().recordingCue("Speak now…"))
+    }
 }
