@@ -22,6 +22,10 @@ import com.rumi.hermesvoice.core.settings.WakePhrasePatterns
  *    time limit. If the recognizer errors or goes quiet before a final result, a phrase-only
  *    partial still cues a second utterance (nothing was said yet), but an unfinished request is
  *    never sent: the window closes with "unfinished_request" and the Watch asks the user to repeat.
+ *    The same happens when a leading wake phrase was heard in a partial but the final result
+ *    disagrees or is empty; only speech that never led with the wake phrase closes silently.
+ *    The system recognizer applies its own pause detection (and may cap a session), so a long
+ *    request is best said after the buzz, into the app's own recorder, which has no limit.
  * 4. Recognized text never leaves the Watch except as the request of rule 3 and is never logged.
  */
 object WakeContract {
@@ -81,7 +85,9 @@ class WakeSession(
         val request = hypotheses.asSequence().mapNotNull { WakePhrasePatterns.leadingRequest(patterns, it) }.firstOrNull()
         if (final) {
             return when {
-                request == null -> close(WakeOutcome.Closed("not_matched"))
+                // A leading wake phrase was heard but the final disagrees or is empty: the user's words
+                // were consumed, so say so ("unfinished_request" → retry notice); only ambient speech is silent.
+                request == null -> close(WakeOutcome.Closed(if (pending != null) "unfinished_request" else "not_matched"))
                 request.length > WakeContract.MAX_REQUEST_CHARS -> close(WakeOutcome.Closed("request_too_long"))
                 request.isBlank() -> close(WakeOutcome.Handoff(WakeHandoff.SECOND_UTTERANCE, ""))
                 else -> close(WakeOutcome.Handoff(WakeHandoff.RECOGNIZED_REQUEST, request))

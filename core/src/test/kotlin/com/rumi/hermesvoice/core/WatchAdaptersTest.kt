@@ -30,7 +30,7 @@ import org.junit.Test
 class WatchAdaptersTest {
     private class FakeCapturePort(var wav: ByteArray? = ByteArray(1_000)) : CapturePort {
         val calls = mutableListOf<String>()
-        override fun stopRecorder(captureId: String): ByteArray? { calls += "stop:$captureId"; return wav }
+        override fun stopRecorder(captureId: String, reason: CaptureStop): ByteArray? { calls += "stop:$captureId:$reason"; return wav }
         override fun haptic(event: HapticEvent) { calls += "haptic:$event" }
         override fun cue(line: String) { calls += "cue:$line" }
         override fun upload(captureId: String, trigger: TurnTrigger, wav: ByteArray) { calls += "upload:$captureId:$trigger" }
@@ -51,7 +51,7 @@ class WatchAdaptersTest {
         assertFalse("a late auto-end after the tap does nothing", capture.stop("c1", CaptureStop.SILENCE))
         assertFalse(capture.lifecycle())
         capture.onLive("c1")
-        assertEquals(listOf("haptic:RECORDING_START", "stop:c1", "haptic:RECORDING_END", "upload:c1:PUSH_TO_TALK"), port.calls)
+        assertEquals(listOf("haptic:RECORDING_START", "stop:c1:TAP_SEND", "haptic:RECORDING_END", "upload:c1:PUSH_TO_TALK"), port.calls)
         assertNull(capture.activeId)
     }
 
@@ -67,6 +67,10 @@ class WatchAdaptersTest {
         assertFalse(capture.stop("old", CaptureStop.MIC_ERROR))
         assertEquals(emptyList<String>(), port.calls)
         assertEquals("new", capture.activeId)
+        // The next recording's stop is reported with its own reason, not the stale callback's.
+        capture.onLive("new")
+        assertTrue(capture.tap())
+        assertEquals(listOf("haptic:RECORDING_START", "stop:new:TAP_SEND", "haptic:RECORDING_END", "upload:new:PUSH_TO_TALK"), port.calls)
     }
 
     @Test
@@ -87,14 +91,14 @@ class WatchAdaptersTest {
             assertEquals("wake cues only after calibration", emptyList<String>(), port.calls)
             capture.onCalibrated("c")
             assertTrue(capture.stop("c", reason))
-            assertEquals("$reason", listOf("cue:Speak now…", "haptic:RECORDING_START", "stop:c", "haptic:RECORDING_END", outcome), port.calls)
+            assertEquals("$reason", listOf("cue:Speak now…", "haptic:RECORDING_START", "stop:c:$reason", "haptic:RECORDING_END", outcome), port.calls)
         }
         val failed = FakeCapturePort()
         CaptureCoordinator(failed).apply { begin("f", TurnTrigger.PUSH_TO_TALK); stop("f", CaptureStop.START_FAILED) }
-        assertEquals(listOf("stop:f", "discard:Microphone unavailable"), failed.calls)
+        assertEquals(listOf("stop:f:START_FAILED", "discard:Microphone unavailable"), failed.calls)
         val empty = FakeCapturePort(wav = null)
         CaptureCoordinator(empty).apply { begin("e", TurnTrigger.PUSH_TO_TALK); onLive("e"); tap() }
-        assertEquals(listOf("haptic:RECORDING_START", "stop:e", "haptic:RECORDING_END", "discard:Too short"), empty.calls)
+        assertEquals(listOf("haptic:RECORDING_START", "stop:e:TAP_SEND", "haptic:RECORDING_END", "discard:Too short"), empty.calls)
     }
 
     @Test
@@ -176,6 +180,27 @@ class WatchAdaptersTest {
         assertEquals(listOf("window:true", "timer:${WakeContract.WINDOW_MS}", "start:3", "timer-cancel", "release", "window:false",
             "closed:start_failed"), fake.calls)
         assertEquals(WakeBlock.DISABLED, wake.requestArm(inputs.copy(enabled = false)))
+    }
+
+    @Test
+    fun `a contradicted final closes with the retry notice and starts no recorder`() {
+        var now = 0L
+        val fake = FakeWake()
+        val wake = WakeWindowCoordinator(fake, fake, fake) { now }
+        wake.newGeneration("resume")
+        wake.requestArm(inputs)
+        now = 400
+        wake.onResults(1, listOf("hermes turn on the"), final = false, patterns = "hermes")
+        now = 900
+        wake.onResults(1, listOf("her mess turn on the lights"), final = true, patterns = "hermes")
+        assertEquals(listOf("timer-cancel", "release", "window:false", "closed:unfinished_request"), fake.calls.takeLast(4))
+        assertFalse(fake.calls.any { it.startsWith("handoff") })
+        fake.calls.clear()
+        wake.newGeneration("resume")
+        wake.requestArm(inputs)
+        now = 1_500
+        wake.onResults(2, listOf("I told hermes about it"), final = true, patterns = "hermes")
+        assertEquals("ambient speech closes silently", "closed:not_matched", fake.calls.last())
     }
 
     @Test

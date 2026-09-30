@@ -130,14 +130,34 @@ class WakeContractTest {
     }
 
     @Test
-    fun `an ambient mention or a revised final is not a request`() {
+    fun `ambient speech with no leading wake phrase closes silently`() {
         val ambient = WakeSession().apply { open(8, 0) }
         assertEquals(WakeOutcome.None, ambient.onResults(8, listOf("I told hermes"), final = false, nowMs = 300, patterns = "hermes"))
         assertEquals(WakeOutcome.Closed("not_matched"),
             ambient.onResults(8, listOf("I told hermes about the budget"), final = true, nowMs = 900, patterns = "hermes"))
+        val empty = WakeSession().apply { open(16, 0) }
+        assertEquals(WakeOutcome.Closed("not_matched"), empty.onResults(16, emptyList(), final = true, nowMs = 900, patterns = defaults))
+    }
+
+    @Test
+    fun `a heard wake command whose final disagrees or is empty is never dropped silently or sent`() {
         val revised = WakeSession().apply { open(9, 0) }
         revised.onResults(9, listOf("루미야 불"), final = false, nowMs = 300, patterns = defaults)
-        assertEquals(WakeOutcome.Closed("not_matched"), revised.onResults(9, listOf("누구야 불 꺼"), final = true, nowMs = 900, patterns = defaults))
+        assertEquals(WakeOutcome.Closed("unfinished_request"), revised.onResults(9, listOf("누구야 불 꺼"), final = true, nowMs = 900, patterns = defaults))
+
+        val emptyFinal = WakeSession().apply { open(17, 0) }
+        emptyFinal.onResults(17, listOf("hermes turn on the"), final = false, nowMs = 300, patterns = "hermes")
+        assertEquals(WakeOutcome.Closed("unfinished_request"), emptyFinal.onResults(17, emptyList(), final = true, nowMs = 900, patterns = "hermes"))
+
+        val misheard = WakeSession().apply { open(18, 0) }
+        misheard.onResults(18, listOf("hermes turn on the"), final = false, nowMs = 300, patterns = "hermes")
+        assertEquals(WakeOutcome.Closed("unfinished_request"),
+            misheard.onResults(18, listOf("her mess turn on the lights"), final = true, nowMs = 900, patterns = "hermes"))
+
+        val phraseOnly = WakeSession().apply { open(19, 0) }
+        phraseOnly.onResults(19, listOf("루미야"), final = false, nowMs = 300, patterns = defaults)
+        assertEquals("no recorder is started from a contradicted phrase", WakeOutcome.Closed("unfinished_request"),
+            phraseOnly.onResults(19, listOf("누구야"), final = true, nowMs = 900, patterns = defaults))
     }
 
     @Test

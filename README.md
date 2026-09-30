@@ -217,10 +217,12 @@ The Watch shows the app's conversations without ever calling Hermes itself:
   never changes where voice replies play or which conversation a voice turn goes to.
 - **Bounds:** at most 24 conversations, 20 messages per page and 60 KB per response (long texts are
   shortened, marked "more on phone"). The Watch caches 4 conversations and 200 messages each.
-- **Haptics:** a 10 ms tick per bezel step that actually scrolled (nothing at the ends), a 50 ms pulse when the microphone really
+- **Haptics:** a 10 ms touch-feedback tick per bezel step that actually scrolled (nothing at the
+  ends), a 50 ms pulse when the microphone really
   starts delivering audio, and a 2 × 30 ms pulse once when recording ends for any reason (also when
-  a wake-phrase request heard by the recognizer is sent). The Phone's Watch **Haptics** setting
-  turns them all off.
+  a wake-phrase request heard by the recognizer is sent). Recording pulses are marked as hardware
+  feedback, so turning off touch vibration doesn't hide them; none of them overrides Do Not Disturb
+  or the watch's vibration settings. The Phone's Watch **Haptics** setting turns them all off.
 
 ## Watch wake phrase
 
@@ -241,13 +243,20 @@ ignored. What happens next depends on how you say it:
 
 - **Wake phrase, then pause:** the recognizer is released, the Watch's own recorder starts and
   measures the room, and a buzz means "speak now". The request ends after about 2 seconds of
-  silence; short pauses between words don't end it, and there is no time limit while you keep
-  talking. If you don't start within 8 seconds, nothing is sent.
+  silence (up to about 4 seconds if background noise got louder after you spoke); short pauses
+  between words don't end it, and there is no time limit while you keep talking. If you don't
+  start within 8 seconds, nothing is sent. This is the way to make a long request.
 - **Wake phrase and request in one breath:** only the recognizer's **final** result is used, and
-  it's sent whole as the request. While you keep talking, the window stays open (it closes 8
-  seconds after the recognizer last heard something new). If the recognizer stops or fails before
-  a final result, nothing is sent and the Watch shows "Didn't catch that. Tap or say it again".
-  A request longer than 4,000 characters is refused, not cut.
+  it's sent whole as the request. While partial results keep changing, the Watch keeps waiting
+  (up to 8 seconds after the last new partial). Nothing is sent, and the Watch shows "Didn't catch
+  that. Tap or say it again", when the recognizer stops or fails before a final result, or when
+  its final result is empty or no longer starts with the wake phrase it heard. A request longer
+  than 4,000 characters is refused, not cut.
+- **The system recognizer has its own limits.** It decides when you've finished (its own pause
+  detection) and may end a session on its own, so a pause in a one-breath request can end it
+  early, and what you say after that isn't captured. The Watch asks it to wait for 2 seconds of
+  silence, but that is only a hint many recognizers ignore. For a long request, say the wake
+  phrase, wait for the buzz, then speak.
 
 The recognized text is never logged; only counts and outcomes are.
 
@@ -282,11 +291,12 @@ non-debuggable builds ignore them.
 
 Only the following has been run:
 
-- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **165 JUnit tests**, all
+- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **170 JUnit tests**, all
   passing. They use an in-process fake dashboard and cover sign-in, session ownership, chat and
   attachments, routing, playback routing, the Watch link and reader contracts, the wake contract
-  (final-only, leading wake phrase, 30/60/120-second recognizer streams), silence endpointing
-  (30, 60 and 120 seconds of continuous and of speech-like audio with short pauses are not cut),
+  (final-only, leading wake phrase, contradicted or empty finals, 30/60/120-second recognizer
+  streams), silence endpointing (30, 60 and 120 seconds of continuous and of speech-like audio with
+  short pauses are not cut; background noise rising after speech still ends a request),
   haptic timing, gesture arbitration, the Watch capture, wake-window, microphone-handoff and bezel
   scrolling logic the Android adapters delegate to, and source checks of the Android wiring.
 - **Paired debug build:** `gradle :phone:assembleDebug :watch:assembleDebug` succeeded with
@@ -303,8 +313,13 @@ Only the following has been run:
   haptics, follow-latest and scroll preservation ran with synthetic reader rows. Leaving the app
   while recording cancelled it without sending.
 
-**Never run:** Watch↔Phone Data Layer transfer (including the reader), playback on the Watch, the
-Watch `played` ACK, switching playback between devices, and wake-phrase recognition (the Watch
+- **Paired emulators, partial.** After pairing, with an older Phone build and no dashboard reachable,
+  Watch reader requests reached the Phone and its answers came back, and Watch recordings were
+  uploaded to the Phone, which reported its stages back. Nothing was transcribed or delivered.
+  Background noise that rose after speech ended the Watch's hands-free recording within seconds.
+
+**Never run:** a complete paired flow with matching Phone and Watch builds, playback on the Watch,
+the Watch `played` ACK, switching playback between devices, and wake-phrase recognition (the Watch
 emulator has no speech recognition service). These are covered only by core unit tests. Nothing has
 been tested on physical devices, including audio routing, haptic strength and a physical bezel.
 

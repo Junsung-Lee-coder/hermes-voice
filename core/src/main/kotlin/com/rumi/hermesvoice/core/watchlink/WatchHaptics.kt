@@ -19,7 +19,19 @@ data class HapticPattern(val pulseMs: Long, val pulses: Int, val pauseMs: Long =
     }.toLongArray()
 }
 
+/**
+ * How a haptic is attributed to the system. Recording start/end tell the wearer the microphone
+ * state changed (hardware feedback), so a "touch feedback off" setting does not silence them;
+ * scroll steps are touch feedback. Neither bypasses Do Not Disturb or the user's vibration settings.
+ */
+enum class HapticUsage { HARDWARE_FEEDBACK, TOUCH }
+
 object WatchHapticPolicy {
+    fun usageFor(event: HapticEvent): HapticUsage = when (event) {
+        HapticEvent.RECORDING_START, HapticEvent.RECORDING_END -> HapticUsage.HARDWARE_FEEDBACK
+        HapticEvent.SCROLL_STEP -> HapticUsage.TOUCH
+    }
+
     fun patternFor(event: HapticEvent): HapticPattern = when (event) {
         HapticEvent.RECORDING_START -> HapticPattern(50, 1)
         HapticEvent.RECORDING_END -> HapticPattern(30, 2)

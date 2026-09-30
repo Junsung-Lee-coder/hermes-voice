@@ -61,7 +61,6 @@ class WatchActivity : ComponentActivity() {
 
     /** The Android recorder of the active capture; the lifecycle itself lives in [captures]. */
     private var recorder: WatchCapture? = null
-    private var lastStop: CaptureStop? = null
     private val captures: CaptureCoordinator by lazy { CaptureCoordinator(capturePort) }
     private val wakeListening = mutableStateOf(false)
     private var qaWakeHandoffPending = false
@@ -78,13 +77,13 @@ class WatchActivity : ComponentActivity() {
     }
 
     private val capturePort: CapturePort = object : CapturePort {
-        override fun stopRecorder(captureId: String): ByteArray? {
+        override fun stopRecorder(captureId: String, reason: CaptureStop): ByteArray? {
             val active = recorder?.takeIf { it.turnId == captureId }
             recorder = null
             val wav = active?.stop()
             active?.stats()?.let { stats ->
                 // Aggregates only (no audio): proves whether the microphone delivered real, non-silent PCM.
-                Log.i(TAG, "watch mic captured turn=${captureId.take(12)} trigger=${active.trigger} end=$lastStop " +
+                Log.i(TAG, "watch mic captured turn=${captureId.take(12)} trigger=${active.trigger} end=$reason " +
                     "pcm_bytes=${stats.pcmBytes} peak=${stats.peak} rms=${stats.rms} speech=${stats.speech} wav=${wav != null}")
             }
             updateKeepScreenOn()
@@ -283,9 +282,8 @@ class WatchActivity : ComponentActivity() {
         updateKeepScreenOn()
     }
 
-    /** Ends [captureId] exactly once, whoever asks first (see [CaptureCoordinator]). */
+    /** Ends [captureId] exactly once, whoever asks first (see [CaptureCoordinator]); stale requests do nothing. */
     private fun end(captureId: String, reason: CaptureStop) {
-        lastStop = reason
         captures.stop(captureId, reason)
     }
 

@@ -161,6 +161,31 @@ class SilenceEndpointTest {
         assertEquals(4 + 20 + 15 + 5 + 19, index)
     }
 
+    /** Stationary noise frames at [rms] (a 300 Hz tone scaled to that RMS). */
+    private fun noise(n: Int, rms: Double) = generateSequence { frame((rms * 1.4142).toInt()) }.take(n)
+
+    @Test
+    fun `background noise that rises after speech still endpoints within 6 seconds`() {
+        val floor = SilenceEndpoint.rms(frame(100))
+        for (ratio in listOf(2.5, 2.9)) {
+            val endpoint = SilenceEndpoint()
+            val (decision, index) = feed(endpoint, quiet(4) + speech(30) + noise(6_000, floor * ratio))
+            assertEquals("$ratio x floor", EndpointDecision.END_OF_SPEECH, decision)
+            val tailFrames = index - (4 + 30) + 1
+            assertTrue("$ratio x floor ended after ${tailFrames * 100} ms", tailFrames <= 60)
+        }
+    }
+
+    @Test
+    fun `soft speech just above the onset keeps the request open`() {
+        val floor = SilenceEndpoint.rms(frame(100))
+        val random = Random(11)
+        val soft = generateSequence { frame((floor * 3.6 * 1.4142).toInt() + random.nextInt(40)) }.take(300)
+        val (decision, index) = feed(SilenceEndpoint(), quiet(4) + speech(10) + soft + quiet(40))
+        assertEquals(EndpointDecision.END_OF_SPEECH, decision)
+        assertEquals("ends only after the soft speech", 4 + 10 + 300 + 19, index)
+    }
+
     @Test
     fun `stationary background noise above an absolute threshold still endpoints`() {
         fun noisy(n: Int) = generateSequence { frame(1_500) }.take(n)

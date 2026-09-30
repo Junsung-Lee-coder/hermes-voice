@@ -2,6 +2,7 @@ package com.rumi.hermesvoice.core
 
 import com.rumi.hermesvoice.core.watchlink.HapticEvent
 import com.rumi.hermesvoice.core.watchlink.HapticPattern
+import com.rumi.hermesvoice.core.watchlink.HapticUsage
 import com.rumi.hermesvoice.core.watchlink.RecordingHapticLatch
 import com.rumi.hermesvoice.core.watchlink.RotaryScrollAccumulator
 import com.rumi.hermesvoice.core.watchlink.ScrollHapticGate
@@ -21,6 +22,16 @@ class WatchHapticsTest {
         assertEquals(HapticPattern(10, 1), WatchHapticPolicy.patternFor(HapticEvent.SCROLL_STEP))
         assertArrayEquals(longArrayOf(0, 50), WatchHapticPolicy.patternFor(HapticEvent.RECORDING_START).timings())
         assertArrayEquals(longArrayOf(0, 30, 12, 30), WatchHapticPolicy.patternFor(HapticEvent.RECORDING_END).timings())
+    }
+
+    @Test
+    fun `recording pulses are hardware feedback and scroll steps are touch feedback`() {
+        assertEquals(HapticUsage.HARDWARE_FEEDBACK, WatchHapticPolicy.usageFor(HapticEvent.RECORDING_START))
+        assertEquals(HapticUsage.HARDWARE_FEEDBACK, WatchHapticPolicy.usageFor(HapticEvent.RECORDING_END))
+        assertEquals(HapticUsage.TOUCH, WatchHapticPolicy.usageFor(HapticEvent.SCROLL_STEP))
+        // Timings are unchanged by the usage split.
+        assertEquals(HapticPattern(50, 1), WatchHapticPolicy.patternFor(HapticEvent.RECORDING_START))
+        assertEquals(HapticPattern(10, 1), WatchHapticPolicy.patternFor(HapticEvent.SCROLL_STEP))
     }
 
     @Test

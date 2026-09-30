@@ -15,6 +15,7 @@ import com.google.android.gms.wearable.CapabilityClient
 import com.google.android.gms.wearable.Wearable
 import com.rumi.hermesvoice.core.settings.WatchSettings
 import com.rumi.hermesvoice.core.watchlink.HapticEvent
+import com.rumi.hermesvoice.core.watchlink.HapticUsage
 import com.rumi.hermesvoice.core.watchlink.PlayRequest
 import com.rumi.hermesvoice.core.watchlink.PlayedAck
 import com.rumi.hermesvoice.core.watchlink.ReaderKind
@@ -154,10 +155,12 @@ class WatchApp : Application() {
     // ── haptics ──────────────────────────────────────────────────────────────────────────────
 
     /**
-     * One haptic from [WatchHapticPolicy], with touch vibration attributes on API 33+. The exact
-     * waveform durations are kept (the platform "tick" effect played ~100 ms on the emulator, far from
-     * the confirmed 10 ms step). Recording start/end timing is decided by
-     * [com.rumi.hermesvoice.core.watchlink.CaptureCoordinator], never by button intent.
+     * One haptic from [WatchHapticPolicy], with its exact waveform (the platform "tick" effect played
+     * ~100 ms on the emulator, far from the confirmed 10 ms step). On API 33+ it carries the policy's
+     * usage: hardware feedback for recording start/end, touch feedback for scroll steps. No flag
+     * bypasses Do Not Disturb or the user's vibration settings; older APIs use the default attributes.
+     * Recording start/end timing is decided by [com.rumi.hermesvoice.core.watchlink.CaptureCoordinator],
+     * never by button intent.
      */
     fun haptic(event: HapticEvent) {
         if (!_settings.value.hapticsEnabled) return
@@ -171,7 +174,11 @@ class WatchApp : Application() {
             if (!vibrator.hasVibrator()) return
             val effect = VibrationEffect.createWaveform(WatchHapticPolicy.patternFor(event).timings(), -1)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                vibrator.vibrate(effect, VibrationAttributes.createForUsage(VibrationAttributes.USAGE_TOUCH))
+                val usage = when (WatchHapticPolicy.usageFor(event)) {
+                    HapticUsage.HARDWARE_FEEDBACK -> VibrationAttributes.USAGE_HARDWARE_FEEDBACK
+                    HapticUsage.TOUCH -> VibrationAttributes.USAGE_TOUCH
+                }
+                vibrator.vibrate(effect, VibrationAttributes.createForUsage(usage))
             } else {
                 vibrator.vibrate(effect)
             }

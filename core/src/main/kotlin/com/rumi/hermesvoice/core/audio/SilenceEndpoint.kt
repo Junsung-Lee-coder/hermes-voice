@@ -15,9 +15,11 @@ enum class EndpointDecision { CONTINUE, END_OF_SPEECH, NO_SPEECH, MAX_DURATION }
  *   voiced audio in which no dip lasts longer than [maxDipMs], so syllables separated by short dips
  *   count, while isolated clicks never do. Until then the floor adapts slowly, and
  *   [noSpeechTimeoutMs] (counted from the cue) ends a request that never started.
- * - Once speech started there is NO duration cap. Trailing silence is counted only on frames below
- *   `floor × releaseRatio`; any louder frame pauses the count, and [respeechMs] of renewed voiced
- *   audio (again tolerating short dips) resets it. The request ends after [silenceMs] of silence.
+ * - Once speech started there is NO duration cap. Trailing silence counts fully on frames below
+ *   `floor × releaseRatio` and at half rate on louder frames that are still below the onset (noise
+ *   that rose after the speech, e.g. a fan starting), so such a tail still ends the request, within
+ *   2 × [silenceMs]. Voiced frames pause the count, and [respeechMs] of renewed voiced audio (again
+ *   tolerating short dips) resets it. The request ends after [silenceMs] of counted silence.
  * Push-to-talk does not use this.
  */
 class SilenceEndpoint(
@@ -76,14 +78,14 @@ class SilenceEndpoint(
                     return EndpointDecision.NO_SPEECH
                 }
             }
-            Phase.SPEECH -> if (level < floor * releaseRatio) {
+            Phase.SPEECH -> if (!voiced) {
                 phase = Phase.SILENCE
-                quietMs = durationMs
+                quietMs = silenceWeight(level, durationMs)
                 voicedMs = 0
                 dipMs = 0
             }
             Phase.SILENCE -> {
-                if (level < floor * releaseRatio) quietMs += durationMs
+                if (!voiced) quietMs += silenceWeight(level, durationMs)
                 track(voiced, durationMs)
                 if (voicedMs >= respeechMs) {
                     phase = Phase.SPEECH
@@ -111,6 +113,10 @@ class SilenceEndpoint(
             }
         }
     }
+
+    /** Quiet frames count fully; non-voiced frames above the release level count at half rate. */
+    private fun silenceWeight(level: Double, durationMs: Long): Long =
+        if (level < floor * releaseRatio) durationMs else durationMs / 2
 
     /** Slow floor tracking for stationary noise, only from non-speech frames. */
     private fun adapt(level: Double) {

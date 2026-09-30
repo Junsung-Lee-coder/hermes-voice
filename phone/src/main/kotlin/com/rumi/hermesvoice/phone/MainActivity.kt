@@ -413,8 +413,9 @@ private fun SettingsTab(state: PhoneUiState, model: PhoneViewModel) {
         OutlinedTextField(patterns, { patterns = it }, label = { Text("Wake phrases (space-separated, * wildcard)") },
             modifier = Modifier.fillMaxWidth())
         Text("Say the wake phrase first. Pause for the buzz, then speak; the request ends when you stop talking " +
-            "(no time limit). Or say the request right after the phrase: it's sent only once the Watch's speech " +
-            "recognizer has finished hearing it, and if it can't finish, nothing is sent and the Watch asks you to repeat.",
+            "(no time limit), so use this for long requests. Or say the request right after the phrase: it's sent " +
+            "only once the Watch's speech recognizer has finished hearing it, which it decides itself; if it can't " +
+            "finish, nothing is sent and the Watch asks you to repeat.",
             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         SwitchRow("Haptics", state.watch.hapticsEnabled) { model.updateWatch(state.watch.copy(hapticsEnabled = it)) }
         OutlinedButton(onClick = {

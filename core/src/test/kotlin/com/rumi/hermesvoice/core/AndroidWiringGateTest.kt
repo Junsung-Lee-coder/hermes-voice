@@ -58,6 +58,11 @@ class AndroidWiringGateTest {
         val capture = source("$watch/WatchCapture.kt")
         assertTrue("start is confirmed by the recorder state", capture.contains("recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING"))
         assertFalse("no buzz on phone stage updates or timers", source("$watch/WatchApp.kt").contains("fun buzz("))
+        val app = source("$watch/WatchApp.kt")
+        assertTrue("usage comes from the tested policy", app.contains("WatchHapticPolicy.usageFor(event)") &&
+            app.contains("VibrationAttributes.USAGE_HARDWARE_FEEDBACK") && app.contains("VibrationAttributes.USAGE_TOUCH"))
+        assertFalse("never bypasses Do Not Disturb or user settings", app.contains("FLAG_BYPASS"))
+        assertFalse("the end reason is only the accepted stop's", activity.contains("lastStop"))
     }
 
     @Test

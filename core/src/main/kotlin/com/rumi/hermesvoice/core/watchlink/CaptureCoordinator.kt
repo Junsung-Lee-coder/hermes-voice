@@ -2,8 +2,11 @@ package com.rumi.hermesvoice.core.watchlink
 
 /** What the Watch's capture lifecycle does to the device: the microphone, haptics, prompt and upload. */
 interface CapturePort {
-    /** Stops the microphone for [captureId]; the WAV, or null when too little was captured. */
-    fun stopRecorder(captureId: String): ByteArray?
+    /**
+     * Stops the microphone for [captureId], the capture being ended for [reason] (only ever the
+     * accepted stop of the active capture); the WAV, or null when too little was captured.
+     */
+    fun stopRecorder(captureId: String, reason: CaptureStop): ByteArray?
     fun haptic(event: HapticEvent)
     fun cue(line: String)
     fun upload(captureId: String, trigger: TurnTrigger, wav: ByteArray)
@@ -66,7 +69,7 @@ class CaptureCoordinator(private val port: CapturePort) {
         val turnTrigger = trigger!!
         activeId = null
         trigger = null
-        val wav = port.stopRecorder(captureId)
+        val wav = port.stopRecorder(captureId, reason)
         haptics.onEnded(captureId)?.let(port::haptic)
         when (reason) {
             CaptureStop.TAP_SEND, CaptureStop.SILENCE ->
