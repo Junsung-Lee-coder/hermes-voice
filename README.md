@@ -547,6 +547,25 @@ Only the following has been run:
     two app conversations plus the hidden routing session. Whether to create was the model's own
     choice in these runs; forced replies (refusals, malformed replies, failures, restarts) were
     exercised only in the unit tests against the fake dashboard.
+  - *After the routing review repair:* the build was installed over a Phone whose saved data for
+    a test dashboard had been created by an earlier build (one conversation and a routing session
+    seeded with the first routing instructions). The first spoken request replaced the routing
+    session once: the saved data then held the old one marked retired and a new one, and the
+    dashboard still held the old session with its history. In that same request the real routing
+    model asked for a new conversation; the ack the Phone composed and played named the title and
+    alias that were actually registered ("Creating a new conversation called Car Maintenance,
+    alias car-maintenance, and sending this there."), the conversation's first message on the
+    dashboard was the transcript, and the next request on that topic reused it. A Watch
+    push-to-talk request created another conversation with the composed ack played and
+    acknowledged on the Watch, a hands-free Watch follow-up (recorder started by the simulated
+    recognizer, ending 2.0 s after the speech) reused it, and the Watch browser listed and opened
+    the new conversations. Archiving the destination on the Phone while its ack was playing, and
+    in another run while the request was still being routed, ended both requests as not
+    delivered with nothing sent to the dashboard. One Both run with simulated recognizers again
+    gave one winner. The Korean ack wording wasn't heard: the test dashboard's speech-to-text
+    returned Latin text for the Korean recordings, so the English wording was used. Failed and
+    unreadable storage, restarts between steps, alias races and the interrupted or unverifiable
+    replacement of the routing session were exercised only in the unit tests.
   - *Earlier builds:* Watch reader, gestures, bezel scrolling and haptics, Watch playback with
     `played` ACKs, and playback switching between devices.
 
