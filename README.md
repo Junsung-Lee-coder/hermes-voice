@@ -764,6 +764,22 @@ Only the following has been run:
     Say it again".
   - *Routing (current build):* a spoken Phone request created a conversation with the composed
     ack naming the registered title and alias, and the next request on that topic reused it.
+  - *Background operation after the review repair (current build; bounded).* The emulators'
+    notification permission is undecided (the prompt was dismissed, never answered), so the
+    Watch's new rule applied throughout. Its Start ran the session for *media playback* only,
+    showing "replies only. Allow notifications, then open this app to listen" and "Notification
+    hidden. Tap here to stop". With the app closed nothing listened: no window opened, no listen
+    wake lock was held, and a simulated wake result started nothing. With the real recognizer
+    selected it showed "replies only (no recognizer)", still without the microphone type. On
+    screen, push-to-talk recorded and sent a request, a simulated wake started a hands-free
+    recording, and leaving the app cancelled that recording unsent. The in-app Stop ended the
+    session. On the Phone, the relay was off after the update (its old copy in the backed-up
+    settings was dropped), and switching it on ran it as before, saying its notification is
+    hidden. The Phone's dashboard session had expired and wasn't signed in again, so no request
+    was transcribed or answered and no reply played. **Not run on this build:** listening,
+    recording and sending with the Watch app closed (they need notifications allowed), the
+    notification and its Stop, hidden playback, anything needing the dashboard, recognition, and
+    physical devices.
   - *Background operation, on the build before the review repair (these runs don't cover the
     current build, whose session code changed; the Watch emulator has no speech recognizer, so
     every Watch wake below came from the simulated recognizer: it tests the flow after a wake,
