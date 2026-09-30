@@ -12,8 +12,8 @@ import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
-import com.rumi.hermesvoice.core.background.BackgroundStatus
 import com.rumi.hermesvoice.core.background.BackgroundText
+import com.rumi.hermesvoice.core.background.WatchVoiceStatus
 
 /**
  * Keeps the Watch process in the foreground-service state for a background session the user
@@ -70,8 +70,8 @@ class WatchVoiceService : Service() {
         val type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
             (if (microphone) ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0)
         val voice = WatchApp.from(this).voice
-        val status = voice.background.status.let { if (it.running) it else it.copy(running = true, microphone = microphone) }
-        ServiceCompat.startForeground(this, NOTIFICATION_ID, notification(this, status, !voice.wakeUnavailable.value), type)
+        val status = voice.coordinator.status.let { if (it.session.running) it else it.copy(session = it.session.copy(running = true, microphone = microphone)) }
+        ServiceCompat.startForeground(this, NOTIFICATION_ID, notification(this, status), type)
         Log.i(TAG, "background service foreground microphone=$microphone generation=$generation")
     }.onFailure { Log.w(TAG, "background service type refused microphone=$microphone: ${it.javaClass.simpleName}") }.isSuccess
 
@@ -79,10 +79,9 @@ class WatchVoiceService : Service() {
     fun retype(microphone: Boolean): Boolean = enter(microphone)
 
     /** Shows what the session is doing now. */
-    fun refresh(status: BackgroundStatus) {
-        if (!status.running) return
-        val voice = WatchApp.from(this).voice
-        runCatching { getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(this, status, !voice.wakeUnavailable.value)) }
+    fun refresh(status: WatchVoiceStatus) {
+        if (!status.session.running) return
+        runCatching { getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(this, status)) }
     }
 
     /** The user's stop: leave the foreground, remove the notification, end. */
@@ -124,7 +123,7 @@ class WatchVoiceService : Service() {
                 })
         }
 
-        private fun notification(context: Context, status: BackgroundStatus, recognizer: Boolean): Notification {
+        private fun notification(context: Context, status: WatchVoiceStatus): Notification {
             val open = PendingIntent.getActivity(context, 0, Intent(context, WatchActivity::class.java)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP), PendingIntent.FLAG_IMMUTABLE)
             val stop = PendingIntent.getService(context, 1, Intent(context, WatchVoiceService::class.java).setAction(ACTION_STOP),
@@ -132,7 +131,7 @@ class WatchVoiceService : Service() {
             return NotificationCompat.Builder(context, CHANNEL)
                 .setSmallIcon(R.drawable.ic_stat_voice)
                 .setContentTitle("Hermes Voice")
-                .setContentText(BackgroundText.watchNotification(status, recognizer) ?: "Stopped")
+                .setContentText(BackgroundText.watchNotification(status.session, status.loop) ?: "Stopped")
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
                 .setCategory(NotificationCompat.CATEGORY_SERVICE)

@@ -277,6 +277,9 @@ class WakeWindowCoordinator(
 
     fun close(reason: String) = resolve(session.cancel(reason))
 
+    /** The open window's deadline (see [WakeSession.deadline]). */
+    fun deadline(): Long = session.deadline()
+
     private fun resolve(outcome: WakeOutcome) {
         when (outcome) {
             WakeOutcome.None -> if (session.active) timer.schedule((session.deadline() - clock()).coerceAtLeast(0L))

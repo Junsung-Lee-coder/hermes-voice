@@ -55,7 +55,11 @@ class WakeController(
         if (!qaFixtureRecognizer) return
         Log.i(TAG, "qa recognizer fixture result gen=$generation current=${wake.generation} final=$final chars=${text.length} (simulated, not recognition)")
         wake.onResults(generation, listOf(text), final)
+        onActivity()
     }
+
+    /** Whether this Watch has a speech recognizer now (or the debug fixture stands in for one). */
+    fun recognizerAvailable(): Boolean = recognizerPort.available()
 
     private val recognizerPort: WakeRecognizerPort = object : WakeRecognizerPort {
         override fun available(): Boolean = qaFixtureRecognizer ||
@@ -145,8 +149,9 @@ class WakeController(
         val heard = bundle?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION).orEmpty()
         // Privacy: only counts are logged, never recognized words.
         Log.i(TAG, "wake recognizer result gen=$gen final=$final candidates=${heard.size}")
-        onActivity()
         wake.onResults(gen, heard, final)
+        // After the flow saw it: a pending partial may have moved the window's deadline.
+        onActivity()
     }
 
     companion object {

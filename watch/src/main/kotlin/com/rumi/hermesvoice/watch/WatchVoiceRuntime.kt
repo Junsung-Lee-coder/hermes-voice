@@ -1,6 +1,7 @@
 package com.rumi.hermesvoice.watch
 
 import android.Manifest
+import android.app.NotificationManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -18,18 +19,24 @@ import androidx.core.content.ContextCompat
 import com.rumi.hermesvoice.core.audio.CaptureEnd
 import com.rumi.hermesvoice.core.audio.PcmCaptureLoop
 import com.rumi.hermesvoice.core.audio.SilenceEndpoint
+import com.rumi.hermesvoice.core.background.BackgroundNotice
 import com.rumi.hermesvoice.core.background.BackgroundPort
 import com.rumi.hermesvoice.core.background.BackgroundSession
 import com.rumi.hermesvoice.core.background.BackgroundStatus
 import com.rumi.hermesvoice.core.background.HoldReason
+import com.rumi.hermesvoice.core.background.NotificationCapability
+import com.rumi.hermesvoice.core.background.WatchVoiceCoordinator
+import com.rumi.hermesvoice.core.background.WatchVoiceHost
+import com.rumi.hermesvoice.core.background.WatchVoiceStatus
+import com.rumi.hermesvoice.core.settings.WatchSettings
 import com.rumi.hermesvoice.core.wake.WakeArmInputs
 import com.rumi.hermesvoice.core.wake.WakeBlock
 import com.rumi.hermesvoice.core.wake.WakeClaimMessage
 import com.rumi.hermesvoice.core.wake.WakeClaimPort
 import com.rumi.hermesvoice.core.wake.WakeContract
 import com.rumi.hermesvoice.core.wake.WakeDevicePort
+import com.rumi.hermesvoice.core.wake.WakeLoop
 import com.rumi.hermesvoice.core.wake.WakePresence
-import com.rumi.hermesvoice.core.wake.WakePresencePort
 import com.rumi.hermesvoice.core.watchlink.CaptureCoordinator
 import com.rumi.hermesvoice.core.watchlink.CapturePort
 import com.rumi.hermesvoice.core.watchlink.CaptureStop
@@ -39,6 +46,7 @@ import java.util.UUID
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * The Watch's one voice runtime, owned by the application: the wake flow ([WakeController]), the
@@ -49,8 +57,10 @@ import kotlinx.coroutines.launch
  *
  * Without a background session the foreground-only rules hold (one wake window per show; leaving
  * the screen ends listening and any recording unsent). While a session the user started from the
- * visible app has its microphone armed ([background], [presence]), listening, recording and
- * sending continue with the app hidden and the screen off. All calls are on the main thread.
+ * visible app has its microphone armed, listening, recording and sending continue with the app
+ * hidden and the screen off. Every decision about the session, its microphone and its CPU holds is
+ * the tested [WatchVoiceCoordinator]'s; this class supplies the platform facts and does what it
+ * decides. All calls are on the main thread.
  */
 class WatchVoiceRuntime(private val app: WatchApp) {
     private val handler = Handler(Looper.getMainLooper())
@@ -85,11 +95,12 @@ class WatchVoiceRuntime(private val app: WatchApp) {
         if (presence.present && captures.activeId == null) startCapture(TurnTrigger.PUSH_TO_TALK)
     }
 
-    /** The next window of an armed session; the Phone's reachability is read again first. */
+    /** The next window of an armed session; the Phone's reachability is read again first, for a bounded time (the gap stays held). */
     private val rearmRunnable: Runnable = Runnable {
+        if (!coordinator.onRearmTimer()) return@Runnable
         app.scope.launch {
-            app.refreshPhoneReachable()
-            presence.onRearmDue()
+            withTimeoutOrNull(WatchVoiceCoordinator.REACHABILITY_TIMEOUT_MS) { app.refreshPhoneReachable() }
+            coordinator.onRearmDue()
         }
     }
 
@@ -118,9 +129,6 @@ class WatchVoiceRuntime(private val app: WatchApp) {
         override fun windowChanged(open: Boolean) {
             _wakeListening.value = open
             if (open) _wakeUnavailable.value = false
-            // A hidden window needs the CPU: one bounded hold per window, let go when it closes.
-            if (open && presence.armed) app.holds.acquire(HoldReason.LISTEN, wake.wake.windowMs + LISTEN_HOLD_MARGIN_MS)
-            else if (!open) app.holds.release(HoldReason.LISTEN)
             updateKeepScreenOn()
         }
 
@@ -163,14 +171,13 @@ class WatchVoiceRuntime(private val app: WatchApp) {
         override fun closed(reason: String) {
             Log.i(TAG, "wake window closed reason=$reason")
             onWakeClosed(reason)
-            presence.onWindowClosed(reason)
         }
 
+        // Platform facts only; the coordinator's port decides presence (visible, or an armed session).
         override fun armInputs() = WakeArmInputs(
             enabled = true,
-            // Present: the app is on screen, or a background session the user started has its microphone armed.
-            resumed = presence.present,
-            interactive = presence.armed || app.getSystemService(PowerManager::class.java)?.isInteractive == true,
+            resumed = false,
+            interactive = app.getSystemService(PowerManager::class.java)?.isInteractive == true,
             ambient = false,
             permission = hasMic(),
             microphoneMuted = app.getSystemService(AudioManager::class.java)?.isMicrophoneMute == true,
@@ -184,23 +191,6 @@ class WatchVoiceRuntime(private val app: WatchApp) {
 
         override fun armBlocked(source: String, block: WakeBlock) {
             if (block != WakeBlock.DISABLED) Log.i(TAG, "wake window blocked source=$source reason=$block")
-            presence.onArmBlocked(block, (cooldownUntilMs() - SystemClock.elapsedRealtime()).coerceAtLeast(0L))
-            // The permission was taken away under an armed session: it can no longer listen.
-            if (block == WakeBlock.PERMISSION) syncMicrophoneWanted()
-        }
-    }
-
-    private val presencePort: WakePresencePort = object : WakePresencePort {
-        override fun scheduleRearm(delayMs: Long) {
-            Log.i(TAG, "wake window re-arms in $delayMs ms (background session)")
-            handler.removeCallbacks(rearmRunnable)
-            handler.postDelayed(rearmRunnable, delayMs)
-        }
-
-        override fun cancelRearm() = handler.removeCallbacks(rearmRunnable)
-
-        override fun cancelCapture(reason: String) {
-            captures.activeId?.let { end(it, CaptureStop.LIFECYCLE) }
         }
     }
 
@@ -210,7 +200,7 @@ class WatchVoiceRuntime(private val app: WatchApp) {
             endedTrigger = active?.trigger
             recorder = null
             val wav = active?.stop()
-            app.holds.release(HoldReason.CAPTURE)
+            // CAPTURE is let go after the recording was handed on (upload) or dropped (discard): its successor holds first.
             active?.stats()?.let { stats ->
                 // Aggregates only (no audio): proves whether the microphone delivered real, non-silent PCM.
                 Log.i(TAG, "watch mic captured turn=${captureId.take(12)} trigger=${active.trigger} end=$reason " +
@@ -235,6 +225,7 @@ class WatchVoiceRuntime(private val app: WatchApp) {
                 wake.wake.onRequestCaptureEnded(sent = true)
             }
             app.upload(captureId, trigger, wav, claimId)
+            app.holds.release(HoldReason.CAPTURE)
         }
 
         override fun uploadRecognized(turnId: String, text: String) = app.uploadRecognized(turnId, text, recognizedClaimId)
@@ -246,22 +237,45 @@ class WatchVoiceRuntime(private val app: WatchApp) {
                 wake.wake.onRequestCaptureEnded(sent = false)
             }
             app.discard(message)
+            app.holds.release(HoldReason.CAPTURE)
         }
     }
 
-    val wake: WakeController = WakeController(app, wakePort, app.settings.value, claimPort) {
-        if (presence.armed && _wakeListening.value) app.holds.acquire(HoldReason.LISTEN, WakeContract.PENDING_INACTIVITY_MS + LISTEN_HOLD_MARGIN_MS)
+    private val host = object : WatchVoiceHost {
+        override fun microphonePermission() = hasMic()
+        override fun notifications() = notificationCapability()
+        override fun recognizerAvailable() = wake.recognizerAvailable()
+        override fun settings(): WatchSettings = app.settings.value
+
+        override fun scheduleRearm(delayMs: Long) {
+            Log.i(TAG, "wake window re-arms in $delayMs ms (background session)")
+            handler.removeCallbacks(rearmRunnable)
+            handler.postDelayed(rearmRunnable, delayMs)
+        }
+
+        override fun cancelRearm() = handler.removeCallbacks(rearmRunnable)
+
+        override fun cancelCapture(reason: String) {
+            captures.activeId?.let { end(it, CaptureStop.LIFECYCLE) }
+        }
+
+        override fun post(block: () -> Unit) {
+            handler.post(block)
+        }
+
+        override fun statusChanged(status: WatchVoiceStatus) {
+            Log.i(TAG, "background session wanted=${status.session.wanted} running=${status.session.running} " +
+                "microphone=${status.session.microphone} notice=${status.session.notice} loop=${status.loop} notification=${status.notification}")
+            _voiceStatus.value = status
+            _background.value = status.session
+            updateKeepScreenOn()
+            WatchVoiceService.running?.refresh(status)
+        }
+
+        override fun log(line: String) {
+            Log.i(TAG, line)
+        }
     }
-
-    /** Whether the wake flow follows the screen or an armed background session. */
-    val presence: WakePresence = WakePresence(wake.wake, presencePort)
-
-    // ── background session ───────────────────────────────────────────────────────────────────
-
-    private val _background = MutableStateFlow(BackgroundStatus(false, false, false, com.rumi.hermesvoice.core.background.BackgroundNotice.OFF))
-
-    /** The opt-in background session as it really is now (not the saved wish alone). */
-    val backgroundStatus: StateFlow<BackgroundStatus> = _background
 
     private val servicePort: BackgroundPort = object : BackgroundPort {
         override fun startService(microphone: Boolean): Boolean = runCatching {
@@ -277,21 +291,43 @@ class WatchVoiceRuntime(private val app: WatchApp) {
     }
 
     /**
-     * Device-local opt-in, off unless the user started it here. Its microphone is armed only from
-     * the visible app and only while the Phone's wake settings include the Watch.
+     * The background session composed with the wake flow: device-local opt-in, off unless the user
+     * started it here; its microphone is armed only from the visible app when nothing blocks it.
      */
-    val background: BackgroundSession = BackgroundSession(app.localStore, KEY_BACKGROUND, servicePort, resumeWhenVisible = false) { status ->
-        Log.i(TAG, "background session wanted=${status.wanted} running=${status.running} microphone=${status.microphone} notice=${status.notice}")
-        _background.value = status
-        presence.onArmed(status.microphone)
-        updateKeepScreenOn()
-        WatchVoiceService.running?.refresh(status)
+    val coordinator = WatchVoiceCoordinator(app.localStore, KEY_BACKGROUND, servicePort, host, app.holds, SystemClock::elapsedRealtime)
+
+    val wake: WakeController = WakeController(app, coordinator.devicePort(wakePort), app.settings.value, claimPort) {
+        coordinator.onRecognizerActivity()
+    }
+
+    /** Whether the wake flow follows the screen or an armed background session. */
+    val presence: WakePresence get() = coordinator.presence
+
+    val background: BackgroundSession get() = coordinator.session
+
+    private val _background = MutableStateFlow(BackgroundStatus(false, false, false, BackgroundNotice.OFF))
+
+    /** The opt-in background session as it really is now (not the saved wish alone). */
+    val backgroundStatus: StateFlow<BackgroundStatus> = _background
+
+    private val _voiceStatus = MutableStateFlow(WatchVoiceStatus(_background.value, WakeLoop.OFF, NotificationCapability.SHOWN))
+
+    /** The session with its wake loop and whether its notification can be seen. */
+    val voiceStatus: StateFlow<WatchVoiceStatus> = _voiceStatus
+
+    /** Whether the session's notification (and its Stop) can be seen now, from the platform itself. */
+    fun notificationCapability(): NotificationCapability {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            app.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return NotificationCapability.NOT_ALLOWED
+        val manager = app.getSystemService(NotificationManager::class.java)
+        if (!manager.areNotificationsEnabled()) return NotificationCapability.APP_OFF
+        val channel = manager.getNotificationChannel(WatchVoiceService.CHANNEL)
+        if (channel != null && channel.importance == NotificationManager.IMPORTANCE_NONE) return NotificationCapability.CHANNEL_OFF
+        return NotificationCapability.SHOWN
     }
 
     /** The user's Start, from the visible activity only. */
-    fun startBackground(): BackgroundStatus =
-        background.start(visible = presence.visible, microphoneWanted = app.settings.value.watchWakeEnabled, microphonePermission = hasMic())
-            .also { _background.value = it }
+    fun startBackground(): BackgroundStatus = coordinator.start()
 
     /**
      * The user's Stop (notification or app), safe to repeat. The session is over for good: nothing
@@ -301,8 +337,7 @@ class WatchVoiceRuntime(private val app: WatchApp) {
      */
     fun stopBackground() {
         val hidden = !presence.visible
-        background.stop()
-        _background.value = background.status
+        coordinator.stop()
         if (!hidden) return
         handler.removeCallbacks(handoffRunnable)
         handler.removeCallbacks(talkAfterRelease)
@@ -314,30 +349,21 @@ class WatchVoiceRuntime(private val app: WatchApp) {
     }
 
     /** The service was started by the platform with the microphone type refused: the session plays replies only. */
-    fun onMicrophoneRefused(generation: Long) {
-        _background.value = background.onMicrophoneRefused(generation)
-    }
+    fun onMicrophoneRefused(generation: Long) = coordinator.onMicrophoneRefused(generation)
 
     /** The service is gone without the user's stop. */
-    fun onServiceGone(generation: Long) {
-        _background.value = background.onServiceGone(generation)
-    }
-
-    private fun syncMicrophoneWanted() {
-        _background.value = background.onMicrophoneWanted(app.settings.value.watchWakeEnabled, visible = presence.visible, permission = hasMic())
-    }
+    fun onServiceGone(generation: Long) = coordinator.onServiceGone(generation)
 
     // ── activity ─────────────────────────────────────────────────────────────────────────────
 
-    /** The activity is on screen. It reads the synced settings next and then calls [onSettingsPulled]. */
-    fun onActivityResumed() = presence.onActivityResumed(settingsPending = true)
+    /** The activity is on screen. It reads the synced settings next and then calls [onSettingsPulled] with the returned visit. */
+    fun onActivityResumed(): Long = coordinator.onActivityResumed()
 
-    /** The settings replica is as current as the Watch can know: it may listen, and a running session may arm its microphone. */
-    fun onSettingsPulled() {
-        wake.wake.onSettings(app.settings.value)
-        presence.onSettingsCurrent()
-        _background.value = background.onVisible(app.settings.value.watchWakeEnabled, hasMic())
-    }
+    /**
+     * The settings read of [visit] finished. Applied only if that visit is still current: a read
+     * that finishes after the app was hidden never arms anything (see [WatchVoiceCoordinator.onSettingsPulled]).
+     */
+    fun onSettingsPulled(visit: Long): Boolean = coordinator.onSettingsPulled(visit)
 
     fun onActivityPaused() {
         if (!presence.armed) {
@@ -345,12 +371,13 @@ class WatchVoiceRuntime(private val app: WatchApp) {
             handler.removeCallbacks(talkAfterRelease)
             talkPending = false
         }
-        presence.onActivityPaused()
+        coordinator.onActivityPaused()
     }
 
-    fun onPermissionGranted() {
+    /** A permission prompt was answered (microphone or notifications): re-evaluated from the platform, never from the answer alone. */
+    fun onPermissionResult() {
         wake.wake.onPermissionGranted()
-        if (presence.visible) _background.value = background.onVisible(app.settings.value.watchWakeEnabled, hasMic())
+        coordinator.onEligibilityChanged()
     }
 
     fun hasMic() = app.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
@@ -364,7 +391,7 @@ class WatchVoiceRuntime(private val app: WatchApp) {
         if (!hasMic()) return false
         if (talkPending) return true
         val listening = _wakeListening.value
-        presence.onBusy()
+        coordinator.onBusy()
         if (!listening) {
             startCapture(TurnTrigger.PUSH_TO_TALK)
             return true
@@ -452,8 +479,8 @@ class WatchVoiceRuntime(private val app: WatchApp) {
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
-                Intent.ACTION_SCREEN_OFF -> handler.post { presence.onScreenOff() }
-                Intent.ACTION_SCREEN_ON -> handler.post { presence.onScreenOn() }
+                Intent.ACTION_SCREEN_OFF -> handler.post { coordinator.onScreenOff() }
+                Intent.ACTION_SCREEN_ON -> handler.post { coordinator.onScreenOn() }
             }
         }
     }
@@ -481,8 +508,20 @@ class WatchVoiceRuntime(private val app: WatchApp) {
         }
     }
 
+    /** The app's or the session channel's notifications were switched on or off: the session is re-evaluated (it can only disarm while hidden). */
+    private val notificationReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            handler.post { coordinator.onEligibilityChanged() }
+        }
+    }
+
     init {
-        _background.value = background.status
+        coordinator.attach(wake.wake)
+        val notificationChanges = IntentFilter().apply {
+            addAction(NotificationManager.ACTION_APP_BLOCK_STATE_CHANGED)
+            addAction(NotificationManager.ACTION_NOTIFICATION_CHANNEL_BLOCK_STATE_CHANGED)
+        }
+        ContextCompat.registerReceiver(app, notificationReceiver, notificationChanges, ContextCompat.RECEIVER_NOT_EXPORTED)
         val screen = IntentFilter().apply {
             addAction(Intent.ACTION_SCREEN_ON)
             addAction(Intent.ACTION_SCREEN_OFF)
@@ -496,33 +535,27 @@ class WatchVoiceRuntime(private val app: WatchApp) {
             // Exported so `adb shell am broadcast` reaches it; never registered in a release build.
             ContextCompat.registerReceiver(app, qaReceiver, IntentFilter(QA_ACTION), ContextCompat.RECEIVER_EXPORTED)
         }
-        // The notification says whether the Watch can really listen.
-        app.scope.launch { _wakeUnavailable.collect { WatchVoiceService.running?.refresh(background.status) } }
         app.wakeVerdictListener = { claimId, verdict -> wake.wake.onClaimVerdict(claimId, verdict) }
         app.wakeEpochListener = { epoch, claimId -> wake.wake.onEpisodeAnswered(epoch, claimId) }
         app.scope.launch {
             app.talk.collect {
                 if (it.canArmWakePhrase) {
-                    presence.onIdle()
+                    coordinator.onIdle()
                 } else if (captures.activeId == null) {
-                    presence.onBusy()
+                    coordinator.onBusy()
                 }
             }
         }
         // Phone-owned settings: a mode that excludes the Watch stops listening and any hands-free capture at
         // once, and disarms a background session; including it again arms one only while the app is on screen.
         app.scope.launch {
-            app.settings.collect {
-                wake.wake.onSettings(it)
-                syncMicrophoneWanted()
-            }
+            app.settings.collect { coordinator.onEligibilityChanged() }
         }
     }
 
     companion object {
         private const val TAG = "HermesVoiceWatch"
         const val KEY_BACKGROUND = "background_operation"
-        private const val LISTEN_HOLD_MARGIN_MS = 10_000L
         const val QA_ACTION = "com.rumi.hermesvoice.QA_WATCH"
         const val QA_WAKE_HEARD = "hv_qa_wake_heard"
         const val QA_WAKE_FINAL = "hv_qa_wake_final"

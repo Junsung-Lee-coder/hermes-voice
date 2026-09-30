@@ -13,6 +13,8 @@ import com.rumi.hermesvoice.core.background.BackgroundNotice
 import com.rumi.hermesvoice.core.background.BackgroundPort
 import com.rumi.hermesvoice.core.background.BackgroundSession
 import com.rumi.hermesvoice.core.background.BackgroundStatus
+import com.rumi.hermesvoice.core.background.DeviceLocalFlags
+import com.rumi.hermesvoice.core.background.NotificationCapability
 import com.rumi.hermesvoice.core.background.HoldReason
 import com.rumi.hermesvoice.core.background.WakeHolds
 import com.rumi.hermesvoice.core.settings.AppSettings
@@ -63,6 +65,9 @@ class PhoneApp : Application() {
     private val settingsStore by lazy { SharedPreferencesKeyValueStore(prefs(AppSettings.PREFERENCES_NAME)) }
     val settings: AppSettings by lazy { AppSettings(settingsStore) }
 
+    /** This install's own flags (the relay opt-in, notifications asked), excluded from backup and transfer. */
+    private val localStore by lazy { SharedPreferencesKeyValueStore(prefs(DeviceLocalFlags.PHONE_PREFERENCES)) }
+
     /** Elapsed-realtime millis when Phone speaker playback last ended (wake-phrase cooldown). */
     @Volatile var lastPhonePlaybackEndedAtMs: Long = 0L
 
@@ -72,6 +77,8 @@ class PhoneApp : Application() {
         val migrated = settings.migrate()
         Log.i("HermesVoice", "voice settings wake_location=${settings.wakeLocation} vad_silence_s=${settings.vadSilenceSeconds} " +
             "revision=${settings.watchSettingsRevision} migrated=$migrated")
+        // Legacy copies of the relay flags in the backed-up settings file are switched off, never carried over.
+        if (DeviceLocalFlags.dropLegacy(settingsStore, localStore)) Log.i(RELAY_TAG, "legacy relay flags dropped from the backed-up settings")
         PhoneRelayService.createChannel(this)
         _relayStatus.value = relay.status
         if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
@@ -123,7 +130,7 @@ class PhoneApp : Application() {
      * starts from the background.
      */
     val relay: BackgroundSession by lazy {
-        BackgroundSession(settingsStore, KEY_BACKGROUND_RELAY, relayPort, resumeWhenVisible = true) { status ->
+        BackgroundSession(localStore, DeviceLocalFlags.KEY_RELAY, relayPort, resumeWhenVisible = true) { status ->
             Log.i(RELAY_TAG, "background relay wanted=${status.wanted} running=${status.running} notice=${status.notice}")
             _relayStatus.value = status
             PhoneRelayService.running?.refresh(status)
@@ -161,10 +168,23 @@ class PhoneApp : Application() {
         holds.releaseAll()
     }
 
+    /** Whether the relay's notification (and its Stop) can be seen now, from the platform itself. */
+    fun relayNotificationCapability(): NotificationCapability {
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            return NotificationCapability.NOT_ALLOWED
+        }
+        val manager = getSystemService(android.app.NotificationManager::class.java)
+        if (!manager.areNotificationsEnabled()) return NotificationCapability.APP_OFF
+        val channel = manager.getNotificationChannel(PhoneRelayService.CHANNEL)
+        if (channel != null && channel.importance == android.app.NotificationManager.IMPORTANCE_NONE) return NotificationCapability.CHANNEL_OFF
+        return NotificationCapability.SHOWN
+    }
+
     /** True the first time only: whether the relay's notification may show is asked once, not at every switch-on. */
     fun askNotificationsOnce(): Boolean {
-        if (settingsStore.getBoolean(KEY_NOTIFICATIONS_ASKED, false)) return false
-        settingsStore.putBoolean(KEY_NOTIFICATIONS_ASKED, true)
+        if (localStore.getBoolean(DeviceLocalFlags.KEY_NOTIFICATIONS_ASKED, false)) return false
+        localStore.putBoolean(DeviceLocalFlags.KEY_NOTIFICATIONS_ASKED, true)
         return true
     }
 
@@ -297,8 +317,6 @@ class PhoneApp : Application() {
     companion object {
         private const val VOICE_TAG = "HermesVoiceTurn"
         private const val RELAY_TAG = "HermesVoiceRelay"
-        const val KEY_BACKGROUND_RELAY = "phone_background_relay"
-        private const val KEY_NOTIFICATIONS_ASKED = "notifications_asked"
         private const val QA_ACTION = "com.rumi.hermesvoice.QA_PHONE"
         private const val QA_RELAY = "hv_qa_relay"
         const val REGISTRY_PREFS_PREFIX = "hermes_voice_sessions_"

@@ -673,8 +673,8 @@ private fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerAv
         HorizontalDivider()
         Text("Background", style = MaterialTheme.typography.titleSmall)
         // The first switch-on asks whether the app may show its notification (Android 13+); the relay starts whatever the answer.
-        val notifications = android.os.Build.VERSION.SDK_INT < 33 ||
-            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        // Whether the relay's notification can really be seen now: the permission, the app's notifications and its channel.
+        val notifications = PhoneApp.from(context).relayNotificationCapability().shown
         val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { model.setBackgroundRelay(true) }
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text("Keep relaying for the Watch when this app is closed", Modifier.weight(1f))

@@ -15,6 +15,33 @@ interface BackgroundPort {
     fun stopService()
 }
 
+/** Why a running session's microphone is not armed; null when nothing stands in the way but visibility. */
+enum class MicBlock {
+    /** This device's microphone isn't wanted: a relay, or the Phone's wake settings exclude the device. */
+    NOT_WANTED,
+
+    /** No microphone permission. */
+    PERMISSION,
+
+    /** The device has no speech recognizer: nothing could listen. */
+    NO_RECOGNIZER,
+
+    /**
+     * The session's notification can't be shown (not allowed, the app's notifications or the
+     * session's channel switched off): a hidden microphone would have no visible indicator and no
+     * Stop outside the app, so it is not armed.
+     */
+    NOTIFICATIONS;
+
+    companion object {
+        fun of(wanted: Boolean, permission: Boolean): MicBlock? = when {
+            !wanted -> NOT_WANTED
+            !permission -> PERMISSION
+            else -> null
+        }
+    }
+}
+
 /** What the user is told about the background session. */
 enum class BackgroundNotice {
     /** Not opted in. */
@@ -32,6 +59,12 @@ enum class BackgroundNotice {
     /** Running, but the microphone can only be armed while the app is on screen. */
     NEEDS_VISIBLE_TO_LISTEN,
 
+    /** Running for replies only: its notification can't be shown, so it doesn't listen. */
+    NEEDS_NOTIFICATIONS,
+
+    /** Running for replies only: the device has no speech recognizer. */
+    NO_RECOGNIZER,
+
     /** Opted in, not running (the system ended it, or the device restarted): the user has to start it again. */
     PAUSED,
 
@@ -47,11 +80,12 @@ data class BackgroundStatus(val wanted: Boolean, val running: Boolean, val micro
 /**
  * One device's opt-in background session, independent of Android. Off unless the user started it
  * (the choice is stored under [key]; nothing else ever writes it). It starts only from a visible
- * app, and its microphone is armed only from a visible app: a change that arrives while the app is
- * hidden can disarm it but never arm it. Stopping is the user's and is final; a session the system
- * ended stays "wanted" and reads as paused until the user starts it again ([resumeWhenVisible]: a
- * session without a microphone may also resume when its app is shown). Every started session has
- * a [generation]; whatever belongs to an older one [isCurrent] rejects.
+ * app, and its microphone is armed only from a visible app and only when nothing blocks it
+ * ([MicBlock]): a change that arrives while the app is hidden can disarm it but never arm it.
+ * Stopping is the user's and is final; a session the system ended stays "wanted" and reads as
+ * paused until the user starts it again ([resumeWhenVisible]: a session without a microphone may
+ * also resume when its app is shown). Every started session has a [generation]; whatever belongs
+ * to an older one [isCurrent] rejects.
  */
 class BackgroundSession(
     private val store: KeyValueStore,
@@ -62,8 +96,7 @@ class BackgroundSession(
 ) {
     private var running = false
     private var microphone = false
-    private var microphoneWanted = false
-    private var microphonePermission = true
+    private var block: MicBlock? = MicBlock.NOT_WANTED
     private var refused: BackgroundNotice? = null
     private var last: BackgroundStatus? = null
 
@@ -78,9 +111,13 @@ class BackgroundSession(
             !wanted -> BackgroundNotice.OFF
             !running -> refused ?: BackgroundNotice.PAUSED
             microphone -> BackgroundNotice.LISTENING
-            !microphoneWanted -> BackgroundNotice.RUNNING
-            !microphonePermission -> BackgroundNotice.NEEDS_PERMISSION
-            else -> BackgroundNotice.NEEDS_VISIBLE_TO_LISTEN
+            else -> when (block) {
+                MicBlock.NOT_WANTED -> BackgroundNotice.RUNNING
+                MicBlock.PERMISSION -> BackgroundNotice.NEEDS_PERMISSION
+                MicBlock.NO_RECOGNIZER -> BackgroundNotice.NO_RECOGNIZER
+                MicBlock.NOTIFICATIONS -> BackgroundNotice.NEEDS_NOTIFICATIONS
+                null -> BackgroundNotice.NEEDS_VISIBLE_TO_LISTEN
+            }
         })
 
     init {
@@ -91,14 +128,17 @@ class BackgroundSession(
     fun isCurrent(generation: Long): Boolean = running && generation == this.generation
 
     /** The user asked for background operation. Only a [visible] app may start it. */
+    fun start(visible: Boolean, microphoneWanted: Boolean, microphonePermission: Boolean): BackgroundStatus =
+        start(visible, MicBlock.of(microphoneWanted, microphonePermission))
+
+    /** The user asked for background operation. Only a [visible] app may start it; the microphone only when [block] is null. */
     @Synchronized
-    fun start(visible: Boolean, microphoneWanted: Boolean, microphonePermission: Boolean): BackgroundStatus {
+    fun start(visible: Boolean, block: MicBlock?): BackgroundStatus {
         if (!visible) return status.copy(notice = BackgroundNotice.NEEDS_VISIBLE)
         store.putBoolean(key, true)
-        this.microphoneWanted = microphoneWanted
-        this.microphonePermission = microphonePermission
+        this.block = block
         if (running) return arm()
-        val arming = microphoneWanted && microphonePermission
+        val arming = block == null
         val started = port.startService(arming)
         // The microphone type alone may be refused: run for playback and say so.
         val fallback = !started && arming && port.startService(false)
@@ -145,12 +185,28 @@ class BackgroundSession(
         return changed()
     }
 
-    /** The app is on screen: the only moment a running session's microphone may be armed. */
+    /**
+     * The microphone of session [generation] was granted but nothing can use it (the app wasn't
+     * visible when it came, or the loop can't open a window): it is given back, and the session
+     * says listening needs the app on screen.
+     */
     @Synchronized
-    fun onVisible(microphoneWanted: Boolean, microphonePermission: Boolean): BackgroundStatus {
-        this.microphoneWanted = microphoneWanted
-        this.microphonePermission = microphonePermission
-        if (!running) return if (wanted && resumeWhenVisible) start(true, microphoneWanted, microphonePermission) else status
+    fun onMicrophoneStalled(generation: Long): BackgroundStatus {
+        if (!isCurrent(generation) || !microphone) return status
+        microphone = false
+        port.retypeService(false)
+        return changed()
+    }
+
+    /** The app is on screen: the only moment a running session's microphone may be armed. */
+    fun onVisible(microphoneWanted: Boolean, microphonePermission: Boolean): BackgroundStatus =
+        onVisible(MicBlock.of(microphoneWanted, microphonePermission))
+
+    /** The app is on screen: the only moment a running session's microphone may be armed (when [block] is null). */
+    @Synchronized
+    fun onVisible(block: MicBlock?): BackgroundStatus {
+        this.block = block
+        if (!running) return if (wanted && resumeWhenVisible) start(true, block) else status
         return arm()
     }
 
@@ -158,12 +214,18 @@ class BackgroundSession(
      * Whether this device's microphone is wanted changed (the Phone's wake settings, or the
      * permission). Not wanted or not permitted disarms at once; wanted arms only while [visible].
      */
+    fun onMicrophoneWanted(wanted: Boolean, visible: Boolean, permission: Boolean): BackgroundStatus =
+        onMicrophoneBlock(MicBlock.of(wanted, permission), visible)
+
+    /**
+     * What stands in the way of the microphone changed. Any [block] disarms at once, wherever it
+     * comes from; none arms only while [visible].
+     */
     @Synchronized
-    fun onMicrophoneWanted(wanted: Boolean, visible: Boolean, permission: Boolean): BackgroundStatus {
-        microphoneWanted = wanted
-        microphonePermission = permission
+    fun onMicrophoneBlock(block: MicBlock?, visible: Boolean): BackgroundStatus {
+        this.block = block
         if (!running) return status
-        if (microphone && !(wanted && permission)) {
+        if (microphone && block != null) {
             microphone = false
             port.retypeService(false)
             return changed()
@@ -172,7 +234,11 @@ class BackgroundSession(
     }
 
     private fun arm(): BackgroundStatus {
-        if (!microphone && microphoneWanted && microphonePermission) microphone = port.retypeService(true)
+        if (!microphone && block == null) microphone = port.retypeService(true)
+        if (microphone && block != null) {
+            microphone = false
+            port.retypeService(false)
+        }
         return changed()
     }
 

@@ -8,8 +8,10 @@ import org.junit.Test
 
 /**
  * Secondary source gates: the behaviour itself is tested on the pure cores the Android adapters
- * delegate to (see WatchAdaptersTest). These only check that the adapters still delegate there and
- * keep platform wiring the JVM cannot run (theme flags, manifest, focus order, contexts).
+ * delegate to (see WatchAdaptersTest, and WatchVoiceCoordinatorTest for the Watch's background
+ * session composed as its runtime composes it). These only check that the adapters still delegate
+ * there and keep platform wiring the JVM cannot run (theme flags, manifest, focus order,
+ * contexts). A text match proves that a line exists, never that its ordering or timing is right.
  */
 class AndroidWiringGateTest {
     private val root: File = generateSequence(File(System.getProperty("user.dir")).absoluteFile) { it.parentFile }
@@ -54,7 +56,7 @@ class AndroidWiringGateTest {
         assertTrue(runtime.substringAfter("override fun onCalibrated()").substringBefore("override fun onEnd(").contains("captures.onCalibrated(turnId)"))
         // Leaving the screen goes to the tested presence rules, which end a recording unsent unless a background session is armed.
         assertTrue(activity.substringAfter("override fun onPause()").substringBefore("super.onPause()").contains("voice.onActivityPaused()"))
-        assertTrue(runtime.substringAfter("fun onActivityPaused()").substringBefore("fun onPermissionGranted()").contains("presence.onActivityPaused()"))
+        assertTrue(runtime.substringAfter("fun onActivityPaused()").substringBefore("fun onPermissionResult()").contains("coordinator.onActivityPaused()"))
         assertTrue(runtime.substringAfter("override fun cancelCapture(reason: String)").substringBefore("}").contains("CaptureStop.LIFECYCLE"))
         assertTrue("handoff is cancellable and generation-bound (WakeDeviceController)",
             runtime.contains("wake.wake.onHandoffDue(captureIdle = captures.activeId == null)") && runtime.contains("removeCallbacks(handoffRunnable)"))
@@ -102,21 +104,21 @@ class AndroidWiringGateTest {
         val watchWake = source("$watch/WakeController.kt")
         assertFalse(watchWake.contains("ComponentActivity") || watchWake.contains("LifecycleObserver"))
         val runtime = source("$watch/WatchVoiceRuntime.kt")
-        assertTrue(runtime.contains("val presence: WakePresence = WakePresence(wake.wake, presencePort)"))
-        assertTrue("the Watch waits for its synced settings", runtime.contains("presence.onActivityResumed(settingsPending = true)"))
-        assertTrue(runtime.substringAfter("fun onSettingsPulled()").substringBefore("fun onActivityPaused()").let {
-            it.indexOf("wake.wake.onSettings(app.settings.value)") in 0 until it.indexOf("presence.onSettingsCurrent()")
-        })
-        assertTrue(runtime.substringAfter("app.settings.collect {").substringBefore("}").contains("wake.wake.onSettings(it)"))
+        // The wake flow is built on the coordinator's port and bound to it: its decisions are the tested ones.
+        assertTrue(runtime.contains("WakeController(app, coordinator.devicePort(wakePort), app.settings.value, claimPort)") &&
+            runtime.contains("coordinator.attach(wake.wake)"))
+        assertTrue(runtime.contains("fun onActivityResumed(): Long = coordinator.onActivityResumed()") &&
+            runtime.contains("fun onSettingsPulled(visit: Long): Boolean = coordinator.onSettingsPulled(visit)"))
+        assertTrue(runtime.contains("app.settings.collect { coordinator.onEligibilityChanged() }"))
         assertFalse("the screen receiver only posts a signal", runtime.substringAfter("private val screenReceiver").substringBefore("private val qaReceiver")
             .let { it.contains("startListening") || it.contains("startCapture") })
-        assertTrue("present = on screen or an armed session; the screen state is waived only for an armed session",
-            runtime.contains("resumed = presence.present,") &&
-                runtime.contains("interactive = presence.armed || app.getSystemService(PowerManager::class.java)?.isInteractive == true,"))
+        assertTrue("the runtime reports platform facts only; presence is the coordinator's", runtime.contains("resumed = false,"))
         val watchActivity = source("$watch/WatchActivity.kt")
         assertTrue(watchActivity.substringAfter("override fun onResume()").substringBefore("override fun onPause()").let {
-            it.indexOf("voice.onActivityResumed()") in 0 until it.indexOf("pullSettings()") && it.indexOf("pullSettings()") < it.indexOf("voice.onSettingsPulled()")
+            it.indexOf("val visit = voice.onActivityResumed()") in 0 until it.indexOf("pullSettings()") && it.indexOf("pullSettings()") < it.indexOf("voice.onSettingsPulled(visit)")
         })
+        assertTrue("the read of a show is cancelled when the app leaves the screen",
+            watchActivity.substringAfter("override fun onPause()").substringBefore("voice.onActivityPaused()").contains("settingsPull?.cancel()"))
         val phoneActivity = source("$phone/MainActivity.kt")
         assertTrue(phoneActivity.contains("collect { phoneWake.wake.onSettings(it) }"))
         assertTrue("the Phone recorder gets the snapshot", phoneActivity.contains("model.startHandsFree(silenceMs, claimId)"))
@@ -187,7 +189,7 @@ class AndroidWiringGateTest {
         val resume = watchActivity.substringAfter("override fun onResume()").substringBefore("override fun onPause()")
         assertTrue("the count is read before the Watch may listen",
             watchActivity.contains("pullItem(WatchLinkPaths.WAKE_EPOCH, app::applyWakeEpoch)") &&
-                resume.indexOf("pullSettings()") in 0 until resume.indexOf("voice.onSettingsPulled()"))
+                resume.indexOf("pullSettings()") in 0 until resume.indexOf("voice.onSettingsPulled(visit)"))
         assertTrue("the wake location changing mid-request is said on both devices",
             watchRuntime.contains("\"wake_mode_changed\" ->") && source("$phone/PhoneViewModel.kt").contains("\"wake_mode_changed\" ->"))
     }
@@ -199,7 +201,7 @@ class AndroidWiringGateTest {
         assertTrue(phoneTalk.contains("phoneWake.wake.onBusy()") && phoneTalk.contains("postDelayed(talkAfterRelease, WakeContract.MIC_HANDOFF_MS)"))
         assertTrue(phoneActivity.contains("PhoneScreen(model, recognizerAvailable, onTalk = ::onTalk)"))
         val watchTalk = source("$watch/WatchVoiceRuntime.kt").substringAfter("fun onTalkPressed(): Boolean").substringBefore("// ── capture")
-        assertTrue(watchTalk.contains("presence.onBusy()") && watchTalk.contains("postDelayed(talkAfterRelease, WakeContract.MIC_HANDOFF_MS)"))
+        assertTrue(watchTalk.contains("coordinator.onBusy()") && watchTalk.contains("postDelayed(talkAfterRelease, WakeContract.MIC_HANDOFF_MS)"))
         // On the Phone, leaving the screen (rotation included) cancels a hands-free recording unsent: the documented lifecycle contract.
         assertTrue(source("$phone/PhoneWakeController.kt").contains("override fun onPause(owner: LifecycleOwner) = wake.onPause()"))
     }
@@ -242,11 +244,13 @@ class AndroidWiringGateTest {
         val watchApp = source("$watch/WatchApp.kt")
         val listener = source("$watch/WatchListenerService.kt")
         // Off unless started: the opt-in key is only written by the session itself, from Start and Stop.
-        assertTrue(runtime.contains("BackgroundSession(app.localStore, KEY_BACKGROUND, servicePort, resumeWhenVisible = false)"))
+        assertTrue(runtime.contains("WatchVoiceCoordinator(app.localStore, KEY_BACKGROUND, servicePort, host, app.holds, SystemClock::elapsedRealtime)"))
+        assertTrue(source("core/src/main/kotlin/com/rumi/hermesvoice/core/background/WatchVoiceCoordinator.kt")
+            .contains("BackgroundSession(store, key, service, resumeWhenVisible = false)"))
         assertEquals("one place starts it: the activity's control", 1, Regex("voice\\.startBackground\\(\\)").findAll(watchActivity).count())
         assertTrue(watchActivity.substringAfter("private fun startBackgroundNow()").substringBefore("}").contains("voice.startBackground()"))
-        assertTrue("the start is refused unless the activity is on screen",
-            runtime.substringAfter("fun startBackground(): BackgroundStatus").substringBefore("fun stopBackground()").contains("background.start(visible = presence.visible,"))
+        assertTrue("the start goes to the coordinator, which refuses it unless the app is on screen (WatchVoiceCoordinatorTest)",
+            runtime.contains("fun startBackground(): BackgroundStatus = coordinator.start()"))
         for (elsewhere in listOf(watchService, watchApp, listener)) {
             assertFalse(elsewhere.contains("startBackground(") || elsewhere.contains("background.start(") || elsewhere.contains("startForegroundService"))
         }
@@ -255,11 +259,8 @@ class AndroidWiringGateTest {
         assertTrue(watchService.contains("(if (microphone) ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0)"))
         assertTrue(watchService.contains("microphone && enter(false) -> voice.onMicrophoneRefused(generation)"))
         assertTrue(watchService.substringAfter("private fun enter(microphone: Boolean): Boolean = runCatching {").contains("}.onFailure {"))
-        assertTrue("armed from a resumed activity, after its settings are current",
-            runtime.substringAfter("fun onSettingsPulled()").substringBefore("fun onActivityPaused()").contains("background.onVisible(app.settings.value.watchWakeEnabled, hasMic())"))
-        assertTrue("a settings change disarms or arms through the tested session rules, never directly",
-            runtime.contains("background.onMicrophoneWanted(app.settings.value.watchWakeEnabled, visible = presence.visible, permission = hasMic())"))
-        assertTrue(runtime.contains("presence.onArmed(status.microphone)"))
+        // When the microphone may be armed is decided and tested in WatchVoiceCoordinatorTest; here only: nothing else arms it.
+        assertFalse(runtime.contains("background.onVisible(") || runtime.contains("background.onMicrophone") || runtime.contains("presence.onArmed("))
         // Both services: not sticky, no redelivery, the session's generation, a Stop action to the service itself.
         for ((service, stop, gone) in listOf(Triple(watchService, "voice.stopBackground()", "voice.onServiceGone(generation)"),
             Triple(source("$phone/PhoneRelayService.kt"), "app.stopRelay()", "onRelayServiceGone(generation)"))) {
@@ -273,14 +274,14 @@ class AndroidWiringGateTest {
         }
         // Stop with the app hidden ends everything of the session: recording, pending upload, playback, wake locks.
         val stop = runtime.substringAfter("fun stopBackground()").substringBefore("fun onMicrophoneRefused")
-        for (step in listOf("background.stop()", "end(it, CaptureStop.LIFECYCLE)", "app.cancelPendingUploads(\"Stopped\")", "app.stopPlayback(\"stopped\")", "app.holds.releaseAll()")) {
+        for (step in listOf("coordinator.stop()", "end(it, CaptureStop.LIFECYCLE)", "app.cancelPendingUploads(\"Stopped\")", "app.stopPlayback(\"stopped\")", "app.holds.releaseAll()")) {
             assertTrue(step, stop.contains(step))
         }
         assertTrue(watchApp.contains("if (request.turnId in stoppedTurns) return refusePlayback(request, nodeId, \"stopped on the watch\")"))
         assertTrue(watchApp.substringAfter("fun cancelPendingUploads(reason: String)").substringBefore("private fun send(").contains("job.cancel()"))
         // The Phone: the switch in the visible app, resumed only when an activity is started, turns stopped when closed.
         val phoneApp = source("$phone/PhoneApp.kt")
-        assertTrue(phoneApp.contains("BackgroundSession(settingsStore, KEY_BACKGROUND_RELAY, relayPort, resumeWhenVisible = true)"))
+        assertTrue(phoneApp.contains("BackgroundSession(localStore, DeviceLocalFlags.KEY_RELAY, relayPort, resumeWhenVisible = true)"))
         assertTrue(phoneApp.contains("relay.start(visible = activityVisible, microphoneWanted = false, microphonePermission = false)"))
         assertTrue(phoneApp.substringAfter("fun onActivityStarted()").substringBefore("fun onActivityStopped()").contains("relay.onVisible(microphoneWanted = false, microphonePermission = false)"))
         assertTrue(source("$phone/MainActivity.kt").substringAfter("override fun onStart()").substringBefore("override fun onStop()").contains("PhoneApp.from(this).onActivityStarted()"))
@@ -311,10 +312,11 @@ class AndroidWiringGateTest {
         val runtime = sources.getValue("$watch/WatchVoiceRuntime.kt")
         assertTrue("the screen is kept on for a recording or a foreground window, never for a whole background session",
             runtime.contains("_keepScreenOn.value = recorder != null || (_wakeListening.value && !presence.armed)"))
-        assertTrue("a hidden window holds the CPU only for its own length",
-            runtime.contains("if (open && presence.armed) app.holds.acquire(HoldReason.LISTEN, wake.wake.windowMs + LISTEN_HOLD_MARGIN_MS)") &&
-                runtime.contains("else if (!open) app.holds.release(HoldReason.LISTEN)"))
-        assertTrue(runtime.substringAfter("override fun stopRecorder(").substringBefore("override fun haptic(").contains("app.holds.release(HoldReason.CAPTURE)"))
+        // The session's holds (window, handoff, gap) are the coordinator's, tested in WatchVoiceCoordinatorTest; the runtime takes none of them.
+        for (reason in listOf("LISTEN", "HANDOFF", "REARM")) assertFalse(reason, runtime.contains("HoldReason.$reason"))
+        assertTrue("the recording's hold is let go after its successor (the transfer) took one",
+            runtime.substringAfter("override fun upload(").substringBefore("override fun uploadRecognized").let {
+                it.indexOf("app.upload(captureId, trigger, wav, claimId)") in 0 until it.indexOf("app.holds.release(HoldReason.CAPTURE)") })
         val qa = runtime.substringBefore("ContextCompat.registerReceiver(app, qaReceiver").substringAfterLast("\n")
         assertTrue("the QA receiver is registered only in a debuggable build",
             runtime.substringBefore("ContextCompat.registerReceiver(app, qaReceiver").trimEnd().endsWith("// Exported so `adb shell am broadcast` reaches it; never registered in a release build.") &&

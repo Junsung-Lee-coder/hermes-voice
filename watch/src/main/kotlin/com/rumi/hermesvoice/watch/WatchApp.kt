@@ -18,6 +18,7 @@ import android.util.Log
 import com.google.android.gms.wearable.CapabilityClient
 import com.google.android.gms.wearable.Wearable
 import com.rumi.hermesvoice.core.KeyValueStore
+import com.rumi.hermesvoice.core.background.DeviceLocalFlags
 import com.rumi.hermesvoice.core.background.HoldReason
 import com.rumi.hermesvoice.core.background.WakeHolds
 import com.rumi.hermesvoice.core.background.WakeLockPort
@@ -98,7 +99,7 @@ class WatchApp : Application() {
     private lateinit var replica: WatchSettingsReplica
 
     /** Device-local choices of this Watch (not the Phone-owned voice settings): the background opt-in. */
-    val localStore: KeyValueStore by lazy { PrefsStore(getSharedPreferences(LOCAL_PREFS, Context.MODE_PRIVATE)) }
+    val localStore: KeyValueStore by lazy { PrefsStore(getSharedPreferences(DeviceLocalFlags.WATCH_PREFERENCES, Context.MODE_PRIVATE)) }
 
     /** CPU wake locks, one per reason and each with a timeout (see [WakeHolds]). */
     val holds: WakeHolds by lazy { WakeHolds(AndroidWakeLocks(this), SystemClock::elapsedRealtime) }
@@ -586,7 +587,6 @@ class WatchApp : Application() {
         private const val TAG = "HermesVoiceWatch"
         private const val PREFS = "hermes_voice_watch"
         private const val KEY_SETTINGS = "settings_json"
-        private const val LOCAL_PREFS = "hermes_voice_watch_local"
         private const val ACK_HOLD_MS = 10_000L
 
         fun from(context: Context): WatchApp = context.applicationContext as WatchApp

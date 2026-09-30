@@ -3,6 +3,21 @@ package com.rumi.hermesvoice.core.wake
 /** When to open the next window of an armed background session; [failure] counts toward the back-off. */
 data class Rearm(val delayMs: Long, val failure: Boolean)
 
+/** What an armed background session's wake loop is doing, for what the user is told. */
+enum class WakeLoop {
+    /** No background session is armed. */
+    OFF,
+
+    /** Listening, between two windows, or busy with a request. */
+    ACTIVE,
+
+    /** Waiting to try again: the recognizer failed, the Phone is unreachable or the microphone is muted. */
+    RETRYING,
+
+    /** The device has no recognizer: the loop stopped. */
+    NO_RECOGNIZER,
+}
+
 /**
  * What follows a closed recognizer window while a background session is armed. A quiet window,
  * speech that was not the phrase and an episode that ended are followed by the next window after
@@ -65,11 +80,31 @@ class WakePresence(private val wake: WakeDeviceController, private val port: Wak
     private var failures = 0
     private var unavailable = false
 
+    /** The next window is scheduled (null: none); kept until it is due, so the gap can be held awake. */
+    var pendingRearm: Rearm? = null
+        private set
+
+    /** The last scheduled wait was a retry (a failure, an unreachable Phone or a muted microphone). */
+    private var retrying = false
+
+    /** The device's recognizer reported that it isn't there. */
+    val recognizerUnavailable: Boolean get() = unavailable
+
+    val loop: WakeLoop
+        get() = when {
+            !armed -> WakeLoop.OFF
+            unavailable -> WakeLoop.NO_RECOGNIZER
+            retrying -> WakeLoop.RETRYING
+            else -> WakeLoop.ACTIVE
+        }
+
     fun onActivityResumed(settingsPending: Boolean) {
         visible = true
         // A recognizer may have been installed meanwhile: every show tries again.
         unavailable = false
         if (!armed) return wake.onResume(settingsPending)
+        // Armed: the flow may have been paused before the session was armed; it counts as shown again.
+        wake.markResumed()
         if (!settingsPending) rearm("resume")
     }
 
@@ -93,21 +128,29 @@ class WakePresence(private val wake: WakeDeviceController, private val port: Wak
         if (!armed) wake.onScreenOn()
     }
 
-    /** The background session's microphone was armed (from the visible app) or disarmed (stop, settings, permission). */
-    fun onArmed(now: Boolean) {
-        if (now == armed) return
+    /**
+     * The background session's microphone was armed (from the visible app) or disarmed (stop,
+     * settings, permission). Arming is refused while the app is not visible; returns whether the
+     * session is armed now.
+     */
+    fun onArmed(now: Boolean): Boolean {
+        if (now == armed) return armed
+        if (now && !visible) return false
         armed = now
         failures = 0
-        port.cancelRearm()
+        retrying = false
+        cancelRearm()
         if (now) {
+            wake.markResumed()
             wake.windowMs = WakeContract.BACKGROUND_WINDOW_MS
             rearm("session")
-            return
+            return true
         }
         wake.windowMs = WakeContract.WINDOW_MS
-        if (visible) return
+        if (visible) return false
         wake.onPause()
         port.cancelCapture("pause")
+        return false
     }
 
     /** The wake flow closed its window (or an episode) for [reason]. */
@@ -116,15 +159,15 @@ class WakePresence(private val wake: WakeDeviceController, private val port: Wak
         if (!armed) return
         val next = ContinuousWakePolicy.next(reason, failures) ?: return
         failures = if (next.failure) failures + 1 else 0
-        port.scheduleRearm(next.delayMs)
+        schedule(next)
     }
 
     /** A window could not open. [cooldownRemainingMs]: how long the playback cooldown still lasts. */
     fun onArmBlocked(block: WakeBlock, cooldownRemainingMs: Long) {
         if (!armed) return
         when (block) {
-            WakeBlock.COOLDOWN -> port.scheduleRearm(cooldownRemainingMs + ContinuousWakePolicy.COOLDOWN_MARGIN_MS)
-            WakeBlock.PHONE_UNREACHABLE, WakeBlock.MICROPHONE_MUTED -> port.scheduleRearm(ContinuousWakePolicy.BLOCKED_RETRY_MS)
+            WakeBlock.COOLDOWN -> schedule(Rearm(cooldownRemainingMs + ContinuousWakePolicy.COOLDOWN_MARGIN_MS, failure = false))
+            WakeBlock.PHONE_UNREACHABLE, WakeBlock.MICROPHONE_MUTED -> schedule(Rearm(ContinuousWakePolicy.BLOCKED_RETRY_MS, failure = true))
             else -> Unit
         }
     }
@@ -136,10 +179,24 @@ class WakePresence(private val wake: WakeDeviceController, private val port: Wak
     }
 
     fun onRearmDue() {
+        pendingRearm = null
         if (armed) rearm("rearm")
     }
 
+    private fun schedule(next: Rearm) {
+        pendingRearm = next
+        retrying = next.failure
+        port.scheduleRearm(next.delayMs)
+    }
+
+    private fun cancelRearm() {
+        pendingRearm = null
+        port.cancelRearm()
+    }
+
     private fun rearm(source: String) {
-        if (!unavailable) wake.rearm(source)
+        if (unavailable) return
+        // A window that opens means the loop works again; one that is blocked schedules its own retry.
+        if (wake.rearm(source) == null) retrying = false
     }
 }

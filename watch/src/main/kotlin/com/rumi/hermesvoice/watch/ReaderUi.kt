@@ -49,8 +49,8 @@ import androidx.wear.compose.material.ChipDefaults
 import androidx.wear.compose.material.CompactChip
 import androidx.wear.compose.material.MaterialTheme
 import androidx.wear.compose.material.Text
-import com.rumi.hermesvoice.core.background.BackgroundStatus
 import com.rumi.hermesvoice.core.background.BackgroundText
+import com.rumi.hermesvoice.core.background.WatchVoiceStatus
 import com.rumi.hermesvoice.core.watchlink.LoadStatus
 import com.rumi.hermesvoice.core.watchlink.ReaderError
 import com.rumi.hermesvoice.core.watchlink.ReaderHistory
@@ -250,7 +250,7 @@ fun SessionsSurface(
 /** Big Talk/Send button used when no conversation is open. */
 @Composable
 fun TalkHome(phone: Boolean?, talk: WatchTalkState, wakeEnabled: Boolean, wakeListening: Boolean, wakeUnavailable: Boolean,
-             background: BackgroundStatus, onTalk: () -> Unit, onBackground: () -> Unit) {
+             background: WatchVoiceStatus, onTalk: () -> Unit, onBackground: () -> Unit) {
     Column(Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 14.dp),
         horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
         Text(
@@ -276,10 +276,10 @@ fun TalkHome(phone: Boolean?, talk: WatchTalkState, wakeEnabled: Boolean, wakeLi
             textAlign = TextAlign.Center, maxLines = 3,
         )
         // The background session: what it really does now, and what a tap does. Started and stopped only here (or Stop in its notification).
-        Text("${BackgroundText.watchLabel(background, recognizer = !wakeUnavailable)}\n${BackgroundText.watchAction(background)}",
+        Text("${BackgroundText.watchLabel(background.session, background.loop)}\n${BackgroundText.watchAction(background.session, background.notification)}",
             Modifier.padding(top = 2.dp).clip(RoundedCornerShape(10.dp)).background(MaterialTheme.colors.surface)
                 .clickable(onClick = onBackground).padding(horizontal = 8.dp, vertical = 2.dp).testTag("background"),
-            color = if (background.running) MaterialTheme.colors.secondary else MaterialTheme.colors.onSurfaceVariant,
+            color = if (background.session.running) MaterialTheme.colors.secondary else MaterialTheme.colors.onSurfaceVariant,
             style = MaterialTheme.typography.caption3, textAlign = TextAlign.Center, maxLines = 3)
         Text("Swipe left for conversations", color = MaterialTheme.colors.onSurfaceVariant,
             style = MaterialTheme.typography.caption3, textAlign = TextAlign.Center)

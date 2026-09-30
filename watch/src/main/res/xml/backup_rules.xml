@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- This install's background opt-in and "asked" flag (DeviceLocalFlags): never restored elsewhere. -->
+    <exclude domain="sharedpref" path="hermes_voice_watch_local.xml" />
+</full-backup-content>

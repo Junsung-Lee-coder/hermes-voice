@@ -2,4 +2,6 @@
 <full-backup-content>
     <!-- Keystore-sealed bearer pair: undecryptable elsewhere and must never migrate. -->
     <exclude domain="sharedpref" path="hermes_voice_secure.xml" />
+    <!-- This install's background opt-in and "asked" flag (DeviceLocalFlags): never restored elsewhere. -->
+    <exclude domain="sharedpref" path="hermes_voice_device_local.xml" />
 </full-backup-content>

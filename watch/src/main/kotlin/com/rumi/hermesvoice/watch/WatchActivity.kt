@@ -41,6 +41,7 @@ import com.rumi.hermesvoice.core.watchlink.SwipeDirection
 import com.rumi.hermesvoice.core.watchlink.TurnTrigger
 import com.rumi.hermesvoice.core.watchlink.WatchLinkPaths
 import java.io.File
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 
@@ -62,11 +63,18 @@ class WatchActivity : ComponentActivity() {
     /** A tap on Start that waits for the notification prompt to close and the activity to be back on screen. */
     private var startBackgroundPending = false
 
-    private val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) voice.onPermissionGranted()
+    /** The settings read of the current show; cancelled when the app leaves the screen. */
+    private var settingsPull: Job? = null
+
+    private val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        voice.onPermissionResult()
     }
 
-    /** Asked once, at the first Start: the session runs either way, the prompt only decides whether its notification shows. */
+    /**
+     * Asked at Start while notifications aren't allowed (Android 13+; the system stops asking after
+     * repeated refusals). The session starts whatever the answer; the platform's answer, read again
+     * then, decides whether it may listen (see WatchVoiceCoordinator.block).
+     */
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
         startBackgroundPending = true
         if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) startBackgroundNow()
@@ -81,7 +89,7 @@ class WatchActivity : ComponentActivity() {
             val reader by app.reader.collectAsStateWithLifecycle()
             val listening by voice.wakeListening.collectAsStateWithLifecycle()
             val unavailable by voice.wakeUnavailable.collectAsStateWithLifecycle()
-            val background by voice.backgroundStatus.collectAsStateWithLifecycle()
+            val background by voice.voiceStatus.collectAsStateWithLifecycle()
             val chatFocus = remember { FocusRequester() }
             val sessionsFocus = remember { FocusRequester() }
             val onScrollStep = { app.haptic(HapticEvent.SCROLL_STEP) }
@@ -126,12 +134,14 @@ class WatchActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        voice.onActivityResumed()
-        // Reachability and the synced settings item first; only then may the Watch listen.
-        lifecycleScope.launch {
+        val visit = voice.onActivityResumed()
+        // Reachability and the synced settings item first; only then may the Watch listen. The read
+        // belongs to this show: leaving the screen cancels it, and a late one is ignored anyway.
+        settingsPull?.cancel()
+        settingsPull = lifecycleScope.launch {
             app.refreshPhoneReachable()
             pullSettings()
-            voice.onSettingsPulled()
+            voice.onSettingsPulled(visit)
         }
         // Titles for the chat header and the browser; the open conversation is re-read for new messages.
         if (app.reader.value.sessions.status == LoadStatus.IDLE) app.loadSessions()
@@ -155,6 +165,8 @@ class WatchActivity : ComponentActivity() {
     }
 
     override fun onPause() {
+        settingsPull?.cancel()
+        settingsPull = null
         // Without an armed background session this ends listening and any recording, unsent (WakePresence).
         voice.onActivityPaused()
         super.onPause()
@@ -164,8 +176,9 @@ class WatchActivity : ComponentActivity() {
 
     /**
      * The control on the home screen: Stop when a session runs, otherwise Start. Start happens
-     * here, in the visible activity, and nowhere else. The first Start asks whether the app may
-     * show its notification (Android 13+); the session starts whatever the answer.
+     * here, in the visible activity, and nowhere else. While notifications aren't allowed, Start
+     * asks for them (Android 13+); the session starts whatever the answer, but without them it
+     * only plays replies: a hidden microphone always has its notification and Stop.
      */
     private fun onBackgroundPressed() {
         if (voice.backgroundStatus.value.running) {
@@ -173,10 +186,8 @@ class WatchActivity : ComponentActivity() {
             return voice.stopBackground()
         }
         val ask = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
-            !app.localStore.getBoolean(KEY_NOTIFICATIONS_ASKED, false)
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         if (!ask) return startBackgroundNow()
-        app.localStore.putBoolean(KEY_NOTIFICATIONS_ASKED, true)
         notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
 
@@ -285,7 +296,6 @@ class WatchActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "HermesVoiceWatch"
-        private const val KEY_NOTIFICATIONS_ASKED = "notifications_asked"
         private const val QA_WAKE_HANDOFF = "hv_qa_wake_handoff"
         private const val QA_RECOGNIZER = "hv_qa_recognizer"
         private const val QA_WAKE_HEARD = "hv_qa_wake_heard"

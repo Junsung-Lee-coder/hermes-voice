@@ -187,6 +187,27 @@ class WakeDeviceController(
         disable("pause")
     }
 
+    /**
+     * The app is on screen again while a background session keeps this device listening: the flow
+     * counts as shown again without starting a new generation, so a window, handoff or recording
+     * under way goes on (compare [onResume], which starts over).
+     */
+    fun markResumed() {
+        resumed = true
+    }
+
+    /** A recognizer window is open. */
+    val listening: Boolean get() = window.listening
+
+    /** When the open window gives up without the phrase (it moves later while partial results keep changing). */
+    fun windowDeadlineMs(): Long = window.deadline()
+
+    /**
+     * Between the phrase and the recorder: a claim asked or held without a recording, a handoff
+     * waiting for the Phone's answer, or the microphone handoff pause.
+     */
+    val episodePending: Boolean get() = !capturing && (claim != null || heldHandoff != null || handoffGate.pending)
+
     fun onScreenOff() {
         cancelHandoff()
         heldHandoff = null
