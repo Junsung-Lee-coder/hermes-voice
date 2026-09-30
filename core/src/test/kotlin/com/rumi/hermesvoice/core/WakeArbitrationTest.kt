@@ -184,7 +184,14 @@ class WakeArbitrationTest {
         override fun scheduleHandoff(delayMs: Long) { calls += "handoff" }
         override fun cancelHandoff() {}
         override fun startRequestCapture(silenceMs: Long) = error("unused")
-        override fun startRequestCapture(silenceMs: Long, claimId: String?): Boolean { calls += "capture"; captureClaim = claimId; return true }
+        override fun startRequestCapture(silenceMs: Long, claimId: String?): Boolean {
+            calls += "capture"
+            captureClaim = claimId
+            // As on the Watch: starting the recorder makes the talk state busy, which reports back at once.
+            if (busyOnCaptureStart) controller.onBusy()
+            return true
+        }
+        var busyOnCaptureStart = false
         override fun cancelRequestCapture(reason: String) { calls += "cancel_capture:$reason" }
         override fun sendRecognized(request: String) = error("unused")
         override fun sendRecognized(request: String, claimId: String?) { calls += "send:$request"; outcomes += submit(request, claimId) }
@@ -288,6 +295,24 @@ class WakeArbitrationTest {
         assertTrue("$sent", sent is VoiceTurnOutcome.Completed)
         assertEquals(1, delivered(r))
         assertTrue("one claim, one request", r.phone.submit(null, r.phone.captureClaim) is VoiceTurnOutcome.NotAdmitted)
+    }
+
+    @Test
+    fun `the winner keeps its claim when starting its recorder reports busy, as on the watch`() = rig { r ->
+        // Found on the paired emulators: the Watch released its claim as its recorder started, so the Phone was granted too.
+        r.watch.busyOnCaptureStart = true
+        r.watch.hears("루미", final = true)
+        assertTrue(r.watch.controller.onHandoffDue(captureIdle = true))
+        assertFalse(r.watch.calls.toString(), r.watch.calls.contains("release_claim"))
+        assertEquals(VoiceOrigin.WATCH, r.h.core.wakeAdmission.holder())
+        r.phone.hears("루미", final = true)
+        assertTrue(r.phone.calls.contains("closed:wake_taken"))
+        assertFalse(r.phone.controller.onHandoffDue(captureIdle = true))
+        assertFalse(r.phone.calls.contains("capture"))
+        val sent = r.watch.submit(null, r.watch.captureClaim)
+        r.watch.controller.onRequestCaptureEnded(sent = true)
+        assertTrue("$sent", sent is VoiceTurnOutcome.Completed)
+        assertEquals(1, delivered(r))
     }
 
     @Test

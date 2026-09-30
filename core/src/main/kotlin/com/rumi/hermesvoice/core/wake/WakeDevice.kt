@@ -237,6 +237,8 @@ class WakeDeviceController(
             return false
         }
         if (arbitrated && claim?.granted != true) return false
+        // Marked before the recorder starts: starting it reports "busy", which must not give the claim back.
+        capturing = true
         capturing = port.startRequestCapture(VadSilence.millis(settings.vadSilenceSeconds), claim?.id)
         if (!capturing) releaseClaim()
         return capturing

@@ -435,7 +435,7 @@ builds ignore them.
 
 Only the following has been run:
 
-- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **256 JUnit tests**, all
+- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **257 JUnit tests**, all
   passing. They use an in-process fake dashboard and cover sign-in, session ownership, chat and
   attachments, routing, playback routing, the Watch link and reader contracts, the wake contract
   (final-only, leading wake phrase, contradicted or empty finals, 30/60/120-second recognizer
