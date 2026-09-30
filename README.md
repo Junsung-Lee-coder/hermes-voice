@@ -573,11 +573,11 @@ Only the following has been run:
     recording one, both stopped the recording without sending it.
   - *Push-to-talk:* on both devices a recording with 6 seconds of silence after the speech was
     sent only on the tap; a silent Phone recording was refused before speech-to-text.
-  - *After the VAD review repair:* a 75-second request with a 2.5-second held "uhh" at speech
+  - *Held sounds and noise bursts:* a 75-second request with a 2.5-second held "uhh" at speech
     level in the middle (Watch and Phone), and one with a 4-second steady noise burst at speech
-    level (Watch), were recorded whole and ended 2.0 s after the speech; the earlier build cut
-    such requests and sent them truncated. Most of these runs used the build just before the last
-    two fixes, which did not touch the ending; the held-sound run was repeated on the last build. Speech that was already under way when the
+    level (Watch), were recorded whole and ended 2.0 s after the speech; an early build cut
+    such requests and sent them truncated. Both were repeated on the Watch with the current build
+    (synthesized voice), with the same result; the rest of this item is from an earlier build. Speech that was already under way when the
     recorder started was detected and sent complete. Push-to-talk speech about 4 dB above steady
     noise was accepted and answered on both devices; the same noise alone was refused before
     speech-to-text on both. Tapping Talk while the Phone's real recognizer was listening released
@@ -601,7 +601,7 @@ Only the following has been run:
     two app conversations plus the hidden routing session. Whether to create was the model's own
     choice in these runs; forced replies (refusals, malformed replies, failures, restarts) were
     exercised only in the unit tests against the fake dashboard.
-  - *After the routing review repair:* the build was installed over a Phone whose saved data for
+  - *Saved data from an earlier build, and the create ack (an earlier build):* the build was installed over a Phone whose saved data for
     a test dashboard had been created by an earlier build (one conversation and a routing session
     seeded with the first routing instructions). The first spoken request replaced the routing
     session once: the saved data then held the old one marked retired and a new one, and the
@@ -620,13 +620,48 @@ Only the following has been run:
     returned Latin text for the Korean recordings, so the English wording was used. Failed and
     unreadable storage, restarts between steps, alias races and the interrupted or unverifiable
     replacement of the routing session were exercised only in the unit tests.
+  - *Room recordings and recorded human speech (current build):* recordings of real rooms
+    (DEMAND, CC BY 4.0) and of people reading aloud (Mini LibriSpeech, CC BY 4.0), mixed offline,
+    were played into the microphones. With nobody speaking after the buzz (recorder started by
+    the simulated recognizer), 40 seconds of a living room, a cafeteria and an office each ended
+    as "Didn't hear a request" on the Watch with nothing sent, as did twelve further 20-second
+    stretches (three per room, kitchen included) and the office on the Phone. **The 40-second
+    kitchen recording, which has dishes clattering, was still recorded as a request for about
+    37 seconds on both devices, sent, transcribed into a few words and answered**, as on the
+    build before; loud, irregular household sounds are not told apart from speech. About a
+    minute of read speech 15 dB above the kitchen (Phone), with pauses between sentences, and a
+    ten-second sentence above the living room (Watch), were recorded whole, ended 2.0 and 1.9 s
+    after the last word while the room kept playing, and were transcribed completely. With
+    push-to-talk, a small voice 6 and 10 dB above the cafeteria was accepted, transcribed and
+    answered on both devices. Eight seconds of the cafeteria alone **passed the recording check
+    on both devices**; speech-to-text then returned nothing and the request ended as "no
+    speech" with nothing delivered.
+  - *Words said one at a time (current build):* eight synthesized words with 450 ms between
+    them, after a wake on the Watch, were recorded whole and ended 1.96 s after the last word.
+    Ten seconds of synthetic 160 ms syllables 240 ms apart ended 2.0 s after the last one; the
+    build before ended that recording 0.84 s after it.
+  - *Both and the wake location (current build, simulated recognizers, so this tests the flow
+    and not recognition):* with a debug delay holding a finished Watch recording back for 25
+    seconds, the Watch kept renewing its claim every 3 seconds, a wake on the Phone during the
+    wait was refused as "the other device is answering", and the recording was then accepted and
+    answered on the Watch. With both recognizers reporting one wake and the Watch's result
+    arriving 4.5 s late, only the Phone recorded and the Watch showed that the other device
+    answered. With the Watch's result arriving after the Phone's short request had been
+    accepted, the Watch's window had already closed and the late result started nothing. Each
+    run produced one request. Changing the wake location on the Phone while the Watch was
+    recording a wake request cancelled it unsent, and the Watch showed "Wake settings changed.
+    Say it again".
+  - *Routing (current build):* a spoken Phone request created a conversation with the composed
+    ack naming the registered title and alias, and the next request on that topic reused it.
   - *Earlier builds:* Watch reader, gestures, bezel scrolling and haptics, Watch playback with
     `played` ACKs, and playback switching between devices.
 
 **Never run:** wake-phrase recognition on the Watch (the Watch emulator has no speech recognition
 service, so its recorder was started by the debug handoff), Korean wake-phrase recognition, and
 anything on physical devices, including audio routing, haptic strength, real room acoustics and
-a physical bezel. The emulator microphone occasionally delivers digital silence; those runs ended
+a physical bezel. Live human speech and live room sound were never used: the human
+speech and rooms above are published recordings played through the audio cable, and the other
+spoken stimuli are synthesized voices. The emulator microphone occasionally delivers digital silence; those runs ended
 as "no speech" and were repeated.
 
 ## Known limitations
