@@ -125,6 +125,10 @@ class WatchTurnIntake(
         }
         val states = Channel<TurnStateMessage>(Channel.UNLIMITED)
         val listener = object : VoiceTurnListener {
+            // Told at once, before the turn waits its place in line: the Watch keeps its wake claim until this.
+            override fun onAccepted(turnId: String, origin: VoiceOrigin) {
+                states.trySend(TurnStateMessage(turnId, "accepted", "", false))
+            }
             override fun onStage(turnId: String, stage: VoiceTurnStage) {
                 states.trySend(TurnStateMessage(turnId, stage.name.lowercase(), "", false))
             }
@@ -170,7 +174,8 @@ object VoiceOutcomeText {
         VoiceTurnOutcome.NoSpeech -> "No speech detected"
         is VoiceTurnOutcome.Duplicate -> "Duplicate turn ignored"
         is VoiceTurnOutcome.NotAdmitted ->
-            if (outcome.reason.startsWith("wake_claim")) "Not sent: the wake phrase was answered elsewhere or timed out. Say it again"
+            if (outcome.reason == "wake_claim_missing") "Not sent: the wake settings changed while you spoke. Say it again"
+            else if (outcome.reason.startsWith("wake_claim")) "Not sent: the wake phrase was answered elsewhere or timed out. Say it again"
             else "Not sent: ${outcome.reason.take(120)}"
     }
 }

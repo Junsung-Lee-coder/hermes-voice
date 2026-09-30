@@ -109,6 +109,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var phoneWake: PhoneWakeController
     private var qaWakeHandoffPending = false
     private var qaHeardPending: Pair<String, Boolean>? = null
+    private var qaHeardDelayMs = QA_HEARD_DELAY_MS
     private var recognizerAvailable by mutableStateOf(false)
     private val handoffRunnable: Runnable = Runnable {
         if (!phoneWake.wake.onHandoffDue(captureIdle = model.voiceIdle())) Log.i(TAG, "phone wake handoff dropped gen=${phoneWake.wake.generation}")
@@ -173,9 +174,11 @@ class MainActivity : ComponentActivity() {
 
         override fun newClaimId(): String = "p-" + UUID.randomUUID().toString()
 
-        override fun request(claimId: String, settingsRevision: Long, generation: Long) {
-            val verdict = admission()?.claim(WakeClaim(claimId, VoiceOrigin.PHONE, "", settingsRevision, generation)) ?: ClaimVerdict.EXPIRED
-            Log.i(TAG, "phone wake claim ${claimId.take(10)} gen=$generation verdict=$verdict")
+        override fun epoch(): Long = admission()?.epoch ?: 0L
+
+        override fun request(claimId: String, settingsRevision: Long, generation: Long, epoch: Long) {
+            val verdict = admission()?.claim(WakeClaim(claimId, VoiceOrigin.PHONE, "", settingsRevision, generation, epoch)) ?: ClaimVerdict.EXPIRED
+            Log.i(TAG, "phone wake claim ${claimId.take(10)} gen=$generation epoch=$epoch verdict=$verdict")
             window.decorView.post { phoneWake.wake.onClaimVerdict(claimId, verdict) }
         }
 
@@ -242,6 +245,10 @@ class MainActivity : ComponentActivity() {
         }
         // Phone-owned settings: a mode that excludes the Phone stops listening and any hands-free capture at once.
         lifecycleScope.launch { model.state.map { it.watch }.distinctUntilChanged().collect { phoneWake.wake.onSettings(it) } }
+        // Both: a wake request was admitted (from the Watch, or this Phone's own): a window that was already listening closes.
+        lifecycleScope.launch {
+            PhoneApp.from(this@MainActivity).wakeEpisodes.collect { episode -> episode?.let { phoneWake.wake.onEpisodeAnswered(it.epoch, it.claimId) } }
+        }
         // Push-to-talk or a turn in flight closes the window; idle again may re-arm (once per visibility generation).
         lifecycleScope.launch {
             model.state.map { it.recording || it.voiceBusy }.distinctUntilChanged().collect { busy ->
@@ -258,7 +265,7 @@ class MainActivity : ComponentActivity() {
         qaHeardPending?.let { (text, final) ->
             qaHeardPending = null
             // After the resume's window opened: the simulated recognizer reports this result.
-            window.decorView.postDelayed({ phoneWake.qaHeard(text, final) }, QA_HEARD_DELAY_MS)
+            window.decorView.postDelayed({ phoneWake.qaHeard(text, final) }, qaHeardDelayMs)
         }
         if (qaWakeHandoffPending) {
             qaWakeHandoffPending = false
@@ -310,10 +317,11 @@ class MainActivity : ComponentActivity() {
         val recognizer = intent.getStringExtra(QA_RECOGNIZER)
         val heard = intent.getStringExtra(QA_WAKE_HEARD)
         val heardFinal = intent.getBooleanExtra(QA_WAKE_FINAL, true)
+        val heardDelay = intent.getStringExtra(QA_WAKE_DELAY)?.toLongOrNull()?.coerceIn(0L, WakeContract.WINDOW_MS - 300)
         if (name == null && handoff == null && location == null && silence == null && recognizer == null && heard == null) return
         val fromHistory = intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0
         val handled = intent.getBooleanExtra(QA_HANDLED, false)
-        listOf(QaAudio.EXTRA, QA_WAKE_HANDOFF, QA_WAKE_LOCATION, QA_VAD_SILENCE, QA_RECOGNIZER, QA_WAKE_HEARD, QA_WAKE_FINAL).forEach(intent::removeExtra)
+        listOf(QaAudio.EXTRA, QA_WAKE_HANDOFF, QA_WAKE_LOCATION, QA_VAD_SILENCE, QA_RECOGNIZER, QA_WAKE_HEARD, QA_WAKE_FINAL, QA_WAKE_DELAY).forEach(intent::removeExtra)
         intent.putExtra(QA_HANDLED, true)
         setIntent(intent)
         if (!QaLaunchGuard.shouldHandle(restored, fromHistory, handled)) return
@@ -326,7 +334,10 @@ class MainActivity : ComponentActivity() {
         }
         if (handoff == "second_utterance") qaWakeHandoffPending = true
         if (recognizer != null) phoneWake.qaFixtureRecognizer = recognizer == "fixture"
-        if (heard != null) qaHeardPending = heard to heardFinal
+        if (heard != null) {
+            qaHeardPending = heard to heardFinal
+            qaHeardDelayMs = heardDelay ?: QA_HEARD_DELAY_MS
+        }
         val file = name?.let { QaAudio.resolve(File(filesDir, QaAudio.DIR), it) } ?: return
         Log.i("HermesVoice", "qa audio submitted as a phone voice request bytes=${file.length()}")
         model.submitQaWav(file.readBytes())
@@ -341,6 +352,7 @@ class MainActivity : ComponentActivity() {
         const val QA_RECOGNIZER = "hv_qa_recognizer"
         const val QA_WAKE_HEARD = "hv_qa_wake_heard"
         const val QA_WAKE_FINAL = "hv_qa_wake_final"
+        const val QA_WAKE_DELAY = "hv_qa_wake_delay_ms"
         const val QA_HEARD_DELAY_MS = 600L
     }
 

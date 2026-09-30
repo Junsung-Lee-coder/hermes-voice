@@ -37,6 +37,9 @@ object WatchLinkPaths {
     /** Watch → Phone: claim, renew or release the wake episode ("Both"); Phone → that Watch: the verdict. */
     const val WAKE_CLAIM = "/hv/v1/wake/claim"
     const val WAKE_VERDICT = "/hv/v1/wake/verdict"
+
+    /** Phone → Watch data item: how many wake requests have been answered (see `WakeEpochItem`). */
+    const val WAKE_EPOCH = "/hv/v1/wake/epoch"
     const val CAPABILITY_PHONE = "hermes_voice_phone"
     const val CAPABILITY_WATCH = "hermes_voice_watch"
 

@@ -14,12 +14,16 @@ enum class EndpointDecision { CONTINUE, END_OF_SPEECH, NO_SPEECH }
  *   [calibrated] then turns true, which is when the device cues "speak now", so the request itself
  *   is never part of the calibration.
  * - Until speech qualifies ([VadProfile.minSpeechMs]), [noSpeechTimeoutMs] counted from the cue
- *   ends a request that never started ([EndpointDecision.NO_SPEECH]: nothing is sent).
+ *   ends a request that never started ([EndpointDecision.NO_SPEECH]: nothing is sent). A steady
+ *   sound that started with nobody speaking first counts as speech, but once the detector absorbs
+ *   it as background ([EnergyVad.absorbingSteadyNoise]) the request is back to "not started", on
+ *   the same clock from the cue.
  * - Once speech started there is NO duration cap. The request ends after [silenceMs] (the user's
  *   "trailing silence" setting) of counted non-voice: background frames count fully, frames a
  *   little above it ([VadClass.GRAY], e.g. a fan that started) at half rate while the floor adapts
  *   to them, so such a tail still ends the request, within 2 × [silenceMs]. Voiced frames pause
- *   the count; [respeechMs] of renewed speech (dips tolerated) restarts it.
+ *   the count; [respeechMs] of renewed speech (dips tolerated) restarts it, which is the same bar
+ *   as the first speech, so words said one at a time keep the request open like the first one did.
  * Push-to-talk does not use this: it ends only when the user taps.
  */
 class SilenceEndpoint(
@@ -27,8 +31,8 @@ class SilenceEndpoint(
     val silenceMs: Long = 2_000,
     private val noSpeechTimeoutMs: Long = 8_000,
     private val calibrationMs: Long = 400,
-    private val respeechMs: Long = 200,
     private val profile: VadProfile = VadProfile.HANDS_FREE,
+    private val respeechMs: Long = profile.minSpeechMs,
 ) {
     private enum class Phase { CALIBRATING, ARMED, SPEECH, SILENCE, DONE }
 
@@ -37,7 +41,10 @@ class SilenceEndpoint(
     private var phase = Phase.CALIBRATING
     private val calibration = ArrayList<Double>()
     private var vad: EnergyVad? = null
-    private var armedMs = 0L
+    private var cuedAtMs = 0L
+
+    /** Something was said and ended before: whatever follows belongs to a request that did start. */
+    private var pausedBefore = false
     private var quietMs = 0L
 
     /** Audio time processed so far, in ms. */
@@ -73,7 +80,8 @@ class SilenceEndpoint(
             calibration += level
             if (calibration.size * frameMs >= calibrationMs) {
                 val sorted = calibration.sorted()
-                vad = EnergyVad(profile, max(profile.minFloor, sorted[(sorted.size - 1) / 4]))
+                vad = EnergyVad(profile, max(profile.minFloor, sorted[(sorted.size - 1) / 4]), calibration.toDoubleArray())
+                cuedAtMs = elapsedMs
                 phase = Phase.ARMED
             }
             return EndpointDecision.CONTINUE
@@ -82,20 +90,26 @@ class SilenceEndpoint(
         val cls = vad.observe(level, frameMs)
         if (cls == VadClass.VOICED) lastVoicedEndMs = elapsedMs
         when (phase) {
-            Phase.ARMED -> {
-                armedMs += frameMs
-                if (vad.qualified) {
-                    phase = Phase.SPEECH
-                    speechDetected = true
-                } else if (armedMs >= noSpeechTimeoutMs) {
-                    phase = Phase.DONE
-                    return EndpointDecision.NO_SPEECH
-                }
+            Phase.ARMED -> if (vad.qualified) {
+                phase = Phase.SPEECH
+                speechDetected = true
+            } else if (notStarted()) {
+                return EndpointDecision.NO_SPEECH
             }
             Phase.SPEECH -> if (cls != VadClass.VOICED) {
-                phase = Phase.SILENCE
-                quietMs = weight(cls)
-                vad.resetRun()
+                if (!pausedBefore && !vad.voiceHeard && vad.absorbingSteadyNoise) {
+                    // What qualified was steady noise that started with nobody speaking: not a request yet.
+                    phase = Phase.ARMED
+                    speechDetected = false
+                    lastVoicedEndMs = -1
+                    vad.forgetSpeech()
+                    if (notStarted()) return EndpointDecision.NO_SPEECH
+                } else {
+                    phase = Phase.SILENCE
+                    pausedBefore = true
+                    quietMs = weight(cls)
+                    vad.resetRun()
+                }
             }
             Phase.SILENCE -> {
                 if (cls != VadClass.VOICED) quietMs += weight(cls)
@@ -114,6 +128,13 @@ class SilenceEndpoint(
     }
 
     private fun weight(cls: VadClass): Long = if (cls == VadClass.QUIET) frameMs else frameMs / 2
+
+    /** No request [noSpeechTimeoutMs] after the cue: ends the capture as "no speech". */
+    private fun notStarted(): Boolean {
+        if (elapsedMs - cuedAtMs < noSpeechTimeoutMs) return false
+        phase = Phase.DONE
+        return true
+    }
 
     companion object {
         /** A hands-free endpoint for a validated trailing-silence setting (see VadSilence). */

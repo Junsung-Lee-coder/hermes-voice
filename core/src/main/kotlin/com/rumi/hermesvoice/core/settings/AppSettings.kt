@@ -199,6 +199,11 @@ class AppSettings(private val store: KeyValueStore) {
             store.putBoolean(KEY_WATCH_WAKE, value.listensOn(VoiceOrigin.WATCH))
         }
 
+    /** How many wake requests the Phone has answered (see [com.rumi.hermesvoice.core.wake.WakeAdmission]); kept across restarts. */
+    var wakeEpoch: Long
+        get() = store.getString(KEY_WAKE_EPOCH)?.toLongOrNull()?.takeIf { it >= 0 } ?: 0L
+        set(value) = store.putString(KEY_WAKE_EPOCH, value.toString())
+
     /** Trailing silence for hands-free requests; a missing or invalid stored value reads as 2.0 s. */
     var vadSilenceSeconds: Double
         get() = VadSilence.validOrNull(store.getString(KEY_VAD_SILENCE)?.toDoubleOrNull()) ?: VadSilence.DEFAULT_SECONDS
@@ -266,6 +271,7 @@ class AppSettings(private val store: KeyValueStore) {
         const val KEY_WATCH_WAKE = "watch_wake_phrase_enabled"
         const val KEY_WAKE_LOCATION = "wake_location"
         const val KEY_VAD_SILENCE = "vad_silence_seconds"
+        const val KEY_WAKE_EPOCH = "wake_epoch"
         const val KEY_WATCH_WAKE_PATTERNS = "watch_wake_patterns"
         const val KEY_WATCH_HAPTICS = "watch_haptics_enabled"
         const val KEY_WATCH_REVISION = "watch_settings_revision"

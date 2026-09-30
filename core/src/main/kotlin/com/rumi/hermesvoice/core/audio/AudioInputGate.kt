@@ -3,8 +3,10 @@ package com.rumi.hermesvoice.core.audio
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.abs
+import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.sqrt
 
 enum class AudioInputVerdict {
@@ -30,15 +32,22 @@ enum class AudioInputVerdict {
  * - [AudioInputVerdict.INVALID]: unreadable, not 16-bit PCM, or under [MIN_AUDIO_MS];
  * - [AudioInputVerdict.SILENT]: peak below [MIN_PEAK] (about −44 dBFS), far below soft speech;
  * - [AudioInputVerdict.NO_SPEECH_ENERGY]: the shared [EnergyVad] ([VadProfile.ELIGIBILITY], 20 ms
- *   frames, fixed floor = the recording's 10th-percentile frame level) never qualifies speech
- *   (nothing half again above the background for [VadProfile.MIN_SPEECH_MS], short dips
- *   tolerated), or everything loud in it is one steady level: at least half a second of loud
- *   frames, none of whose 1 s stretches varies by [MODULATION_RATIO] (steady noise that started
- *   and stopped during the recording, a hum, a held tone).
+ *   frames, fixed floor = the recording's 10th-percentile frame level) never qualifies speech, or
+ *   everything loud in it is one steady level.
+ *   - How far above the floor counts as loud depends on how much the background itself varies.
+ *     With a steady background it is half again above it ([VadProfile.onsetRatio]). The variation
+ *     is measured around the floor, where speech cannot be: from the 2nd percentile (frames under
+ *     half the floor are dropouts, not background) to the 25th. Loud is [SPREAD_FACTOR] × that
+ *     (scaled to one standard deviation), at most [MAX_ONSET_DB]: about three deviations above the
+ *     background's typical level, so a background that merely wanders is not taken for speech.
+ *     Recordings under [MIN_SPREAD_FRAMES] frames keep the plain ratio.
+ *   - Steady: at least half a second of loud frames, none of whose 1 s stretches varies by
+ *     [MODULATION_RATIO] (steady noise that started and stopped during the recording, a hum, a
+ *     held tone).
  *
- * It is an energy test, not a speech detector: changing non-speech sound passes it (and may still
- * be mis-transcribed), and it deliberately leans towards letting soft and short speech through,
- * including speech a few dB above loud steady noise.
+ * It is an energy test, not a speech detector: loud changing non-speech sound passes it (and may
+ * still be mis-transcribed), and speech must stand out from its background: a few dB above steady
+ * noise is enough, above a background that itself swings by several dB it takes more.
  */
 object AudioInputGate {
     const val MIN_AUDIO_MS = 100L
@@ -50,6 +59,18 @@ object AudioInputGate {
 
     /** Loud frames of speech differ by far more than this; those of steady noise by a few percent. */
     const val MODULATION_RATIO = 1.2
+
+    /** A recording this short says too little about its background's variation. */
+    const val MIN_SPREAD_FRAMES = 50
+
+    /** The onset above the floor, in standard deviations of the background (in dB) counted from its 10th percentile. */
+    const val SPREAD_FACTOR = 5.0
+
+    /** The highest onset the background's variation can ask for (4 × the floor). */
+    const val MAX_ONSET_DB = 12.0
+
+    /** The 2nd to the 25th percentile of a normal distribution span this many standard deviations. */
+    private const val SPREAD_SPAN = 1.38
 
     /** Recordings in formats this gate cannot read (none today) are left to the dashboard. */
     fun assess(audio: ByteArray, mimeType: String): AudioInputVerdict {
@@ -70,7 +91,10 @@ object AudioInputGate {
             sqrt(sum / frameSamples)
         }
         if (peak < MIN_PEAK) return AudioInputVerdict.SILENT
-        val vad = EnergyVad(VadProfile.ELIGIBILITY, levels.sorted()[(levels.size - 1) / 10])
+        val ordered = levels.sortedArray()
+        val reference = ordered[(ordered.size - 1) / 10]
+        val onset = onsetRatio(ordered, reference, VadProfile.ELIGIBILITY.onsetRatio)
+        val vad = EnergyVad(VadProfile.ELIGIBILITY.copy(onsetRatio = onset, releaseRatio = onset), reference)
         val frameMs = PcmFramer.FRAME_MS.toLong()
         val recent = DoubleArray(MODULATION_WINDOW_FRAMES)
         val sorted = DoubleArray(MODULATION_WINDOW_FRAMES)
@@ -95,6 +119,19 @@ object AudioInputGate {
             voicedFrames < MIN_MODULATION_FRAMES || modulated -> AudioInputVerdict.USABLE
             else -> AudioInputVerdict.NO_SPEECH_ENERGY
         }
+    }
+
+    /** The plain onset, or a higher one when the background around [reference] varies (see the class comment). */
+    private fun onsetRatio(sorted: DoubleArray, reference: Double, plain: Double): Double {
+        val n = sorted.size
+        if (n < MIN_SPREAD_FRAMES || reference <= 0) return plain
+        var first = 0
+        while (first < n && sorted[first] < reference / 2) first++
+        val low = sorted[first + ((n - 1 - first) * 0.02).toInt()]
+        val high = sorted[((n - 1) * 0.25).toInt()]
+        if (low <= 0) return plain
+        val deviationDb = 20 * log10(high / low) / SPREAD_SPAN
+        return max(plain, 10.0.pow(min(MAX_ONSET_DB, SPREAD_FACTOR * deviationDb) / 20))
     }
 }
 

@@ -21,7 +21,11 @@ class CoreHarness(
     val tokens = InMemoryHermesTokenStore(HermesBearerSession(fake.accessToken, fake.refreshToken, null, "basic", "jun"))
     val settings = AppSettings(store).apply { dashboardUrl = fake.baseUrl }
     val registry = OwnedSessionRegistry(store)
-    private val wiring = HermesVoiceCore.connect(HermesDashboardEndpoint.parse(fake.baseUrl), http, tokens, registry, settings)
+
+    /** Added to the wall clock the wake claim leases run on, so a test can let time pass. */
+    @Volatile var clockOffsetMs = 0L
+    private val wiring = HermesVoiceCore.connect(HermesDashboardEndpoint.parse(fake.baseUrl), http, tokens, registry, settings,
+        clock = { System.currentTimeMillis() + clockOffsetMs })
     val core: HermesVoiceCore = wiring.first
 
     override fun close() {

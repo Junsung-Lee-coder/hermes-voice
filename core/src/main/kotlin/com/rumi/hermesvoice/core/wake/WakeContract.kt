@@ -46,14 +46,21 @@ object WakeContract {
     /** How long a wake claim lasts without renewal (see [WakeAdmission]). */
     const val CLAIM_TTL_MS = 10_000L
 
-    /** How often the holder renews its claim while it listens, hands off and records. */
+    /** How often the holder renews its claim while it listens, hands off, records and (Watch) waits for the Phone's answer. */
     const val CLAIM_RENEW_MS = 3_000L
 
     /** How long a device waits for the Phone's answer to a claim before failing closed. */
     const val CLAIM_TIMEOUT_MS = 2_500L
 
-    /** How long after a wake episode ends the other device's claim for it is still refused. */
-    const val CLAIM_SETTLE_MS = 3_000L
+    /** How long the Watch waits for one claim message to be handed to the Data Layer before giving that claim up. */
+    const val CLAIM_SEND_TIMEOUT_MS = 5_000L
+
+    /**
+     * The longest the Watch keeps a claim alive for a request it handed to the Phone and has not
+     * heard back about: a minute plus the time [bytes] take at 2 kB/s. The link normally answers or
+     * fails long before; this only bounds a transfer that hangs without either.
+     */
+    fun transitLimitMs(bytes: Int): Long = 60_000L + bytes / 2L
 }
 
 enum class WakeHandoff { SECOND_UTTERANCE, RECOGNIZED_REQUEST }

@@ -77,6 +77,7 @@ class WatchActivity : ComponentActivity() {
     private val wakeUnavailable = mutableStateOf(false)
     private var qaWakeHandoffPending = false
     private var qaHeardPending: Pair<String, Boolean>? = null
+    private var qaHeardDelayMs = QA_HEARD_DELAY_MS
     private lateinit var wake: WakeController
     private val handoffRunnable: Runnable = Runnable {
         if (!wake.wake.onHandoffDue(captureIdle = captures.activeId == null)) {
@@ -97,8 +98,9 @@ class WatchActivity : ComponentActivity() {
      */
     private val claimPort: WakeClaimPort = object : WakeClaimPort {
         override fun newClaimId(): String = "w-" + UUID.randomUUID().toString()
-        override fun request(claimId: String, settingsRevision: Long, generation: Long) =
-            app.sendWakeClaim(WakeClaimMessage(WakeClaimMessage.Op.CLAIM, claimId, settingsRevision, generation))
+        override fun epoch(): Long = app.wakeEpoch
+        override fun request(claimId: String, settingsRevision: Long, generation: Long, epoch: Long) =
+            app.sendWakeClaim(WakeClaimMessage(WakeClaimMessage.Op.CLAIM, claimId, settingsRevision, generation, epoch))
         override fun renew(claimId: String) = app.sendWakeClaim(WakeClaimMessage(WakeClaimMessage.Op.RENEW, claimId))
         override fun release(claimId: String) = app.sendWakeClaim(WakeClaimMessage(WakeClaimMessage.Op.RELEASE, claimId))
 
@@ -236,6 +238,7 @@ class WatchActivity : ComponentActivity() {
         wake = WakeController(this, wakePort, app.settings.value, claimPort)
         lifecycle.addObserver(wake)
         app.wakeVerdictListener = { claimId, verdict -> wake.wake.onClaimVerdict(claimId, verdict) }
+        app.wakeEpochListener = { epoch, claimId -> wake.wake.onEpisodeAnswered(epoch, claimId) }
         setContent {
             val talk by app.talk.collectAsStateWithLifecycle()
             val settings by app.settings.collectAsStateWithLifecycle()
@@ -306,7 +309,7 @@ class WatchActivity : ComponentActivity() {
         qaHeardPending?.let { (text, final) ->
             qaHeardPending = null
             // After this resume's window opened (it waits for the synced settings): the simulated recognizer's result.
-            window.decorView.postDelayed({ wake.qaHeard(text, final) }, QA_HEARD_DELAY_MS)
+            window.decorView.postDelayed({ wake.qaHeard(text, final) }, qaHeardDelayMs)
         }
         if (qaWakeHandoffPending) {
             qaWakeHandoffPending = false
@@ -321,6 +324,7 @@ class WatchActivity : ComponentActivity() {
 
     override fun onDestroy() {
         app.wakeVerdictListener = null
+        app.wakeEpochListener = null
         super.onDestroy()
     }
 
@@ -348,13 +352,21 @@ class WatchActivity : ComponentActivity() {
 
     private fun hasMic() = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
 
-    /** The settings data item may predate this install's listener; read it directly on resume. */
+    /**
+     * The settings data item may predate this install's listener; read it directly on resume, and
+     * with it the Phone's count of answered wake requests, which the next wake window must know.
+     */
     private suspend fun pullSettings() {
+        pullItem(WatchLinkPaths.SETTINGS, app::applySettings)
+        pullItem(WatchLinkPaths.WAKE_EPOCH, app::applyWakeEpoch)
+    }
+
+    private suspend fun pullItem(path: String, apply: (String) -> Unit) {
         runCatching {
             val items = Wearable.getDataClient(this).getDataItems(
-                Uri.Builder().scheme(PutDataRequest.WEAR_URI_SCHEME).path(WatchLinkPaths.SETTINGS).build()).await()
+                Uri.Builder().scheme(PutDataRequest.WEAR_URI_SCHEME).path(path).build()).await()
             try {
-                items.firstOrNull()?.let { DataMapItem.fromDataItem(it).dataMap.getString("json") }?.let(app::applySettings)
+                items.firstOrNull()?.let { DataMapItem.fromDataItem(it).dataMap.getString("json") }?.let(apply)
             } finally {
                 items.release()
             }
@@ -443,6 +455,7 @@ class WatchActivity : ComponentActivity() {
             "unavailable" -> "Wake phrase unavailable on this watch"
             "wake_taken" -> "The phone answered that wake phrase"
             "wake_claim_timeout", "wake_claim_failed" -> "Couldn't confirm with the phone. Say it again"
+            "wake_mode_changed" -> "Wake settings changed. Say it again"
             "recognizer_error_12", "recognizer_error_13" -> "The speech recognizer lacks the wake phrase language"
             else -> return
         }
@@ -459,7 +472,9 @@ class WatchActivity : ComponentActivity() {
     /**
      * `am start ... --es hv_qa_wav <name>.wav` uploads files/qa/<name>.wav as a push-to-talk turn;
      * `--es hv_qa_wake_handoff second_utterance` runs the wake handoff exactly as a recognizer match
-     * would (fixture: it proves the recorder path, not recognition); `--ei hv_qa_seed_reader <n>
+     * would (fixture: it proves the recorder path, not recognition); `--es hv_qa_upload_delay_ms <ms>`
+     * makes every upload wait before it is handed to the link (a slow transfer); `--es hv_qa_wake_delay_ms <ms>`
+     * is when the simulated recognizer reports its result; `--ei hv_qa_seed_reader <n>
      * [--el hv_qa_seed_newest <row>]` shows synthetic reader rows ([WatchApp.seedReaderForQa]).
      * Once per fresh launch intent.
      */
@@ -471,20 +486,30 @@ class WatchActivity : ComponentActivity() {
         val recognizer = intent.getStringExtra(QA_RECOGNIZER)
         val heard = intent.getStringExtra(QA_WAKE_HEARD)
         val heardFinal = intent.getBooleanExtra(QA_WAKE_FINAL, true)
-        if (wav == null && handoff == null && seed <= 0 && recognizer == null && heard == null) return
+        val heardDelay = intent.getStringExtra(QA_WAKE_DELAY)?.toLongOrNull()?.coerceIn(0L, WakeContract.WINDOW_MS - 300)
+        val uploadDelay = intent.getStringExtra(QA_UPLOAD_DELAY)?.toLongOrNull()?.coerceIn(0L, 120_000L)
+        if (wav == null && handoff == null && seed <= 0 && recognizer == null && heard == null && uploadDelay == null) return
         val fromHistory = intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0
         val handled = intent.getBooleanExtra(QA_HANDLED, false)
         intent.removeExtra(QaAudio.EXTRA)
         intent.removeExtra(QA_WAKE_HANDOFF)
         intent.removeExtra(QA_SEED_READER)
-        listOf(QA_RECOGNIZER, QA_WAKE_HEARD, QA_WAKE_FINAL).forEach(intent::removeExtra)
+        listOf(QA_RECOGNIZER, QA_WAKE_HEARD, QA_WAKE_FINAL, QA_WAKE_DELAY, QA_UPLOAD_DELAY).forEach(intent::removeExtra)
         intent.putExtra(QA_HANDLED, true)
         setIntent(intent)
         if (!QaLaunchGuard.shouldHandle(restored, fromHistory, handled)) return
         if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0 || captures.activeId != null) return
         if (recognizer != null) wake.qaFixtureRecognizer = recognizer == "fixture"
-        if (heard != null) qaHeardPending = heard to heardFinal
-        if (recognizer != null || heard != null) return
+        if (heard != null) {
+            qaHeardPending = heard to heardFinal
+            qaHeardDelayMs = heardDelay ?: QA_HEARD_DELAY_MS
+        }
+        if (uploadDelay != null) {
+            // A slow link for QA: every upload waits this long before it is handed to the Data Layer.
+            app.qaUploadDelayMs = uploadDelay
+            Log.i(TAG, "qa slow transfer set to $uploadDelay ms (debug builds only)")
+        }
+        if (recognizer != null || heard != null || uploadDelay != null) return
         if (seed > 0) {
             app.seedReaderForQa(seed.coerceAtMost(40), intent.getLongExtra(QA_SEED_NEWEST, seed.toLong()))
             return
@@ -507,6 +532,8 @@ class WatchActivity : ComponentActivity() {
         private const val QA_RECOGNIZER = "hv_qa_recognizer"
         private const val QA_WAKE_HEARD = "hv_qa_wake_heard"
         private const val QA_WAKE_FINAL = "hv_qa_wake_final"
+        private const val QA_WAKE_DELAY = "hv_qa_wake_delay_ms"
+        private const val QA_UPLOAD_DELAY = "hv_qa_upload_delay_ms"
         private const val QA_HEARD_DELAY_MS = 1_500L
         private const val QA_HANDLED = "hv_qa_handled"
         private const val QA_SEED_READER = "hv_qa_seed_reader"

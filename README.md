@@ -159,12 +159,15 @@ The flow is the same whether a turn starts on the Phone or the Watch:
    isn't sent, transcribed, routed or delivered, and it doesn't change where replies play. The Watch
    checks before uploading and the Phone checks again before accepting. The check runs the same
    voice-activity detector as the hands-free ending (see [Hands-free ending](#hands-free-ending-shared-vad)),
-   with a lower bar: it only refuses a recording in which nothing rose at least half again above
-   its own background for 140 ms, or whose loud part (half a second or more) stays at one steady
-   level, i.e. silence or steady noise, also when the noise started and stopped during the
-   recording. Speech in loud steady noise
-   (tested down to 3 dB above it) passes. It is a loudness check, not speech recognition: it lets
-   soft and short speech through, so changing non-speech sound still reaches speech-to-text, which
+   with a lower bar. It refuses a recording in which nothing stood out from its own background for
+   140 ms, or whose loud part (half a second or more) stays at one steady level, i.e. silence or
+   steady noise, also when the noise started and stopped during the recording. How far "stood
+   out" is depends on the background: half again above a steady one (speech 3 dB above loud
+   steady noise passes), and more when the background's own level moves: several times its usual
+   swing, up to four times the background. So a room whose noise merely wanders is refused
+   too, and speech there has to be clearly above the noise. It is a loudness check, not speech
+   recognition: it lets soft and short speech through, so changing non-speech sound (dishes, a
+   door, typing next to the microphone) still reaches speech-to-text, which
    can mistake it for words. Otherwise the Phone calls `POST /api/audio/transcribe`. If that finds no speech,
    the turn ends without routing or delivering anything. A wake-phrase request the recognizer
    already heard in full arrives as text instead and skips this step; it is treated exactly like a
@@ -340,8 +343,10 @@ one device:
   identifies it by the link, not by anything the Watch says.
 - The first to ask wins and keeps the claim while it listens, hands over to its recorder and
   records, renewing it every few seconds for as long as that takes (this is not a time limit on
-  the recording). The other device is refused: it stops listening, shows that the other device
-  answered, and sends nothing.
+  the recording). The Watch also keeps renewing it after the recording ended, while the recording
+  travels to the Phone, until the Phone has answered that request; a slow transfer doesn't lose
+  it. The other device is refused: it stops listening, shows that the other device answered, and
+  sends nothing.
 - The Phone accepts a wake-phrase request in Both only with the claim it gave that device, once.
   A request without it, with another device's, with one that ran out, or made before the Phone
   app restarted is refused before it is accepted: nothing is transcribed or delivered and where
@@ -349,11 +354,20 @@ one device:
 - If the answer doesn't arrive within 2.5 seconds, the claim was made under settings the Phone has
   since changed, or a renewal is refused, the device stops without sending and asks you to say it
   again. A claim that is no longer renewed (the app closed, the link dropped) runs out after 10
-  seconds. Late messages about an old claim can't affect a newer one.
-- For 3 seconds after a request is accepted, the other device still can't claim, because its
-  recognizer may only just be finishing the same spoken phrase. The same device can start its
-  next request at once. Requests are never compared or merged by their words: saying the same
-  thing twice on purpose is two requests.
+  seconds. A recording on its way to the Phone gives its claim back when the transfer fails or the
+  Phone refuses it, and the Watch says so; a transfer that neither arrives nor fails is given up
+  after a minute plus the time its size needs at 2 kB/s. The Watch's claim messages go out one at
+  a time in order, so a late message can't undo or outrun a newer one.
+- The Phone counts the wake requests it has accepted, and each device notes that count when its
+  recognizer starts listening. A recognizer that was already listening when a request was accepted
+  can't claim that phrase any more, however late it finishes hearing it: the Phone refuses it, and
+  tells the other device so it stops listening. Listening that starts afterwards is a new request,
+  with no waiting time. If the first device gives its claim back without a request (its final
+  result didn't start with the wake phrase after all), the other device may still answer. Requests
+  are never compared or merged by their words: saying the same thing twice on purpose is two
+  requests.
+- Changing **Listen on** while a wake request is being recorded cancels that recording with a
+  notice; nothing is sent. Other setting changes don't interrupt it.
 - Push-to-talk and typed messages are never arbitrated, and with Watch or Phone alone there is
   nothing to arbitrate.
 - Where a recognizer gives no partial results, the claim is made at its final result, so both
@@ -396,27 +410,42 @@ Both devices end a hands-free request with the same voice-activity detector (VAD
 - **How it listens:** in 20 ms frames, it compares loudness with the room's background, which it
   measures for 0.4 s before the "speak now" buzz. Speech is three times the background or louder
   for at least 140 ms, with gaps between syllables of up to 200 ms tolerated and at least 45% of
-  that stretch voiced. A fading syllable stays "speech" for at most 200 ms. The timing is the same
-  on the Phone and the Watch and doesn't depend on how the microphone delivers audio.
+  that stretch voiced. A fading syllable stays "speech" for at most 200 ms. The same 140 ms
+  starts a request and continues it after a pause, so words said one at a time keep it open. The
+  timing is the same on the Phone and the Watch and doesn't depend on how the microphone delivers
+  audio.
 - **The background estimate** comes from the last second of sound:
-  - It drops quickly to the quietest moments of that second. So if it started too high, because
-    you spoke before the buzz or a steady sound was taken for background, it recovers at the next
-    natural dips of your speech.
-  - It rises only when the whole last second is steady (no louder moment more than twice the
-    quietest), and only if that steady sound is not voiced, or is barely above the speech
-    threshold, or is clearly quieter than your speech so far (under about 45% of its typical
-    level). Speech changes loudness all the time, so it never raises the estimate. A fan that
-    starts after you stop is adopted within a second or two and the request ends; in tests,
-    background that rose to 2.5–10 times its level ended the request 2.7–3.6 s after the speech.
-  - A steady sound about as loud as your speech is never taken for background: a drawn-out "uhh",
-    a held note, or a vacuum cleaner while you talk does not end your request, however long it
-    lasts.
+  - *Before you speak* it is the usual level of that second (its median), as long as the second is
+    one level (the middle half of it within about 6 dB). It follows that level up within a third
+    of a second and down slowly, so a room whose noise wanders isn't taken for speech at its
+    louder moments.
+  - *Once you have spoken* it is what your speech sits on: the lower quarter of the last second,
+    the dips between words. It rises only to levels clearly below your voice (under about 45% of
+    its typical level), so soft words stay above it while a background that rose doesn't hold the
+    request open.
+  - If it started far too high (you spoke before the buzz, or a loud moment fell into the 0.4 s),
+    it drops at once to the quiet between your words.
+  - A steady sound about as loud as your speech is never taken for background once you have
+    spoken: a drawn-out "uhh", a held note, or a vacuum cleaner while you talk does not end your
+    request, however long it lasts.
+  - A steady sound that starts before you have said anything, and doesn't even waver the way a
+    held voice does (under about 1 dB), is noise: it becomes the background after a second or so
+    and the request counts as not started. A held "uhh" first, then speech, is kept whole.
 - **What it can't do:** it measures loudness, not speech.
-  - Loud changing sound (music, TV, other people talking) keeps a request open until you tap Send.
-  - So does steady noise that is about as loud as your speech (in tests, from about 40% of its
-    level): it can't be told from a voice, so the request stays open rather than being cut.
-  - Speech that stays very soft, under about three times the background, may count as silence
-    and end the request early, or never start it.
+  - Loud changing sound (music, TV, other people talking, dishes) can start a request and keeps
+    one open until it stops or you tap Send.
+  - After you have spoken, steady noise that is about as loud as your speech was (in tests, from
+    about half of its level) can't be told from a held voice, so the request stays open for a tap
+    rather than being cut. Quieter steady noise ends it 2–3.5 s after the speech.
+  - Your voice has to stand clearly above the room. In tests with recorded speech mixed into
+    recordings of real rooms, no request was cut short with the speech 15 dB or more above the
+    room noise; at 10 dB about one in twenty was sent without its last words, and at 6 dB about
+    one in three. In a noisy place use push-to-talk, or a longer trailing silence.
+  - A room whose noise swings widely (by about 5 dB or more from moment to moment) can still be
+    taken for a request now and then, and a request there can take several seconds longer to end.
+    The recording check then refuses most recordings that hold nothing but such noise.
+  - A word has to be voiced for 140 ms: very short words with long pauses between them, spoken
+    softly, may not count.
   - A single click or knock of 100 ms or less doesn't count, and neither does sparse clicking
     such as slow typing. Dense tapping or knocking (voiced nearly half the time) can count, and a
     burst of noise longer than 140 ms, like a cough, can start a request, which speech-to-text
@@ -460,7 +489,7 @@ builds ignore them.
 
 Only the following has been run:
 
-- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **279 JUnit tests**, all
+- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **311 JUnit tests**, all
   passing. They use an in-process fake dashboard and cover sign-in, session ownership, chat and
   attachments, routing, playback routing, the Watch link and reader contracts, the wake contract
   (final-only, leading wake phrase, contradicted or empty finals, 30/60/120-second recognizer
@@ -473,10 +502,24 @@ Only the following has been run:
   early; isolated and sparse clicks don't count; short words and soft speech do; push-to-talk
   speech 3, 5 and 7 dB above steady noise is accepted for 30 seeds at 4, 20 and 60 s while silence
   and steady noise alone (throughout, or between quiet margins) are refused; whenever the ending finds speech the recording check
-  accepts the same audio), wake arbitration in Both (the claim lease, its renewal, expiry and
+  accepts the same audio), its behaviour in unsteady backgrounds (synthetic, 40 seeds per cell:
+  a background drifting by 1, 2, 3 and 4.5 dB with nobody speaking is recorded as a request in 0,
+  0, 1 and 16 of 40 half-minutes and uploaded in 0, 0, 1 and 11–13; one whose level jumps every
+  100 ms by 2–6 dB in 0, 0, 8 and 34; a request in such a background is never cut and ends on
+  average 2.0–3.1 s after the speech, at worst 10 s; six seconds of drifting noise alone pass the
+  recording check in 0, 2, 5 and 25 of 40; steady noise of 2.5–30 times the background that starts
+  with nobody speaking ends as "no request"; a held voice first, then speech, is kept whole; noise
+  after speech ends the request only when clearly quieter than the speech; words of 100–300 ms
+  said one at a time keep a request open at both the 0.5 s and the 2 s setting; soft speech 3.2–5
+  times the background is never cut in a minute), wake arbitration in Both (the claim lease, its renewal, expiry and
   stale messages; two simulated recognizers hearing the same phrase in either order, by partial or
   final result, phrase-only and in one breath; unanswered, refused and lost claims; push-to-talk
-  and deliberate repeats; the Watch link), the voice settings (0.5–10 s validation, the
+  and deliberate repeats; the Watch link; a Watch recording that reaches the Phone 3 to 90 s after
+  it was recorded is accepted, and one whose transfer fails, is refused, outlasts its limit or
+  meets a restarted Phone gives its claim back with a notice; a recognizer that reports the phrase
+  0.5 s to an hour after the other device's request was accepted never delivers it again, told or
+  not told by the Phone, and the next wake works at once; claim messages arrive in order behind a
+  slow first send; changing the wake location during a wake recording cancels it unsent), the voice settings (0.5–10 s validation, the
   wake-location modes, durable migration from the old Watch switch, strict Watch-side validation,
   stale snapshots), the per-device wake flow both apps delegate to (which device listens for each
   mode, turning a device off mid-window or mid-recording, the silence snapshot, same-breath

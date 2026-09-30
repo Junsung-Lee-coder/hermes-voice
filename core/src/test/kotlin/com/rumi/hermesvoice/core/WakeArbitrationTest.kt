@@ -50,8 +50,9 @@ class WakeArbitrationTest {
 
     private class Clock(var now: Long = 1_000_000L)
 
-    private fun phoneClaim(id: String, revision: Long = 7) = WakeClaim(id, VoiceOrigin.PHONE, "", revision, 1)
-    private fun watchClaim(id: String, revision: Long = 7, node: String = "watch-a") = WakeClaim(id, VoiceOrigin.WATCH, node, revision, 1)
+    private fun phoneClaim(id: String, revision: Long = 7, epoch: Long = 0) = WakeClaim(id, VoiceOrigin.PHONE, "", revision, 1, epoch)
+    private fun watchClaim(id: String, revision: Long = 7, node: String = "watch-a", epoch: Long = 0) =
+        WakeClaim(id, VoiceOrigin.WATCH, node, revision, 1, epoch)
 
     @Test
     fun `the first claim wins and the other device is refused until the episode is over`() {
@@ -62,18 +63,23 @@ class WakeArbitrationTest {
         assertEquals("asking again is idempotent", ClaimVerdict.GRANTED, admission.claim(watchClaim("claim-watch-1")))
         assertEquals("another watch is another device", ClaimVerdict.HELD_BY_OTHER, admission.claim(watchClaim("claim-watch-x", node = "watch-b")))
         assertEquals(VoiceOrigin.WATCH, admission.holder())
-        // The winner's request is admitted once; the loser's finishing recognizer is still refused for the settle time.
+        // The winner's request is admitted once. A window that was listening while it was said (it knows 0
+        // answered requests) can never claim that phrase, however late its recognizer finishes.
         assertNull(admission.admitTurn(true, VoiceOrigin.WATCH, "watch-a", "claim-watch-1"))
         assertEquals("wake_claim_invalid", admission.admitTurn(true, VoiceOrigin.WATCH, "watch-a", "claim-watch-1"))
-        clock.now += WakeContract.CLAIM_SETTLE_MS - 1
-        assertEquals(ClaimVerdict.HELD_BY_OTHER, admission.claim(phoneClaim("claim-phone-2")))
-        assertEquals("the same device may start its next request at once", ClaimVerdict.GRANTED, admission.claim(watchClaim("claim-watch-2")))
+        assertEquals(1L, admission.epoch)
+        for (laterMs in listOf(1L, 2_999L, 3_001L, 60_000L, 3_600_000L)) {
+            clock.now += laterMs
+            assertEquals("$laterMs ms later", ClaimVerdict.HELD_BY_OTHER, admission.claim(phoneClaim("claim-phone-late-$laterMs")))
+        }
+        assertEquals("the winner's own old window too", ClaimVerdict.STALE_WINDOW, admission.claim(watchClaim("claim-watch-old")))
+        // A window opened after the request was admitted is a new episode, at once and for either device.
+        assertEquals(ClaimVerdict.GRANTED, admission.claim(watchClaim("claim-watch-2", epoch = 1)))
         admission.release("claim-watch-2", VoiceOrigin.WATCH, "watch-a")
-        assertEquals("still the settle time of the admitted request", ClaimVerdict.HELD_BY_OTHER, admission.claim(phoneClaim("claim-phone-3")))
-        clock.now += 1
-        assertEquals(ClaimVerdict.GRANTED, admission.claim(phoneClaim("claim-phone-3")))
+        assertEquals("a claim released without a request frees the episode at once", ClaimVerdict.GRANTED, admission.claim(phoneClaim("claim-phone-3", epoch = 1)))
         admission.release("claim-phone-3", VoiceOrigin.PHONE, "")
-        assertEquals("a claim released without a request frees the episode at once", ClaimVerdict.GRANTED, admission.claim(watchClaim("claim-watch-3")))
+        assertEquals(ClaimVerdict.GRANTED, admission.claim(watchClaim("claim-watch-3", epoch = 1)))
+        assertEquals("nothing was admitted since", 1L, admission.epoch)
     }
 
     @Test
@@ -96,6 +102,9 @@ class WakeArbitrationTest {
         assertEquals(VoiceOrigin.PHONE, admission.holder())
         assertEquals("wake_claim_invalid", admission.admitTurn(true, VoiceOrigin.WATCH, "watch-a", "claim-phone-new"))
         assertNull(admission.admitTurn(true, VoiceOrigin.PHONE, "", "claim-phone-new"))
+        // A renewal that crosses the admission is told the claim was used, not that it was lost.
+        assertEquals(ClaimVerdict.USED, admission.renew("claim-phone-new", VoiceOrigin.PHONE, ""))
+        assertEquals(ClaimVerdict.EXPIRED, admission.renew("claim-phone-new", VoiceOrigin.WATCH, "watch-a"))
     }
 
     @Test
@@ -125,7 +134,7 @@ class WakeArbitrationTest {
         val clock = Clock()
         val admission = WakeAdmission({ clock.now }, { both })
         val verdict = WakeClaimService.handle(admission, "watch-a", WakeClaimMessage(WakeClaimMessage.Op.CLAIM, "claim-wire-01", 7, 3).encode())!!
-        assertEquals(WakeVerdictMessage("claim-wire-01", ClaimVerdict.GRANTED), WakeVerdictMessage.decode(verdict.encode()))
+        assertEquals(WakeVerdictMessage("claim-wire-01", ClaimVerdict.GRANTED, 0), WakeVerdictMessage.decode(verdict.encode()))
         assertEquals("the node comes from the transport, not the message", ClaimVerdict.EXPIRED,
             WakeClaimService.handle(admission, "watch-b", WakeClaimMessage(WakeClaimMessage.Op.RENEW, "claim-wire-01").encode())!!.verdict)
         assertEquals(ClaimVerdict.GRANTED,
@@ -199,9 +208,13 @@ class WakeArbitrationTest {
         override fun armInputs() = WakeArmInputs(true, true, true, false, true, false, true, true, 0, 0, 0, null)
 
         override fun newClaimId() = "claim-${origin.name.lowercase()}-${++ids}"
-        override fun request(claimId: String, settingsRevision: Long, generation: Long) {
+
+        /** Null: the device knows the Phone's count when its window opens (the Phone itself; a Watch that read the data item). */
+        var knownEpoch: Long? = null
+        override fun epoch(): Long = knownEpoch ?: h.core.wakeAdmission.epoch
+        override fun request(claimId: String, settingsRevision: Long, generation: Long, epoch: Long) {
             calls += "claim"
-            val verdict = h.core.wakeAdmission.claim(WakeClaim(claimId, origin, node, settingsRevision, generation))
+            val verdict = h.core.wakeAdmission.claim(WakeClaim(claimId, origin, node, settingsRevision, generation, epoch))
             val deliver = { controller.onClaimVerdict(claimId, verdict) }
             if (holdVerdicts) heldVerdicts += deliver else deliver()
         }

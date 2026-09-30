@@ -421,6 +421,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
             "unavailable" -> "Wake phrase unavailable on this phone (no speech recognizer)"
             "wake_taken" -> "The Watch answered that wake phrase"
             "wake_claim_timeout", "wake_claim_failed" -> "Couldn't confirm the wake phrase. Say it again"
+            "wake_mode_changed" -> "Wake settings changed. Say it again"
             "recognizer_error_12", "recognizer_error_13" -> "The speech recognizer lacks the wake phrase language"
             else -> return
         }

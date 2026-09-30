@@ -16,6 +16,10 @@ import com.google.android.gms.wearable.Wearable
 import com.rumi.hermesvoice.core.settings.ReplicaUpdate
 import com.rumi.hermesvoice.core.wake.ClaimVerdict
 import com.rumi.hermesvoice.core.wake.WakeClaimMessage
+import com.rumi.hermesvoice.core.wake.WakeClaimSender
+import com.rumi.hermesvoice.core.wake.WakeClaimTransit
+import com.rumi.hermesvoice.core.wake.WakeContract
+import com.rumi.hermesvoice.core.wake.WakeEpochItem
 import com.rumi.hermesvoice.core.wake.WakeVerdictMessage
 import com.rumi.hermesvoice.core.settings.WatchSettings
 import com.rumi.hermesvoice.core.settings.WatchSettingsReplica
@@ -42,6 +46,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -131,49 +136,110 @@ class WatchApp : Application() {
     fun cue(line: String) = _talk.update { it.recordingCue(line) }
 
     /** Uploads the finished recording to the reachable Phone node that advertises the app capability. */
-    fun upload(turnId: String, trigger: TurnTrigger, wav: ByteArray, wakeClaimId: String? = null) =
-        send(turnId, WatchTurnUpload(turnId, trigger, WatchTurnUpload.MIME_WAV, wav, wakeClaimId?.takeIf { trigger == TurnTrigger.WAKE_PHRASE }))
+    fun upload(turnId: String, trigger: TurnTrigger, wav: ByteArray, wakeClaimId: String? = null) {
+        val claimId = wakeClaimId?.takeIf { trigger == TurnTrigger.WAKE_PHRASE }
+        // Recording ended, but the claim is this Watch's until the Phone has answered the turn.
+        claimId?.let { keepClaimInTransit(it, turnId, wav.size) }
+        send(turnId, WatchTurnUpload(turnId, trigger, WatchTurnUpload.MIME_WAV, wav, claimId))
+    }
 
     /** Sends a wake-phrase request the recognizer already heard (no second utterance was recorded). */
-    fun uploadRecognized(turnId: String, request: String, wakeClaimId: String? = null) =
+    fun uploadRecognized(turnId: String, request: String, wakeClaimId: String? = null) {
+        wakeClaimId?.let { keepClaimInTransit(it, turnId, request.length) }
         send(turnId, WatchTurnUpload.recognized(turnId, request, wakeClaimId))
+    }
 
     // ── wake arbitration ("Both") ────────────────────────────────────────────────────────────
 
-    /** The Phone node each wake claim was sent to; a verdict from any other node is ignored. */
-    private val claimTargets = ConcurrentHashMap<String, String>()
-
     /** Receives the Phone's verdicts (claim id, verdict); set by the visible activity. */
     @Volatile var wakeVerdictListener: ((String, ClaimVerdict) -> Unit)? = null
+
+    /** Told when the Phone admitted a wake request (its count, that request's claim); set by the visible activity. */
+    @Volatile var wakeEpochListener: ((Long, String) -> Unit)? = null
+
+    /** How many wake requests the Phone has answered, as far as this Watch knows; a window carries the value it opened with. */
+    @Volatile var wakeEpoch: Long = 0L
+        private set
+
+    /** The epoch each granted claim was granted at, until its request is answered. */
+    private val grantedEpochs = ConcurrentHashMap<String, Long>()
+
+    /** One ordered sender: a claim's release can never overtake the claim (see [WakeClaimSender]). */
+    private val claimSender by lazy {
+        WakeClaimSender(scope, ::phoneNode,
+            send = { node, bytes -> Wearable.getMessageClient(this@WatchApp).sendMessage(node, WatchLinkPaths.WAKE_CLAIM, bytes).await() },
+            log = { Log.i(TAG, it) })
+    }
 
     /**
      * Asks the Phone for, renews or releases the wake claim. The Phone is the only coordinator; if
      * it cannot be reached nothing comes back and the wake flow fails closed on its timer.
      */
-    fun sendWakeClaim(message: WakeClaimMessage) {
-        scope.launch {
-            val node = claimTargets[message.claimId] ?: phoneNode() ?: return@launch
-            if (message.op == WakeClaimMessage.Op.RELEASE) claimTargets.remove(message.claimId) else claimTargets[message.claimId] = node
-            val sent = runCatching { Wearable.getMessageClient(this@WatchApp).sendMessage(node, WatchLinkPaths.WAKE_CLAIM, message.encode()).await() }
-            Log.i(TAG, "wake claim ${message.op} ${message.claimId.take(10)} sent=${sent.isSuccess}")
+    fun sendWakeClaim(message: WakeClaimMessage) = claimSender.offer(message)
+
+    /** Keeps the claim of a request that is on its way to the Phone until the Phone answers that turn. */
+    private val transit = WakeClaimTransit(SystemClock::elapsedRealtime,
+        renew = { sendWakeClaim(WakeClaimMessage(WakeClaimMessage.Op.RENEW, it)) },
+        release = { sendWakeClaim(WakeClaimMessage(WakeClaimMessage.Op.RELEASE, it)) },
+        onLost = { turnId, reason ->
+            Log.w(TAG, "wake claim lost in transit turn=${turnId.take(12)} reason=$reason")
+            _talk.update { if (it.turnId == turnId) it.sendFailed("Couldn't confirm with the phone. Say it again") else it }
+        })
+    private var transitJob: Job? = null
+
+    private fun keepClaimInTransit(claimId: String, turnId: String, bytes: Int) {
+        transit.begin(claimId, turnId, WakeContract.transitLimitMs(bytes))
+        Log.i(TAG, "wake claim ${claimId.take(10)} kept for turn=${turnId.take(12)} until the phone answers")
+        if (transitJob?.isActive == true) return
+        transitJob = scope.launch {
+            while (transit.active) {
+                delay(WakeContract.CLAIM_RENEW_MS)
+                transit.tick()
+            }
         }
     }
 
     fun onWakeVerdict(sourceNodeId: String, bytes: ByteArray) {
         val verdict = WakeVerdictMessage.decode(bytes) ?: return
-        if (claimTargets[verdict.claimId] != sourceNodeId) {
+        if (!claimSender.accepts(verdict.claimId, sourceNodeId)) {
             Log.w(TAG, "wake verdict ignored ${verdict.claimId.take(10)} (not pending from this node)")
             return
         }
-        if (verdict.verdict != ClaimVerdict.GRANTED) claimTargets.remove(verdict.claimId)
-        Log.i(TAG, "wake verdict ${verdict.claimId.take(10)} ${verdict.verdict}")
+        if (verdict.epoch >= 0) {
+            wakeEpoch = verdict.epoch
+            if (verdict.verdict == ClaimVerdict.GRANTED) {
+                if (grantedEpochs.size >= 8) grantedEpochs.clear()
+                grantedEpochs[verdict.claimId] = verdict.epoch
+            }
+        }
+        if (verdict.verdict != ClaimVerdict.GRANTED) {
+            claimSender.forget(verdict.claimId)
+            grantedEpochs.remove(verdict.claimId)
+        }
+        Log.i(TAG, "wake verdict ${verdict.claimId.take(10)} ${verdict.verdict} epoch=${verdict.epoch}")
+        transit.onVerdict(verdict.claimId, verdict.verdict)
         wakeVerdictListener?.invoke(verdict.claimId, verdict.verdict)
     }
+
+    /** The Phone's count of answered wake requests (data item, read on resume and when it changes). */
+    fun applyWakeEpoch(json: String) {
+        val item = WakeEpochItem.parse(json) ?: return
+        wakeEpoch = item.epoch
+        Log.i(TAG, "wake epoch ${item.epoch}")
+        wakeEpochListener?.invoke(item.epoch, item.claimId)
+    }
+
+    /** Debug QA only (set from WatchActivity in debuggable builds): how long every upload waits first, to model a slow link. */
+    @Volatile var qaUploadDelayMs = 0L
 
     private fun send(turnId: String, upload: WatchTurnUpload) {
         _talk.update { if (it.turnId == turnId) it.sending() else it }
         scope.launch {
             val failure = runCatching {
+                if (qaUploadDelayMs > 0) {
+                    Log.i(TAG, "qa slow transfer: turn=${turnId.take(12)} waits $qaUploadDelayMs ms (debug builds only)")
+                    delay(qaUploadDelayMs)
+                }
                 val phone = phoneNode() ?: error("Phone not reachable")
                 val channels = Wearable.getChannelClient(this@WatchApp)
                 val channel = channels.openChannel(phone, WatchLinkPaths.turnPath(turnId)).await()
@@ -186,6 +252,7 @@ class WatchApp : Application() {
                     (if (upload.recognizedText != null) "recognized_request" else "wav") + " bytes=${upload.audio.size}")
             } else {
                 Log.w(TAG, "upload failed: ${failure.message}")
+                transit.onTransferFailed(turnId)
                 _talk.update { if (it.turnId == turnId) it.sendFailed(failure.message ?: "Could not reach the phone") else it }
             }
         }
@@ -194,6 +261,15 @@ class WatchApp : Application() {
     fun onPhoneState(message: TurnStateMessage) {
         Log.i(TAG, "phone state turn=${message.turnId.take(12)} stage=${message.stage} terminal=${message.terminal}")
         val ownTurn = message.turnId == _talk.value.turnId
+        // The Phone answered this turn: its wake claim was used up (or, if the turn ended there, is given back).
+        transit.onPhoneState(message.turnId, message.terminal)?.let { claimId ->
+            val granted = grantedEpochs.remove(claimId)
+            if (!message.terminal) {
+                // Admitted: one more answered wake request, which this Watch's next window must know.
+                if (granted != null && wakeEpoch == granted) wakeEpoch = granted + 1
+                claimSender.forget(claimId)
+            }
+        }
         _talk.update { it.onPhoneState(message) }
         // A finished Watch turn may have added messages to the conversation being read, or created
         // a new conversation: re-read both through the Phone.

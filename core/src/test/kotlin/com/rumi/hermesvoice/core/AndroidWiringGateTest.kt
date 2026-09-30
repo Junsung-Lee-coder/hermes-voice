@@ -109,7 +109,7 @@ class AndroidWiringGateTest {
         assertTrue(source("phone/src/main/AndroidManifest.xml").contains("android:path=\"/hv/v1/wake/claim\""))
         val phoneActivity = source("$phone/MainActivity.kt")
         assertTrue(phoneActivity.contains("model.startHandsFree(silenceMs, claimId)") && phoneActivity.contains("model.sendRecognizedRequest(request, claimId)"))
-        assertTrue(phoneActivity.contains("admission()?.claim(WakeClaim(claimId, VoiceOrigin.PHONE, \"\", settingsRevision, generation))"))
+        assertTrue(phoneActivity.contains("admission()?.claim(WakeClaim(claimId, VoiceOrigin.PHONE, \"\", settingsRevision, generation, epoch))"))
         val model = source("$phone/PhoneViewModel.kt")
         assertTrue(model.contains("submitVoice(wav, wakeTurn = true, wakeClaimId = claimId)") && model.contains("wakeTurn = true, wakeClaimId = claimId)"))
         assertTrue("a busy phone says so instead of dropping the request", model.substringAfter("fun sendRecognizedRequest").substringBefore("recognizedClaimId = claimId")
@@ -118,8 +118,51 @@ class AndroidWiringGateTest {
         assertTrue(watchActivity.contains("app.upload(captureId, trigger, wav, claimId)") && watchActivity.contains("app.uploadRecognized(turnId, text, recognizedClaimId)"))
         assertTrue(watchActivity.contains("wake.wake.onRequestCaptureEnded(sent = true)") && watchActivity.contains("wake.wake.onRequestCaptureEnded(sent = false)"))
         val watchApp = source("$watch/WatchApp.kt")
-        assertTrue("a verdict counts only from the node the claim went to", watchApp.contains("if (claimTargets[verdict.claimId] != sourceNodeId)"))
+        assertTrue("a verdict counts only from the node the claim went to", watchApp.contains("if (!claimSender.accepts(verdict.claimId, sourceNodeId))"))
         assertTrue(source("$watch/WatchListenerService.kt").contains("WatchLinkPaths.WAKE_VERDICT ->"))
+    }
+
+    @Test
+    fun `the watch keeps its claim until the phone answers and sends every claim message through the one ordered sender`() {
+        val watchApp = source("$watch/WatchApp.kt")
+        assertTrue(watchApp.contains("fun sendWakeClaim(message: WakeClaimMessage) = claimSender.offer(message)"))
+        assertEquals("claim messages leave the Watch in one place only", 1, Regex("WatchLinkPaths\\.WAKE_CLAIM").findAll(watchApp).count())
+        assertTrue(watchApp.contains("WakeClaimSender(scope, ::phoneNode,"))
+        val upload = watchApp.substringAfter("fun upload(turnId: String, trigger: TurnTrigger, wav: ByteArray").substringBefore("fun uploadRecognized")
+        assertTrue("the claim is kept before the recording is handed to the link",
+            upload.indexOf("claimId?.let { keepClaimInTransit(it, turnId, wav.size) }") in 0 until upload.indexOf("send(turnId, WatchTurnUpload("))
+        assertTrue(watchApp.substringAfter("fun uploadRecognized").substringBefore("// ── wake arbitration").contains("wakeClaimId?.let { keepClaimInTransit(it, turnId, request.length) }"))
+        assertTrue("kept by the application, not the activity, so leaving the screen does not drop it",
+            watchApp.contains("transitJob = scope.launch {") && watchApp.contains("delay(WakeContract.CLAIM_RENEW_MS)") && watchApp.contains("transit.tick()"))
+        assertTrue(watchApp.contains("transit.onTransferFailed(turnId)") && watchApp.contains("transit.onPhoneState(message.turnId, message.terminal)") &&
+            watchApp.contains("transit.onVerdict(verdict.claimId, verdict.verdict)"))
+        assertTrue("a claim lost on the way is shown", watchApp.contains("it.sendFailed(\"Couldn't confirm with the phone. Say it again\")"))
+        // The Phone says a turn is accepted at once, before it waits its place in line.
+        assertTrue(source("core/src/main/kotlin/com/rumi/hermesvoice/core/watchlink/PhoneWatchRelay.kt")
+            .contains("states.trySend(TurnStateMessage(turnId, \"accepted\", \"\", false))"))
+    }
+
+    @Test
+    fun `both apps share the phone's count of answered wake requests and read it before they listen`() {
+        val app = source("$phone/PhoneApp.kt")
+        assertTrue(app.contains("core.onWakeEpisode = { episode ->") && app.contains("publishWakeEpoch(WakeEpochItem(episode.epoch, episode.claimId))") &&
+            app.contains("publishWakeEpoch(WakeEpochItem(core.wakeAdmission.epoch))"))
+        assertTrue(source("$phone/PhoneWatchBridge.kt").contains("PutDataMapRequest.create(WatchLinkPaths.WAKE_EPOCH)"))
+        val phoneActivity = source("$phone/MainActivity.kt")
+        assertTrue(phoneActivity.contains("override fun epoch(): Long = admission()?.epoch ?: 0L") &&
+            phoneActivity.contains("phoneWake.wake.onEpisodeAnswered(it.epoch, it.claimId)"))
+        assertTrue(source("watch/src/main/AndroidManifest.xml").contains("android:path=\"/hv/v1/wake/epoch\""))
+        assertTrue(source("$watch/WatchListenerService.kt").contains("WatchLinkPaths.WAKE_EPOCH -> app.scope.launch { app.applyWakeEpoch(json) }"))
+        val watchActivity = source("$watch/WatchActivity.kt")
+        assertTrue(watchActivity.contains("override fun epoch(): Long = app.wakeEpoch") &&
+            watchActivity.contains("app.sendWakeClaim(WakeClaimMessage(WakeClaimMessage.Op.CLAIM, claimId, settingsRevision, generation, epoch))") &&
+            watchActivity.contains("app.wakeEpochListener = { epoch, claimId -> wake.wake.onEpisodeAnswered(epoch, claimId) }"))
+        val resume = watchActivity.substringAfter("override fun onResume()").substringBefore("override fun onDestroy()")
+        assertTrue("the count is read before the Watch may listen",
+            watchActivity.contains("pullItem(WatchLinkPaths.WAKE_EPOCH, app::applyWakeEpoch)") &&
+                resume.indexOf("pullSettings()") in 0 until resume.indexOf("wake.wake.onSettingsCurrent()"))
+        assertTrue("the wake location changing mid-request is said on both devices",
+            watchActivity.contains("\"wake_mode_changed\" ->") && source("$phone/PhoneViewModel.kt").contains("\"wake_mode_changed\" ->"))
     }
 
     @Test

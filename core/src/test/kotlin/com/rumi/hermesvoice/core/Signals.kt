@@ -4,6 +4,8 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.PI
 import kotlin.math.cos
+import kotlin.math.exp
+import kotlin.math.pow
 import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.random.Random
@@ -93,5 +95,44 @@ class Signals(val rate: Int, seed: Int = 1) {
 
         fun chunks(bytes: ByteArray, size: Int): Sequence<ByteArray> =
             (bytes.indices step size).asSequence().map { bytes.copyOfRange(it, minOf(it + size, bytes.size)) }
+    }
+}
+
+/**
+ * Backgrounds whose level is not steady, with nobody speaking. Levels are given as the RMS around which the background moves and the standard deviation
+ * of its frame level in dB.
+ */
+object UnsteadyNoise {
+    /** Gaussian noise whose level drifts smoothly: per 20 ms frame an AR(1) process in dB with correlation time [corrMs]. */
+    fun drift(rate: Int, seed: Int, ms: Long, rms: Double, sigmaDb: Double, corrMs: Double = 300.0): ShortArray {
+        val r = java.util.Random(seed.toLong())
+        val n = (rate * ms / 1000).toInt()
+        val frame = rate / 50
+        val a = exp(-20.0 / corrMs)
+        val innovation = sigmaDb * sqrt(1 - a * a)
+        var x = r.nextGaussian() * sigmaDb
+        var next = a * x + innovation * r.nextGaussian()
+        return ShortArray(n) { i ->
+            val k = i % frame
+            if (k == 0 && i > 0) {
+                x = next
+                next = a * x + innovation * r.nextGaussian()
+            }
+            val db = x + (next - x) * k / frame
+            (r.nextGaussian() * rms * 10.0.pow(db / 20)).toInt().coerceIn(-32768, 32767).toShort()
+        }
+    }
+
+    /** Uniform noise whose level jumps every [holdMs] to a new value drawn log-normally around [rms]. */
+    fun blocks(rate: Int, seed: Int, ms: Long, rms: Double, sigmaDb: Double, holdMs: Long = 100): ShortArray {
+        val levels = java.util.Random(seed.toLong())
+        val noise = Random(seed)
+        val n = (rate * ms / 1000).toInt()
+        val hold = (rate * holdMs / 1000).toInt()
+        var level = rms
+        return ShortArray(n) { i ->
+            if (i % hold == 0) level = rms * 10.0.pow(levels.nextGaussian() * sigmaDb / 20)
+            ((noise.nextDouble() * 2 - 1) * level * sqrt(3.0)).toInt().coerceIn(-32768, 32767).toShort()
+        }
     }
 }

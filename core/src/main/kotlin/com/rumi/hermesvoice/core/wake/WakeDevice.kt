@@ -48,7 +48,12 @@ interface WakeDevicePort {
  */
 interface WakeClaimPort {
     fun newClaimId(): String
-    fun request(claimId: String, settingsRevision: Long, generation: Long)
+
+    /** The number of answered wake requests this device knows of now ([WakeAdmission.epoch]); read before a window starts listening. */
+    fun epoch(): Long
+
+    /** Asks for the claim; [epoch] is what [epoch] returned when the window that heard the phrase opened. */
+    fun request(claimId: String, settingsRevision: Long, generation: Long, epoch: Long)
     fun renew(claimId: String)
     fun release(claimId: String)
 
@@ -73,9 +78,16 @@ interface WakeClaimPort {
  * When both devices listen ("Both") and a [WakeClaimPort] is given, the device asks the Phone for
  * the wake claim as soon as its recognizer reports a leading wake phrase (partial or final) and
  * records or sends only once the claim is granted; it renews the claim until its request is
- * handed over, and releases it when the episode ends without one. A refused, unanswered or lost
- * claim fails closed: the window closes with a notice, a recording in progress is stopped unsent.
- * Verdicts and timers for an older claim are ignored.
+ * handed over (the Watch then keeps renewing it until the Phone answers, see [WakeClaimTransit]),
+ * and releases it when the episode ends without one. A refused, unanswered or lost claim fails
+ * closed: the window closes with a notice, a recording in progress is stopped unsent. Verdicts
+ * and timers for an older claim are ignored. A claim carries how many wake requests had been
+ * answered when its window opened; a window that was already listening when another device's
+ * request was admitted closes ([onEpisodeAnswered]) and could not claim anyway.
+ *
+ * Changing the wake location while a wake episode is under way (a claim asked, a handoff pending
+ * or a request being recorded) cancels it with a notice, unsent: a request recorded under one
+ * mode is never sent under another. Push-to-talk is not touched.
  */
 class WakeDeviceController(
     val device: VoiceOrigin,
@@ -111,6 +123,9 @@ class WakeDeviceController(
     private var handoffGeneration = -1L
     private var resumed = false
 
+    /** [WakeClaimPort.epoch] when the current window started listening. */
+    private var windowEpoch = 0L
+
     /** False while the device may hold settings older than the Phone's (Watch, just resumed). */
     private var settingsCurrent = true
 
@@ -126,11 +141,28 @@ class WakeDeviceController(
     /** New settings: listen if this device is (still) included, otherwise stop everything wake-related now. */
     fun onSettings(next: WatchSettings) {
         val revised = next.revision != settings.revision
+        val modeChanged = next.wakeLocation != settings.wakeLocation
         settings = next
         if (!enabledHere) return disable("opt_out")
-        // A claim was made under the old settings: the Phone would refuse its request anyway.
-        if (revised && claim != null && !capturing) failClaim("wake_claim_failed")
+        if (modeChanged && (claim != null || heldHandoff != null || handoffGate.pending || capturing)) {
+            // Heard or being recorded under another mode: never sent under this one, and never recorded on in silence.
+            endEpisode("wake_mode_changed")
+        } else if (revised && claim != null && !capturing) {
+            // A claim was made under the old settings: the Phone would refuse its request anyway.
+            failClaim("wake_claim_failed")
+        }
         requestArm("settings")
+    }
+
+    /**
+     * A wake request was admitted by the Phone (count [epoch], claim [claimId]). A window of this
+     * device that was already listening can no longer answer that phrase: it closes, unless the
+     * admitted request is this device's own.
+     */
+    fun onEpisodeAnswered(epoch: Long, claimId: String?) {
+        if (epoch == windowEpoch || capturing) return
+        if (claimId != null && claimId == claim?.id) return
+        if (window.listening || heldHandoff != null || (claim != null && claim?.granted != true)) failClaim("wake_taken", release = claim?.granted == true)
     }
 
     /** The app became visible. [settingsPending]: wait for [onSettingsCurrent] before listening. */
@@ -181,7 +213,11 @@ class WakeDeviceController(
         // A pending handoff means the app's recorder is about to take the microphone.
         val inputs = platform.copy(enabled = enabledHere && settingsCurrent, resumed = resumed && platform.resumed,
             talkIdle = platform.talkIdle && !handoffGate.pending)
+        // Read before the recognizer starts: what this window hears is newer than every request answered so far.
+        val epoch = claims?.epoch() ?: 0L
+        val wasListening = window.listening
         val block = window.requestArm(inputs)
+        if (block == null && !wasListening) windowEpoch = epoch
         if (block != null) port.armBlocked(source, block)
         return block
     }
@@ -197,6 +233,7 @@ class WakeDeviceController(
     /** The Phone's answer to a claim or renewal. Answers about any other claim are ignored. */
     fun onClaimVerdict(claimId: String, verdict: ClaimVerdict) {
         val current = claim?.takeIf { it.id == claimId } ?: return
+        if (verdict == ClaimVerdict.USED) return forgetClaim()
         if (verdict != ClaimVerdict.GRANTED) {
             return failClaim(if (verdict == ClaimVerdict.HELD_BY_OTHER) "wake_taken" else "wake_claim_failed", release = false)
         }
@@ -251,6 +288,7 @@ class WakeDeviceController(
     fun qaSecondUtterance() {
         if (!enabledHere || !resumed) return
         window.close("qa_handoff")
+        windowEpoch = claims?.epoch() ?: 0L
         onHandoff(generation, WakeOutcome.Handoff(WakeHandoff.SECOND_UTTERANCE, ""))
     }
 
@@ -288,7 +326,7 @@ class WakeDeviceController(
         val started = Claim(port.newClaimId())
         claim = started
         port.scheduleTimer(WakeContract.CLAIM_TIMEOUT_MS)
-        port.request(started.id, settings.revision, generation)
+        port.request(started.id, settings.revision, generation, windowEpoch)
     }
 
     /** The claim was refused, unanswered or lost: stop everything of this episode, unsent, and say so. */
@@ -300,6 +338,9 @@ class WakeDeviceController(
         port.cancelRequestCapture(reason)
         if (window.listening) window.close(reason) else port.closed(reason)
     }
+
+    /** Ends the wake episode under way, whatever stage it reached, unsent and with a notice. */
+    private fun endEpisode(reason: String) = failClaim(reason)
 
     /** Gives the claim back to the Phone (the episode ended without a request). */
     private fun releaseClaim() {

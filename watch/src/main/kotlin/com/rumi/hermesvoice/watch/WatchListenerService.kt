@@ -72,9 +72,12 @@ class WatchListenerService : WearableListenerService() {
 
     override fun onDataChanged(events: DataEventBuffer) {
         val app = WatchApp.from(this)
-        events.filter { it.type == DataEvent.TYPE_CHANGED && it.dataItem.uri.path == WatchLinkPaths.SETTINGS }.forEach { event ->
+        events.filter { it.type == DataEvent.TYPE_CHANGED }.forEach { event ->
             val json = DataMapItem.fromDataItem(event.dataItem).dataMap.getString("json") ?: return@forEach
-            app.scope.launch { app.applySettings(json) }
+            when (event.dataItem.uri.path) {
+                WatchLinkPaths.SETTINGS -> app.scope.launch { app.applySettings(json) }
+                WatchLinkPaths.WAKE_EPOCH -> app.scope.launch { app.applyWakeEpoch(json) }
+            }
         }
     }
 }

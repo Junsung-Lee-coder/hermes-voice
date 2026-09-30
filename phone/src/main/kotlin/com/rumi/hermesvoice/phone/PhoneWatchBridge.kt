@@ -10,6 +10,7 @@ import com.google.android.gms.wearable.Wearable
 import com.google.android.gms.wearable.WearableListenerService
 import com.rumi.hermesvoice.core.settings.WatchSettings
 import com.rumi.hermesvoice.core.wake.WakeClaimService
+import com.rumi.hermesvoice.core.wake.WakeEpochItem
 import com.rumi.hermesvoice.core.watchlink.BoundedRead
 import com.rumi.hermesvoice.core.watchlink.PhoneReaderService
 import com.rumi.hermesvoice.core.watchlink.ReaderError
@@ -108,7 +109,8 @@ class PhoneWatchListenerService : WearableListenerService() {
         val app = PhoneApp.from(context)
         val wiring = runCatching { app.wiring() }.getOrNull() ?: return
         val verdict = WakeClaimService.handle(wiring.core.wakeAdmission, nodeId, data)
-        Log.i(TAG, "wake claim from=${nodeId.take(8)} verdict=${verdict?.verdict ?: "released"} holder=${wiring.core.wakeAdmission.holder()}")
+        Log.i(TAG, "wake claim from=${nodeId.take(8)} verdict=${verdict?.verdict ?: "released"} holder=${wiring.core.wakeAdmission.holder()} " +
+            "epoch=${wiring.core.wakeAdmission.epoch}")
         verdict ?: return
         app.appScope.launch {
             runCatching { Wearable.getMessageClient(context).sendMessage(nodeId, WatchLinkPaths.WAKE_VERDICT, verdict.encode()).await() }
@@ -153,6 +155,16 @@ object WatchSettingsSync {
         val request = PutDataMapRequest.create(WatchLinkPaths.SETTINGS).apply {
             dataMap.putString("json", settings.toJson())
             dataMap.putLong("updated_at", System.currentTimeMillis())
+        }.asPutDataRequest().setUrgent()
+        Wearable.getDataClient(context).putDataItem(request).await()
+    }
+}
+
+/** Publishes the count of answered wake requests as a Data Layer item the Watch reads before it listens. */
+object WakeEpochSync {
+    suspend fun publish(context: Context, item: WakeEpochItem) {
+        val request = PutDataMapRequest.create(WatchLinkPaths.WAKE_EPOCH).apply {
+            dataMap.putString("json", item.toJson())
         }.asPutDataRequest().setUrgent()
         Wearable.getDataClient(context).putDataItem(request).await()
     }

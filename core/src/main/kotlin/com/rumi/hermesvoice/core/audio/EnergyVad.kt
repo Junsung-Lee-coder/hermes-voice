@@ -17,18 +17,27 @@ enum class VadClass { VOICED, GRAY, QUIET }
  * - Speech is qualified after [minSpeechMs] of voiced audio in a run whose gaps never exceeded
  *   [maxDipMs] and in which at least [minDensity] of the time was voiced: syllables separated by
  *   short dips count; an isolated click or knock, or sparse clicks such as typing, do not.
- * - The floor (when [adaptive]) is estimated from the last [windowMs] of frame levels:
- *   - it FALLS quickly (time constant [fallTimeConstantMs]) to the window's low level (its
- *     [lowRank]-th quietest frame) whenever that is below it, so a floor that was set too high,
- *     by talking through the calibration or by a steady sound, recovers at the next natural dips
- *     of speech;
- *   - it RISES (time constant [riseTimeConstantMs]) only towards the quietest frame of a
- *     STATIONARY window (loudest frame under [stationaryRatio] × quietest, about 6 dB), and only
- *     if that window is not voiced, or is voiced but either barely above the onset (under
- *     [nearOnsetRatio] × onset) or clearly quieter than the speech heard so far (at most
- *     [absorbBelowSpeech] × the typical voiced level). Speech is strongly modulated, so it never
- *     raises the floor; a steady sound as loud as the speech (a held vowel, a vacuum while
- *     talking) is never taken for background either.
+ * - The floor (when [adaptive]) follows the last [windowMs] of frame levels, differently before
+ *   and after speech was heard in the request:
+ *   - **Before speech**, the background is the typical level. When that second is one level (its
+ *     upper quartile within [compactRatio] × its lower quartile, about 6 dB) the floor follows its
+ *     median: up within [riseTimeConstantMs] if at most [backgroundVoicedShare] of it was voiced,
+ *     down slowly ([settleTimeConstantMs]). So a background whose level wanders is not mistaken
+ *     for speech at its louder moments.
+ *   - **Once speech was heard**, the background is what the speech sits on: the floor follows the
+ *     second's lower quartile (the dips between words) within [followTimeConstantMs]. It rises
+ *     only to levels at most [absorbBelowSpeech] × this talker's typical voiced level, and only
+ *     slowly ([creepTimeConstantMs]) while more than [backgroundVoicedShare] of the second is
+ *     voiced: soft words stay above it, a background that rose does not hold the request open.
+ *   - A floor far too high (the lower quartile under [farBelowRatio] × it, e.g. after talking
+ *     through the calibration) falls at once ([fallTimeConstantMs]).
+ *   - A STEADY loud sound (a full second whose loudest frame is under [stationaryRatio] × its
+ *     quietest) is absorbed ([followTimeConstantMs]) when it is barely above the onset (under
+ *     [nearOnsetRatio] × onset), clearly quieter than the speech heard so far, or, before any
+ *     voice-like speech, when its level does not even wobble like a voice (its 90th-percentile
+ *     frame under [steadyRatio] × its 10th, over at least [steadyFrames] frames): noise that
+ *     starts with nobody speaking. A held vowel, a sound as loud as the speech, or a vacuum while
+ *     talking is never taken for background.
  */
 data class VadProfile(
     val onsetRatio: Double,
@@ -40,12 +49,19 @@ data class VadProfile(
     val hangoverMs: Long = 200,
     val adaptive: Boolean = true,
     val windowMs: Long = 1_000,
-    val lowRank: Int = 3,
+    val compactRatio: Double = 2.0,
+    val backgroundVoicedShare: Double = 0.2,
+    val riseTimeConstantMs: Double = 300.0,
+    val settleTimeConstantMs: Double = 2_000.0,
+    val followTimeConstantMs: Double = 1_000.0,
+    val creepTimeConstantMs: Double = 4_000.0,
+    val farBelowRatio: Double = 0.5,
     val fallTimeConstantMs: Double = 100.0,
-    val riseTimeConstantMs: Double = 1_000.0,
     val stationaryRatio: Double = 2.0,
     val nearOnsetRatio: Double = 1.5,
     val absorbBelowSpeech: Double = 0.45,
+    val steadyRatio: Double = 1.15,
+    val steadyFrames: Int = 25,
 ) {
     companion object {
         /** The shortest voiced sound that counts as speech: a short word, but longer than any isolated click (≤ 100 ms). */
@@ -57,8 +73,7 @@ data class VadProfile(
         /**
          * Finished recordings (push-to-talk and hands-free) before speech-to-text: the same frames
          * and qualification, against a fixed floor (the whole recording is known, so nothing
-         * adapts) and a low onset. It only refuses recordings in which nothing rises half again
-         * above their own background: silence and steady noise, not speech in noise.
+         * adapts) and a low onset that [AudioInputGate] raises when the background itself varies.
          */
         val ELIGIBILITY = VadProfile(onsetRatio = 1.5, releaseRatio = 1.5, adaptive = false)
     }
@@ -68,9 +83,10 @@ data class VadProfile(
  * The energy-floor detector shared by the Phone and the Watch: the hands-free endpoint
  * ([SilenceEndpoint]) and the recording eligibility check ([AudioInputGate]) both run it on the
  * same 20 ms frames ([PcmFramer]). It measures loudness against the background, not speech: loud
- * non-speech sound counts as voiced and very soft speech may not.
+ * changing non-speech sound counts as voiced and speech that does not stand out from the
+ * background may not. [history] is background already heard (the calibration frames).
  */
-class EnergyVad(val profile: VadProfile, initialFloor: Double) {
+class EnergyVad(val profile: VadProfile, initialFloor: Double, history: DoubleArray = DoubleArray(0)) {
     /** Current background estimate (RMS). */
     var floor: Double = max(initialFloor, 1.0)
         private set
@@ -79,17 +95,41 @@ class EnergyVad(val profile: VadProfile, initialFloor: Double) {
     var runMs: Long = 0
         private set
 
+    /** Speech qualified in this request (and was not taken back by [forgetSpeech]). */
+    var heard: Boolean = false
+        private set
+
+    /** Speech that wobbles like a voice was heard: a steady sound can no longer be the first thing in the request. */
+    var voiceHeard: Boolean = false
+        private set
+
+    /** The last frame was absorbed as steady noise with no voice before it (see [VadProfile.steadyRatio]). */
+    var absorbingSteadyNoise: Boolean = false
+        private set
+
     /** Time since the current run started, dips included. */
     private var spanMs = 0L
     private var dipMs = 0L
     private var inRun = false
     private var hangMs = 0L
+
+    /** The last [VadProfile.windowMs] of levels, and whether each frame before the newest was voiced. */
     private var window = DoubleArray(0)
+    private var voicedFlags = BooleanArray(0)
     private var sorted = DoubleArray(0)
     private var windowFilled = 0
     private var windowNext = 0
+    private var flagsFilled = 0
+    private var flagsNext = 0
+    private var voicedInWindow = 0
+    private var pending: DoubleArray? = history.takeIf { it.isNotEmpty() }
 
-    /** Mean level of the voiced frames of qualified, modulated speech so far; 0 before any. */
+    /** Levels of the voiced frames of the current stretch (hangover excluded), for [wobble]. */
+    private val loud = DoubleArray(LOUD_FRAMES)
+    private val loudSorted = DoubleArray(LOUD_FRAMES)
+    private var loudCount = 0
+
+    /** Mean level of the voiced frames of qualified speech so far; 0 before any. */
     private var speechLevel = 0.0
     private var speechFrames = 0L
 
@@ -100,7 +140,17 @@ class EnergyVad(val profile: VadProfile, initialFloor: Double) {
     fun qualifiedFor(voicedMs: Long): Boolean = runMs >= voicedMs && runMs >= spanMs * profile.minDensity
 
     fun observe(level: Double, frameMs: Long): VadClass {
-        val stationary = if (profile.adaptive) track(level, frameMs) else false
+        if (profile.adaptive) {
+            pending?.let { primed ->
+                pending = null
+                for (past in primed) {
+                    push(past, frameMs)
+                    flag(false)
+                }
+            }
+            push(level, frameMs)
+            track(frameMs)
+        }
         val base = max(floor, profile.minFloor)
         val cls = when {
             level >= base * profile.onsetRatio -> {
@@ -115,19 +165,32 @@ class EnergyVad(val profile: VadProfile, initialFloor: Double) {
             else -> VadClass.QUIET
         }
         inRun = cls == VadClass.VOICED
+        if (profile.adaptive) flag(inRun)
         if (inRun) {
             runMs += frameMs
             spanMs += frameMs
             dipMs = 0
-            // Learn how loud this talker is, from real (modulated, qualified) speech only.
-            if (hangMs == 0L && !stationary && qualified) {
-                speechFrames += 1
-                speechLevel += (level - speechLevel) / speechFrames
+            if (hangMs == 0L) {
+                loud[loudCount % loud.size] = level
+                loudCount++
+            }
+            if (qualified) {
+                heard = true
+                val wobble = wobble()
+                if (wobble != null && wobble >= profile.steadyRatio) voiceHeard = true
+                // How loud this talker is: learnt from speech, never from a sound known to be steady.
+                if (hangMs == 0L && !(wobble != null && wobble < profile.steadyRatio)) {
+                    speechFrames += 1
+                    speechLevel += (level - speechLevel) / speechFrames
+                }
             }
         } else if (runMs > 0) {
             dipMs += frameMs
             spanMs += frameMs
-            if (dipMs > profile.maxDipMs) resetRun()
+            if (dipMs > profile.maxDipMs) {
+                resetRun()
+                loudCount = 0
+            }
         }
         return cls
     }
@@ -139,36 +202,94 @@ class EnergyVad(val profile: VadProfile, initialFloor: Double) {
         dipMs = 0
     }
 
-    /** Updates the floor from the recent window; returns whether that window is stationary. */
-    private fun track(level: Double, frameMs: Long): Boolean {
+    /** What qualified was steady noise, not a request: forget it and what it taught about the talker. */
+    fun forgetSpeech() {
+        resetRun()
+        heard = false
+        speechLevel = 0.0
+        speechFrames = 0
+        loudCount = 0
+    }
+
+    /** How much the recent voiced frames vary (90th over 10th percentile), or null with too few to tell. */
+    private fun wobble(): Double? {
+        val n = minOf(loudCount, loud.size)
+        if (n < profile.steadyFrames) return null
+        System.arraycopy(loud, 0, loudSorted, 0, n)
+        java.util.Arrays.sort(loudSorted, 0, n)
+        return loudSorted[n - 1 - n / 10] / max(loudSorted[n / 10], 1e-9)
+    }
+
+    private fun push(level: Double, frameMs: Long) {
         if (window.isEmpty()) {
-            window = DoubleArray((profile.windowMs / frameMs).toInt().coerceAtLeast(profile.lowRank))
+            window = DoubleArray((profile.windowMs / frameMs).toInt().coerceAtLeast(MIN_WINDOW_FRAMES))
+            voicedFlags = BooleanArray(window.size)
             sorted = DoubleArray(window.size)
         }
         window[windowNext] = level
         windowNext = (windowNext + 1) % window.size
         if (windowFilled < window.size) windowFilled++
-        if (windowFilled < MIN_WINDOW_FRAMES.coerceAtMost(window.size)) return false
-        System.arraycopy(window, 0, sorted, 0, windowFilled)
-        java.util.Arrays.sort(sorted, 0, windowFilled)
+    }
+
+    private fun flag(voiced: Boolean) {
+        if (voicedFlags.isEmpty()) return
+        if (flagsFilled == voicedFlags.size) {
+            if (voicedFlags[flagsNext]) voicedInWindow--
+        } else {
+            flagsFilled++
+        }
+        voicedFlags[flagsNext] = voiced
+        if (voiced) voicedInWindow++
+        flagsNext = (flagsNext + 1) % voicedFlags.size
+    }
+
+    /** Updates the floor from the recent window (see [VadProfile]). */
+    private fun track(frameMs: Long) {
+        absorbingSteadyNoise = false
+        val n = windowFilled
+        if (n < MIN_WINDOW_FRAMES) return
+        System.arraycopy(window, 0, sorted, 0, n)
+        java.util.Arrays.sort(sorted, 0, n)
+        val lowerQuartile = sorted[(n - 1) / 4]
+        val median = sorted[(n - 1) / 2]
+        val upperQuartile = sorted[3 * (n - 1) / 4]
+        val fewVoiced = voicedInWindow <= profile.backgroundVoicedShare * n
+        if (heard) {
+            if (lowerQuartile < floor) {
+                follow(lowerQuartile, if (lowerQuartile < floor * profile.farBelowRatio) profile.fallTimeConstantMs else profile.followTimeConstantMs, frameMs)
+            } else if (speechLevel <= 0 || lowerQuartile <= speechLevel * profile.absorbBelowSpeech) {
+                follow(lowerQuartile, if (fewVoiced) profile.followTimeConstantMs else profile.creepTimeConstantMs, frameMs)
+            }
+        } else if (upperQuartile <= lowerQuartile * profile.compactRatio) {
+            if (median < floor) {
+                follow(median, if (median < floor * profile.farBelowRatio) profile.fallTimeConstantMs else profile.settleTimeConstantMs, frameMs)
+            } else if (fewVoiced) {
+                follow(median, profile.riseTimeConstantMs, frameMs)
+            }
+        } else if (lowerQuartile < floor * profile.farBelowRatio) {
+            follow(lowerQuartile, profile.fallTimeConstantMs, frameMs)
+        }
         val minimum = sorted[0]
-        val maximum = sorted[windowFilled - 1]
-        val low = sorted[(profile.lowRank - 1).coerceAtMost(windowFilled - 1)]
-        if (low < floor) {
-            floor = max(1.0, floor + (low - floor) * (1 - exp(-frameMs / profile.fallTimeConstantMs)))
-        }
-        val stationary = windowFilled == window.size && maximum < minimum * profile.stationaryRatio
-        if (stationary && minimum > floor) {
+        val maximum = sorted[n - 1]
+        if (n == window.size && maximum < minimum * profile.stationaryRatio && minimum > floor) {
             val onset = max(floor, profile.minFloor) * profile.onsetRatio
-            val background = maximum < onset * profile.nearOnsetRatio ||
-                (speechLevel > 0 && maximum <= speechLevel * profile.absorbBelowSpeech)
-            if (background) floor += (minimum - floor) * (1 - exp(-frameMs / profile.riseTimeConstantMs))
+            val wobble = wobble()
+            val steadyNoise = !voiceHeard && wobble != null && wobble < profile.steadyRatio
+            if (maximum < onset * profile.nearOnsetRatio || (speechLevel > 0 && maximum <= speechLevel * profile.absorbBelowSpeech) || steadyNoise) {
+                follow(minimum, profile.followTimeConstantMs, frameMs)
+                absorbingSteadyNoise = steadyNoise
+            }
         }
-        return stationary
+    }
+
+    private fun follow(target: Double, timeConstantMs: Double, frameMs: Long) {
+        floor = max(1.0, floor + (target - floor) * (1 - exp(-frameMs / timeConstantMs)))
     }
 
     private companion object {
-        const val MIN_WINDOW_FRAMES = 15
+        /** Half a second of frames: the fewest that say anything about the background. */
+        const val MIN_WINDOW_FRAMES = 25
+        const val LOUD_FRAMES = 50
     }
 }
 

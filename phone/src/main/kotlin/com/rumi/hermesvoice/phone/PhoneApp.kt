@@ -15,6 +15,8 @@ import com.rumi.hermesvoice.core.voice.PlaybackCue
 import com.rumi.hermesvoice.core.voice.PlaybackRoute
 import com.rumi.hermesvoice.core.voice.VoiceTurnListener
 import com.rumi.hermesvoice.core.voice.VoiceTurnStage
+import com.rumi.hermesvoice.core.wake.WakeEpisode
+import com.rumi.hermesvoice.core.wake.WakeEpochItem
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import android.util.Log
@@ -29,6 +31,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 
 /**
@@ -83,10 +86,25 @@ class PhoneApp : Application() {
         val dashboard = core.speech as HermesDashboardClient
         // A new core has a new (empty) playback route.
         currentRoute.value = core.orchestrator.playbackRoute
+        // Both: every admitted wake request is told to the Phone's own wake flow and to the Watch,
+        // so a window that was already listening cannot answer the same phrase again.
+        core.onWakeEpisode = { episode ->
+            Log.i(VOICE_TAG, "wake episode answered epoch=${episode.epoch} by=${episode.origin}")
+            wakeEpisodes.value = episode
+            publishWakeEpoch(WakeEpochItem(episode.epoch, episode.claimId))
+        }
+        publishWakeEpoch(WakeEpochItem(core.wakeAdmission.epoch))
         return Wiring(key, endpoint, core, dashboard, connector).also { wiring = it }
     }
 
     private fun prefs(name: String) = getSharedPreferences(name, Context.MODE_PRIVATE)
+
+    /** The latest wake request admitted in Both (see [com.rumi.hermesvoice.core.wake.WakeAdmission]); null before any. */
+    val wakeEpisodes = MutableStateFlow<WakeEpisode?>(null)
+
+    private fun publishWakeEpoch(item: WakeEpochItem) {
+        appScope.launch { runCatching { WakeEpochSync.publish(this@PhoneApp, item) } }
+    }
 
     private val currentRoute = MutableStateFlow<PlaybackRoute?>(null)
 
