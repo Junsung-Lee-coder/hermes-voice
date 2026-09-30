@@ -6,6 +6,8 @@ import com.rumi.hermesvoice.core.ResponsePlaybackSettings
 import com.rumi.hermesvoice.core.SpokenAudio
 import com.rumi.hermesvoice.core.SpokenRole
 import com.rumi.hermesvoice.core.VoiceOrigin
+import com.rumi.hermesvoice.core.audio.AudioInputGate
+import com.rumi.hermesvoice.core.audio.AudioInputVerdict
 import com.rumi.hermesvoice.core.net.HermesConversationPort
 import com.rumi.hermesvoice.core.net.HermesSpeechGateway
 import com.rumi.hermesvoice.core.net.SubmittedTurn
@@ -64,6 +66,9 @@ class VoiceTurnRequest(
 enum class VoiceTurnStage { TRANSCRIBING, ROUTING, ACKNOWLEDGING, DELIVERING, RESPONDING }
 
 interface VoiceTurnListener {
+    /** A recording was refused before acceptance because it had no usable audio ([verdict]); nothing else happens. */
+    fun onInputRejected(turnId: String, origin: VoiceOrigin, verdict: AudioInputVerdict) {}
+
     /** A new voice request was accepted; its [origin] device is now the playback target. */
     fun onAccepted(turnId: String, origin: VoiceOrigin) {}
     fun onStage(turnId: String, stage: VoiceTurnStage) {}
@@ -120,6 +125,7 @@ class VoiceTurnOrchestrator(
     private val routingTimeoutMs: Long = 120_000,
     private val responseTimeoutMs: Long = 15 * 60_000,
     val playbackRoute: PlaybackRoute = PlaybackRoute(),
+    private val inputGate: (ByteArray, String) -> AudioInputVerdict = AudioInputGate::assess,
 ) {
     private val deliveryLock = Mutex()
     private val floorLock = Any()
@@ -130,6 +136,15 @@ class VoiceTurnOrchestrator(
     private class Delivered(val route: AssembledRoute, val turn: SubmittedTurn, val floor: Long, val settings: ResponsePlaybackSettings)
 
     suspend fun run(request: VoiceTurnRequest): VoiceTurnOutcome {
+        // A recording with no usable audio stops here, before acceptance: it is never transcribed,
+        // routed or delivered, and it cannot become the latest voice sender (see AudioInputGate).
+        if (request.recognizedText == null) {
+            val verdict = inputGate(request.audio, request.mimeType)
+            if (verdict != AudioInputVerdict.USABLE) {
+                listener.onInputRejected(request.turnId, request.origin, verdict)
+                return VoiceTurnOutcome.NoSpeech
+            }
+        }
         if (!accept(request)) return VoiceTurnOutcome.Duplicate(request.turnId)
         listener.onAccepted(request.turnId, request.origin)
         request.listener?.onAccepted(request.turnId, request.origin)

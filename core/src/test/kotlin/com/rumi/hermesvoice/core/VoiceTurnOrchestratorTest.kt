@@ -1,5 +1,7 @@
 package com.rumi.hermesvoice.core
 
+import com.rumi.hermesvoice.core.audio.AudioInputVerdict
+
 import com.rumi.hermesvoice.core.auth.*
 import com.rumi.hermesvoice.core.net.*
 import com.rumi.hermesvoice.core.sessions.*
@@ -112,7 +114,10 @@ class VoiceTurnOrchestratorTest {
             }
         }
 
-    private fun orchestrator() = VoiceTurnOrchestrator(speech, conversations,
+    /** These tests carry fake transcripts inside the "audio" bytes, so the acoustic gate (AudioInputGateTest) is bypassed. */
+    private val passThrough: (ByteArray, String) -> AudioInputVerdict = { _, _ -> AudioInputVerdict.USABLE }
+
+    private fun orchestrator() = VoiceTurnOrchestrator(speech, conversations, inputGate = passThrough,
         config = { VoiceTurnConfig("router_session", allowlist, playback) }, listener = playedListener)
 
     /** [say] makes the fake transcriber return those words for this request (default: [transcript]). */
@@ -332,7 +337,7 @@ class VoiceTurnOrchestratorTest {
 
     @Test
     fun `invalid configuration fails closed before any network call`() = runBlocking {
-        val orchestrator = VoiceTurnOrchestrator(speech, conversations,
+        val orchestrator = VoiceTurnOrchestrator(speech, conversations, inputGate = passThrough,
             config = { throw IllegalArgumentException("Hermes direct mode is disabled") })
         val outcome = orchestrator.run(request("t1", VoiceOrigin.PHONE))
         assertTrue(outcome is VoiceTurnOutcome.NotDelivered)

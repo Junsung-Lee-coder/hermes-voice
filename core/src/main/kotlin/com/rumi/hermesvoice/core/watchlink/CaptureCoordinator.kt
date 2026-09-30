@@ -1,5 +1,8 @@
 package com.rumi.hermesvoice.core.watchlink
 
+import com.rumi.hermesvoice.core.audio.AudioInputGate
+import com.rumi.hermesvoice.core.audio.AudioInputVerdict
+
 /** What the Watch's capture lifecycle does to the device: the microphone, haptics, prompt and upload. */
 interface CapturePort {
     /**
@@ -28,9 +31,13 @@ enum class CaptureStop { TAP_SEND, SILENCE, NO_SPEECH, SIZE_LIMIT, MIC_ERROR, LI
  * once when the microphone really delivers audio (push-to-talk) or when calibration completes and
  * the user is cued (wake phrase); the end haptic fires once, after the microphone stopped, and
  * only if the start one did. Whoever stops a capture first (tap, endpoint, lifecycle, failure)
- * decides; later stops are no-ops.
+ * decides; later stops are no-ops. A finished recording with no usable audio is discarded as
+ * "No speech detected" instead of being uploaded.
  */
-class CaptureCoordinator(private val port: CapturePort) {
+class CaptureCoordinator(
+    private val port: CapturePort,
+    private val inputGate: (ByteArray) -> AudioInputVerdict = { AudioInputGate.assess(it, WatchTurnUpload.MIME_WAV) },
+) {
     private val haptics = RecordingHapticLatch()
     private var trigger: TurnTrigger? = null
 
@@ -72,8 +79,12 @@ class CaptureCoordinator(private val port: CapturePort) {
         val wav = port.stopRecorder(captureId, reason)
         haptics.onEnded(captureId)?.let(port::haptic)
         when (reason) {
-            CaptureStop.TAP_SEND, CaptureStop.SILENCE ->
-                if (wav != null) port.upload(captureId, turnTrigger, wav) else port.discard("Too short")
+            // A recording with no usable audio is never uploaded (see AudioInputGate).
+            CaptureStop.TAP_SEND, CaptureStop.SILENCE -> when {
+                wav == null -> port.discard("Too short")
+                inputGate(wav) != AudioInputVerdict.USABLE -> port.discard("No speech detected")
+                else -> port.upload(captureId, turnTrigger, wav)
+            }
             CaptureStop.NO_SPEECH -> port.discard("Didn't hear a request")
             CaptureStop.SIZE_LIMIT -> port.discard("Recording too long for the watch link; nothing was sent")
             CaptureStop.MIC_ERROR, CaptureStop.START_FAILED -> port.discard("Microphone unavailable")

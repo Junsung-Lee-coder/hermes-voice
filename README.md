@@ -153,8 +153,14 @@ The flow is the same whether a turn starts on the Phone or the Watch:
    [wake phrase](#watch-wake-phrase). The Watch sends the recording to the Phone over the Data
    Layer (`/hv/v1/turn/<id>`). One Data Layer frame holds about 13 minutes of audio; a longer Watch
    recording is not sent, and the Watch says so.
-2. **Transcribe.** The Phone calls `POST /api/audio/transcribe`. If no speech is detected, the turn
-   ends without routing or delivering anything. A wake-phrase request the Watch's recognizer
+2. **Check, then transcribe.** A recording with no usable audio (unreadable, digital silence or a
+   dead microphone, or only steady background noise) ends right away as "No speech detected": it
+   isn't sent, transcribed, routed or delivered, and it doesn't change where replies play. The Watch
+   checks before uploading and the Phone checks again before accepting. This is a coarse loudness
+   check, not speech recognition: it is tuned to let soft and short speech through, so loud
+   non-speech sound still reaches speech-to-text, which can mistake it for words. Otherwise the
+   Phone calls `POST /api/audio/transcribe`. If that finds no speech, the turn ends without routing
+   or delivering anything. A wake-phrase request the Watch's recognizer
    already heard arrives as text instead and skips this step; it is treated exactly like a
    transcript.
 3. **Route.** The transcript goes to a **persistent routing session**. It is created hidden
@@ -221,8 +227,8 @@ The Watch shows the app's conversations without ever calling Hermes itself:
   ends), a 50 ms pulse when the microphone really
   starts delivering audio, and a 2 × 30 ms pulse once when recording ends for any reason (also when
   a wake-phrase request heard by the recognizer is sent). Recording pulses are marked as hardware
-  feedback, so turning off touch vibration doesn't hide them; none of them overrides Do Not Disturb
-  or the watch's vibration settings. The Phone's Watch **Haptics** setting turns them all off.
+  feedback rather than touch feedback (how each watch treats that is up to the watch); none of them
+  overrides Do Not Disturb or the watch's vibration settings. The Phone's Watch **Haptics** setting turns them all off.
 
 ## Watch wake phrase
 
@@ -245,7 +251,10 @@ ignored. What happens next depends on how you say it:
   measures the room, and a buzz means "speak now". The request ends after about 2 seconds of
   silence (up to about 4 seconds if background noise got louder after you spoke); short pauses
   between words don't end it, and there is no time limit while you keep talking. If you don't
-  start within 8 seconds, nothing is sent. This is the way to make a long request.
+  start within 8 seconds, nothing is sent. This is the way to make a long request. The ending is
+  based on loudness: loud ongoing sound, such as a TV or other people talking, keeps it open, so
+  tap Send; and speech that stays very soft, close to the background level, may be taken as the
+  end of your request.
 - **Wake phrase and request in one breath:** only the recognizer's **final** result is used, and
   it's sent whole as the request. While partial results keep changing, the Watch keeps waiting
   (up to 8 seconds after the last new partial). Nothing is sent, and the Watch shows "Didn't catch
@@ -291,12 +300,14 @@ non-debuggable builds ignore them.
 
 Only the following has been run:
 
-- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **170 JUnit tests**, all
+- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **179 JUnit tests**, all
   passing. They use an in-process fake dashboard and cover sign-in, session ownership, chat and
   attachments, routing, playback routing, the Watch link and reader contracts, the wake contract
   (final-only, leading wake phrase, contradicted or empty finals, 30/60/120-second recognizer
   streams), silence endpointing (30, 60 and 120 seconds of continuous and of speech-like audio with
-  short pauses are not cut; background noise rising after speech still ends a request),
+  short pauses are not cut; background noise rising after speech still ends a request), the
+  recording input check (silent, near-silent, empty, invalid and background-only recordings are
+  refused before speech-to-text on Phone and Watch; soft, short and normal speech passes),
   haptic timing, gesture arbitration, the Watch capture, wake-window, microphone-handoff and bezel
   scrolling logic the Android adapters delegate to, and source checks of the Android wiring.
 - **Paired debug build:** `gradle :phone:assembleDebug :watch:assembleDebug` succeeded with

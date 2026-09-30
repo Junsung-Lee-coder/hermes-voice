@@ -30,7 +30,7 @@ import org.junit.Assert.fail
 import org.junit.Test
 
 class WatchLinkTest {
-    private val wav = ByteArray(200) { it.toByte() }
+    private val wav = TestAudio.speechWav()
 
     /**
      * Plays instantly (or not at all) and acks through the registry from its own node, as the Watch

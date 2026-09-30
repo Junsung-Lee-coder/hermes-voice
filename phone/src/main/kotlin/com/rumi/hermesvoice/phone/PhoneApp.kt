@@ -8,6 +8,7 @@ import com.rumi.hermesvoice.core.net.HermesDashboardClient
 import com.rumi.hermesvoice.core.net.HermesGatewayConnector
 import com.rumi.hermesvoice.core.sessions.OwnedSessionRegistry
 import com.rumi.hermesvoice.core.VoiceOrigin
+import com.rumi.hermesvoice.core.audio.AudioInputVerdict
 import com.rumi.hermesvoice.core.settings.AppSettings
 import com.rumi.hermesvoice.core.voice.PlaybackCue
 import com.rumi.hermesvoice.core.voice.PlaybackRoute
@@ -89,6 +90,9 @@ class PhoneApp : Application() {
 
     /** Turn ids, stages and where each utterance was confirmed played; no transcript or audio. */
     private val voiceTrace = object : VoiceTurnListener {
+        override fun onInputRejected(turnId: String, origin: VoiceOrigin, verdict: AudioInputVerdict) =
+            log("input rejected turn=${turnId.take(12)} origin=$origin verdict=$verdict (not transcribed, target unchanged)")
+
         override fun onAccepted(turnId: String, origin: VoiceOrigin) =
             log("accepted turn=${turnId.take(12)} origin=$origin playback_target=$origin")
 

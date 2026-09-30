@@ -28,7 +28,7 @@ import org.junit.Test
 
 /** Behaviour of the Watch adapters' pure cores: capture lifecycle, wake window, mic handoff and bezel scrolling. */
 class WatchAdaptersTest {
-    private class FakeCapturePort(var wav: ByteArray? = ByteArray(1_000)) : CapturePort {
+    private class FakeCapturePort(var wav: ByteArray? = TestAudio.speechWav()) : CapturePort {
         val calls = mutableListOf<String>()
         override fun stopRecorder(captureId: String, reason: CaptureStop): ByteArray? { calls += "stop:$captureId:$reason"; return wav }
         override fun haptic(event: HapticEvent) { calls += "haptic:$event" }

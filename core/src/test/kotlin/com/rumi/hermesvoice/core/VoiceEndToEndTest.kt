@@ -39,7 +39,7 @@ class VoiceEndToEndTest {
     @After fun tearDown() = h.close()
 
     private fun run(turnId: String, origin: VoiceOrigin) = runBlocking {
-        h.core.orchestrator.run(VoiceTurnRequest(turnId, origin, ByteArray(64) { 7 }, "audio/wav", PlaybackSink { audio, cue ->
+        h.core.orchestrator.run(VoiceTurnRequest(turnId, origin, TestAudio.speechWav(), "audio/wav", PlaybackSink { audio, cue ->
             played += "${origin.name.lowercase()}:${cue.role}:${cue.sequence}:${h.fake.decodeSpoken(audio)}"
         }))
     }
@@ -91,7 +91,7 @@ class VoiceEndToEndTest {
         val fresh = CoreHarness()
         try {
             val outcome = runBlocking {
-                fresh.core.orchestrator.run(VoiceTurnRequest("x1", VoiceOrigin.PHONE, ByteArray(64), "audio/wav", PlaybackSink { _, _ -> }))
+                fresh.core.orchestrator.run(VoiceTurnRequest("x1", VoiceOrigin.PHONE, TestAudio.speechWav(), "audio/wav", PlaybackSink { _, _ -> }))
             } as VoiceTurnOutcome.NotDelivered
             assertTrue(outcome.reason, outcome.reason.startsWith("config_invalid"))
             assertEquals(0, fresh.fake.server.requestCount)

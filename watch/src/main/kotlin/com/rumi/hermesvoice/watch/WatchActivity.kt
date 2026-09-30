@@ -98,7 +98,10 @@ class WatchActivity : ComponentActivity() {
         override fun cue(line: String) = app.cue(line)
         override fun upload(captureId: String, trigger: TurnTrigger, wav: ByteArray) = app.upload(captureId, trigger, wav)
         override fun uploadRecognized(turnId: String, text: String) = app.uploadRecognized(turnId, text)
-        override fun discard(message: String) = app.discard(message)
+        override fun discard(message: String) {
+            Log.i(TAG, "capture discarded: $message")
+            app.discard(message)
+        }
     }
 
     private val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->

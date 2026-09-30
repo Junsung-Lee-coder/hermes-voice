@@ -33,7 +33,7 @@ import org.junit.Test
 
 /** Regressions for the Watch upload path, the playback-target label and the debug QA launch guard. */
 class WatchIntakeRegressionTest {
-    private val wav = ByteArray(200) { it.toByte() }
+    private val wav = TestAudio.speechWav()
 
     private class RecordingWatch(private val h: CoreHarness, override val nodeId: String = "watch-node-a") : WatchTransport {
         val states: MutableList<TurnStateMessage> = Collections.synchronizedList(mutableListOf())
