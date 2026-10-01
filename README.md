@@ -529,7 +529,8 @@ anything on the Watch.
   current answer each time (the permission, the app's notifications and the session's channel),
   not a remembered one. The opt-ins and the "asked" flag belong to this install: backup and
   device transfer leave them out, so a restored or transferred install starts with both off. An
-  update from the build before this one also starts with the Phone's relay off.
+  update from a build that kept the relay switch in the backed-up settings also starts with the
+  Phone's relay off.
 - **Power.** While the Watch listens with its app closed it keeps the CPU awake with partial wake
   locks: one for each open window (until its deadline), one from the wake phrase to the recorder
   (the microphone handoff and, in Both, the Phone's answer), and one for each gap between windows
@@ -699,8 +700,8 @@ Only the following has been run:
   - *Held sounds and noise bursts:* a 75-second request with a 2.5-second held "uhh" at speech
     level in the middle (Watch and Phone), and one with a 4-second steady noise burst at speech
     level (Watch), were recorded whole and ended 2.0 s after the speech; an early build cut
-    such requests and sent them truncated. Both were repeated on the Watch with the current build
-    (synthesized voice), with the same result; the rest of this item is from an earlier build. Speech that was already under way when the
+    such requests and sent them truncated. Both were repeated on the Watch with a later build, before
+    background operation (synthesized voice), with the same result; the rest of this item is from an earlier build. Speech that was already under way when the
     recorder started was detected and sent complete. Push-to-talk speech about 4 dB above steady
     noise was accepted and answered on both devices; the same noise alone was refused before
     speech-to-text on both. Tapping Talk while the Phone's real recognizer was listening released
@@ -743,7 +744,7 @@ Only the following has been run:
     returned Latin text for the Korean recordings, so the English wording was used. Failed and
     unreadable storage, restarts between steps, alias races and the interrupted or unverifiable
     replacement of the routing session were exercised only in the unit tests.
-  - *Room recordings and recorded human speech (current build):* recordings of real rooms
+  - *Room recordings and recorded human speech (a build before background operation):* recordings of real rooms
     (DEMAND, CC BY 4.0) and of people reading aloud (Mini LibriSpeech, CC BY 4.0), mixed offline,
     were played into the microphones. With nobody speaking after the buzz (recorder started by
     the simulated recognizer), 40 seconds of a living room, a cafeteria and an office each ended
@@ -759,11 +760,11 @@ Only the following has been run:
     answered on both devices. Eight seconds of the cafeteria alone **passed the recording check
     on both devices**; speech-to-text then returned nothing and the request ended as "no
     speech" with nothing delivered.
-  - *Words said one at a time (current build):* eight synthesized words with 450 ms between
+  - *Words said one at a time (a build before background operation):* eight synthesized words with 450 ms between
     them, after a wake on the Watch, were recorded whole and ended 1.96 s after the last word.
     Ten seconds of synthetic 160 ms syllables 240 ms apart ended 2.0 s after the last one; the
     build before ended that recording 0.84 s after it.
-  - *Both and the wake location (current build, simulated recognizers, so this tests the flow
+  - *Both and the wake location (a build before background operation, simulated recognizers, so this tests the flow
     and not recognition):* with a debug delay holding a finished Watch recording back for 25
     seconds, the Watch kept renewing its claim every 3 seconds, a wake on the Phone during the
     wait was refused as "the other device is answering", and the recording was then accepted and
@@ -774,9 +775,43 @@ Only the following has been run:
     run produced one request. Changing the wake location on the Phone while the Watch was
     recording a wake request cancelled it unsent, and the Watch showed "Wake settings changed.
     Say it again".
-  - *Routing (current build):* a spoken Phone request created a conversation with the composed
+  - *Routing (a build before background operation):* a spoken Phone request created a conversation with the composed
     ack naming the registered title and alias, and the next request on that topic reused it.
-  - *Background operation after the review repair (current build; bounded).* The emulators'
+  - *Background operation, current build (installed on both emulators).* Notifications were
+    allowed through the system's own screens (the Watch's prompt; on the Phone, which had already
+    asked once, its notification settings page), and the test dashboard was signed in by hand on
+    the Phone. The Watch emulator has no speech recognizer, so every Watch wake below came from
+    the simulated recognizer (it tests the flow after a wake, never recognition); the microphone
+    audio, speech-to-text, routing, the model's replies and playback were real.
+    - Notifications: both showed their ongoing notification; tapping its **Stop** ended the
+      session and removed the notification on each device. Restarting from the open app worked.
+      With the real recognizer selected the Watch showed "replies only (no recognizer)" and ran
+      without the microphone type.
+    - Phone push-to-talk: requests were transcribed, routed (one to an existing conversation,
+      one to a conversation the router created, with the composed ack), the transcript delivered
+      word for word as transcribed, and the ack and the final reply played to completion.
+    - Watch with the Phone relay on and the Phone app closed with its screen off: a push-to-talk
+      request was relayed, and the ack and the final reply played on the Watch, each confirmed
+      as played. With the Watch's session on, the Watch app closed and its screen off, two
+      wake requests of recorded speech were recorded, sent, answered and played on the Watch in
+      the same way; three minutes hidden kept opening windows with the listen wake lock held; a
+      reopened or recreated Watch app kept listening.
+    - Where replies play: after Watch requests, browsing conversations on the Watch, a typed
+      Phone message and a silent Phone recording (refused before speech-to-text) left replies on
+      the Watch; a spoken Phone request moved them to the Phone, and a Watch wake with nothing
+      said (discarded as "Didn't hear a request") didn't move them back.
+    - Stop: the Watch notification's Stop during a recording discarded it unsent; during the ack
+      of a pending request it stopped the ack, and the request wasn't delivered; during the final
+      reply it stopped playback (the request had been delivered after its ack). The Phone
+      notification's Stop during a Watch request stopped that request before delivery, stopped
+      the ack on the Watch and told the Watch the request was stopped. Afterwards no service,
+      notification or wake lock of the app remained, and no crash or ANR was recorded.
+    - **Not run:** recognition of any kind on the Watch or in Korean; showing the Watch's
+      "checking Phone settings" state at runtime (the settings check finished before a tap
+      could land; unit tests cover it); a Watch that can't be reached (it needs the link cut);
+      rotation; and anything on physical devices, including deep sleep, battery, Doze and
+      manufacturer power rules.
+  - *Background operation, on the build before the current one (bounded).* The emulators'
     notification permission is undecided (the prompt was dismissed, never answered), so the
     Watch's new rule applied throughout. Its Start ran the session for *media playback* only,
     showing "replies only. Allow notifications, then open this app to listen" and "Notification
@@ -788,12 +823,12 @@ Only the following has been run:
     session. On the Phone, the relay was off after the update (its old copy in the backed-up
     settings was dropped), and switching it on ran it as before, saying its notification is
     hidden. The Phone's dashboard session had expired and wasn't signed in again, so no request
-    was transcribed or answered and no reply played. **Not run on this build:** listening,
+    was transcribed or answered and no reply played. **Not run on that build:** listening,
     recording and sending with the Watch app closed (they need notifications allowed), the
     notification and its Stop, hidden playback, anything needing the dashboard, recognition, and
     physical devices.
-  - *Background operation, on the build before the review repair (these runs don't cover the
-    current build, whose session code changed; the Watch emulator has no speech recognizer, so
+  - *Background operation, on earlier builds (these runs don't cover the current build, whose
+    session code changed; the Watch emulator has no speech recognizer, so
     every Watch wake below came from the simulated recognizer: it tests the flow after a wake,
     never recognition).* Both switches started only from the open apps: the services ran as
     *microphone + media playback* (Watch) and *connected device + media playback* (Phone). With
