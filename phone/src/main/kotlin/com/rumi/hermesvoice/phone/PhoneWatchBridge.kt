@@ -9,21 +9,28 @@ import com.google.android.gms.wearable.PutDataMapRequest
 import com.google.android.gms.wearable.Wearable
 import com.google.android.gms.wearable.WearableListenerService
 import com.rumi.hermesvoice.core.settings.WatchSettings
-import com.rumi.hermesvoice.core.watchlink.LinkFrame
+import com.rumi.hermesvoice.core.wake.WakeClaimService
+import com.rumi.hermesvoice.core.wake.WakeEpochItem
+import com.rumi.hermesvoice.core.watchlink.BoundedRead
+import com.rumi.hermesvoice.core.watchlink.PhoneReaderService
+import com.rumi.hermesvoice.core.watchlink.ReaderError
+import com.rumi.hermesvoice.core.watchlink.ReaderRequest
+import com.rumi.hermesvoice.core.watchlink.ReaderResponse
 import com.rumi.hermesvoice.core.watchlink.TurnStateMessage
 import com.rumi.hermesvoice.core.watchlink.WatchLinkPaths
 import com.rumi.hermesvoice.core.watchlink.WatchTransport
-import java.io.ByteArrayOutputStream
-import java.io.InputStream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 
-/** Data Layer sends to the single Watch node a turn came from. */
+/**
+ * Data Layer sends to the single Watch node a turn came from. Holds only the application
+ * context: it lives in app-scoped coroutines well past the listener service that created it.
+ */
 class DataLayerWatchTransport(context: Context, override val nodeId: String) : WatchTransport {
-    private val messages = Wearable.getMessageClient(context)
-    private val channels = Wearable.getChannelClient(context)
+    private val messages = Wearable.getMessageClient(context.applicationContext)
+    private val channels = Wearable.getChannelClient(context.applicationContext)
 
     override suspend fun sendMessage(path: String, bytes: ByteArray) {
         messages.sendMessage(nodeId, path, bytes).await()
@@ -42,21 +49,27 @@ class DataLayerWatchTransport(context: Context, override val nodeId: String) : W
 }
 
 /**
- * Receives Watch turns (`/hv/v1/turn/<id>` channels) and playback ACKs (`/hv/v1/played`). Turns
- * are handed to the shared [com.rumi.hermesvoice.core.HermesVoiceCore]; an accepted turn makes its
- * Watch node the playback target, reached through [DataLayerWatchTransport].
+ * Receives Watch turns (`/hv/v1/turn/<id>` channels), playback ACKs (`/hv/v1/played`) and reader
+ * requests (`/hv/v1/reader/request`). Turns are handed to the shared
+ * [com.rumi.hermesvoice.core.HermesVoiceCore]; an accepted turn makes its Watch node the playback
+ * target, reached through [DataLayerWatchTransport]. Reader requests are answered to the asking
+ * node only and never touch voice state. Work outlives this service, so only the application
+ * context is used from app-scoped coroutines.
  */
 class PhoneWatchListenerService : WearableListenerService() {
     override fun onChannelOpened(channel: ChannelClient.Channel) {
         val path = channel.path
-        if (WatchLinkPaths.turnIdFromPath(path) == null) return
-        val app = PhoneApp.from(this)
-        val transport = DataLayerWatchTransport(this, channel.nodeId)
-        app.appScope.launch {
-            val client = Wearable.getChannelClient(this@PhoneWatchListenerService)
+        val turnId = WatchLinkPaths.turnIdFromPath(path) ?: return
+        val context = applicationContext
+        val app = PhoneApp.from(context)
+        val transport = DataLayerWatchTransport(context, channel.nodeId)
+        // In the application scope, as a tracked turn: it outlives this service call and the screen.
+        app.launchTurn(turnId, phoneOrigin = false) {
+            val client = Wearable.getChannelClient(context)
+            // null = unreadable or larger than one frame: rejected below without reaching the orchestrator.
             val bytes = try {
                 val input = client.getInputStream(channel).await()
-                withContext(Dispatchers.IO) { readBounded(input, LinkFrame.MAX_PAYLOAD_BYTES + LinkFrame.MAX_HEADER_BYTES + 8) }
+                withContext(Dispatchers.IO) { BoundedRead.readAtMost(input, BoundedRead.FRAME_LIMIT) }
             } catch (error: Exception) {
                 Log.w(TAG, "watch turn read failed: ${error.javaClass.simpleName}")
                 null
@@ -64,35 +77,66 @@ class PhoneWatchListenerService : WearableListenerService() {
                 runCatching { client.close(channel).await() }
             }
             val wiring = runCatching { app.wiring() }.getOrNull()
-            val turnId = WatchLinkPaths.turnIdFromPath(path)!!
-            if (bytes == null || wiring == null) {
+            if (wiring == null) {
                 runCatching {
-                    transport.sendMessage(WatchLinkPaths.STATE, TurnStateMessage(turnId, "rejected",
-                        if (wiring == null) "Set up Hermes on the phone" else "Recording transfer failed", true).encode())
+                    transport.sendMessage(WatchLinkPaths.STATE, TurnStateMessage(turnId, "rejected", "Set up Hermes on the phone", true).encode())
                 }
-                return@launch
+                return@launchTurn
             }
+            Log.i(TAG, "watch turn ${turnId.take(12)} received bytes=${bytes?.size ?: -1}")
             val outcome = wiring.core.watchIntake.onTurnChannel(path, bytes, transport)
-            Log.i(TAG, "watch turn ${turnId.take(12)} outcome=${outcome?.javaClass?.simpleName}")
+            Log.i(TAG, "watch turn ${turnId.take(12)} outcome=${outcome?.javaClass?.simpleName ?: "rejected"}")
         }
     }
 
     override fun onMessageReceived(event: MessageEvent) {
-        if (event.path != WatchLinkPaths.PLAYED) return
-        val accepted = runCatching { PhoneApp.from(this).wiring().core.watchAcks.onPlayedMessage(event.sourceNodeId, event.data) }
-        if (accepted.getOrNull() != true) Log.w(TAG, "ignored playback ack from ${event.sourceNodeId.take(8)}")
+        when (event.path) {
+            WatchLinkPaths.PLAYED -> {
+                val accepted = runCatching { PhoneApp.from(this).wiring().core.watchAcks.onPlayedMessage(event.sourceNodeId, event.data) }
+                if (accepted.getOrNull() != true) Log.w(TAG, "ignored playback ack from ${event.sourceNodeId.take(8)}")
+            }
+            WatchLinkPaths.READER_REQUEST -> answerReader(event.sourceNodeId, event.data)
+            WatchLinkPaths.WAKE_CLAIM -> answerWakeClaim(event.sourceNodeId, event.data)
+        }
     }
 
-    private fun readBounded(input: InputStream, limit: Int): ByteArray? = input.use { stream ->
-        val out = ByteArrayOutputStream()
-        val buffer = ByteArray(16 * 1024)
-        while (true) {
-            val read = stream.read(buffer)
-            if (read < 0) break
-            if (out.size() + read > limit) return null
-            out.write(buffer, 0, read)
+    /**
+     * "Both": the Watch asks for, renews or releases the wake claim. The Phone decides
+     * ([com.rumi.hermesvoice.core.wake.WakeAdmission]) with the Watch's node id taken from the Data
+     * Layer, and answers that node only. No answer (Phone not set up) makes the Watch fail closed.
+     */
+    private fun answerWakeClaim(nodeId: String, data: ByteArray) {
+        val context = applicationContext
+        val app = PhoneApp.from(context)
+        val wiring = runCatching { app.wiring() }.getOrNull() ?: return
+        val verdict = WakeClaimService.handle(wiring.core.wakeAdmission, nodeId, data)
+        Log.i(TAG, "wake claim from=${nodeId.take(8)} verdict=${verdict?.verdict ?: "released"} holder=${wiring.core.wakeAdmission.holder()} " +
+            "epoch=${wiring.core.wakeAdmission.epoch}")
+        verdict ?: return
+        app.appScope.launch {
+            runCatching { Wearable.getMessageClient(context).sendMessage(nodeId, WatchLinkPaths.WAKE_VERDICT, verdict.encode()).await() }
         }
-        out.toByteArray()
+    }
+
+    private fun answerReader(nodeId: String, data: ByteArray) {
+        val context = applicationContext
+        val app = PhoneApp.from(context)
+        val request = ReaderRequest.decode(data) ?: return
+        app.appScope.launch {
+            val wiring = runCatching { app.wiring() }.getOrNull()
+            val response = when {
+                wiring == null -> ReaderResponse(request.reqId, request.kind, ok = false, error = ReaderError.NOT_CONFIGURED,
+                    sessionId = request.sessionId).encode()
+                app.tokens.load() == null -> ReaderResponse(request.reqId, request.kind, ok = false, error = ReaderError.SIGN_IN_REQUIRED,
+                    sessionId = request.sessionId).encode()
+                else -> PhoneReaderService(wiring.core.sessions).handle(data)
+            } ?: return@launch
+            val sent = runCatching {
+                Wearable.getMessageClient(context).sendMessage(nodeId, WatchLinkPaths.READER_RESPONSE, response).await()
+            }
+            Log.i(TAG, "reader ${request.kind.wire} req=${request.reqId.take(12)} to=${nodeId.take(8)} bytes=${response.size} " +
+                "sent=${sent.isSuccess}")
+        }
     }
 
     companion object {
@@ -112,6 +156,16 @@ object WatchSettingsSync {
         val request = PutDataMapRequest.create(WatchLinkPaths.SETTINGS).apply {
             dataMap.putString("json", settings.toJson())
             dataMap.putLong("updated_at", System.currentTimeMillis())
+        }.asPutDataRequest().setUrgent()
+        Wearable.getDataClient(context).putDataItem(request).await()
+    }
+}
+
+/** Publishes the count of answered wake requests as a Data Layer item the Watch reads before it listens. */
+object WakeEpochSync {
+    suspend fun publish(context: Context, item: WakeEpochItem) {
+        val request = PutDataMapRequest.create(WatchLinkPaths.WAKE_EPOCH).apply {
+            dataMap.putString("json", item.toJson())
         }.asPutDataRequest().setUrgent()
         Wearable.getDataClient(context).putDataItem(request).await()
     }

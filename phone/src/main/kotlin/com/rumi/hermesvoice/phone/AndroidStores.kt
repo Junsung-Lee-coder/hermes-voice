@@ -17,6 +17,9 @@ import javax.crypto.spec.GCMParameterSpec
 class SharedPreferencesKeyValueStore(private val prefs: SharedPreferences) : KeyValueStore {
     override fun getString(key: String): String? = prefs.getString(key, null)
     override fun putString(key: String, value: String) { prefs.edit().putString(key, value).apply() }
+
+    /** `SharedPreferences.commit()`: synchronous, and its result says whether the write reached disk. */
+    override fun commitString(key: String, value: String): Boolean = prefs.edit().putString(key, value).commit()
     override fun getBoolean(key: String, default: Boolean): Boolean = prefs.getBoolean(key, default)
     override fun putBoolean(key: String, value: Boolean) { prefs.edit().putBoolean(key, value).apply() }
     override fun getInt(key: String, default: Int): Int = prefs.getInt(key, default)

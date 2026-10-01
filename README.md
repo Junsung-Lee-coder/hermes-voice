@@ -5,15 +5,15 @@ to an existing [Hermes](#hermes-dashboard-apis-used) dashboard by voice or text.
 
 - The **Phone** signs in to a Hermes dashboard and calls its authenticated APIs directly. It
   manages its own conversations, text chat with attachments, and push-to-talk voice turns.
-- The **Watch** never talks to Hermes and holds no credentials. It records audio and plays
-  replies, and talks only to the paired Phone over the Wear OS Data Layer.
+- The **Watch** never talks to Hermes and holds no credentials. It records audio, plays replies,
+  and reads the app's conversations, talking only to the paired Phone over the Wear OS Data Layer.
 - A voice turn is transcribed on the dashboard and then sent to a hidden **routing session**,
   which picks one of your conversations by alias. The transcript is delivered there only after a
   short spoken acknowledgement has played.
 
 > **Status: pre-release, debug builds only.** There is no release signing, R8/minification is
-> off, and the version is `0.1.0-dev`. Voice has been exercised end to end once, on a Phone
-> emulator with generated speech. The Watch has never run paired with a Phone. See
+> off, and the version is `0.1.0-dev`. Voice has run end to end on a Phone emulator, including
+> speech fed to the emulator microphone. The Watch has run only on an unpaired emulator. See
 > [Validation](#validation) and [Known limitations](#known-limitations) before relying on it.
 
 ## Repository layout
@@ -24,8 +24,8 @@ core/     Pure Kotlin/JVM library: dashboard sign-in, dashboard + gateway client
           and the Phone↔Watch link contract. Holds all unit tests.
 phone/    Android app (Jetpack Compose): sign-in, conversation list, history, text chat with
           attachments, push-to-talk, Phone and Watch settings, Data Layer bridge to the Watch.
-watch/    Wear OS app (Compose for Wear OS): push-to-talk, optional wake phrase with silence
-          endpointing, playback on the Watch.
+watch/    Wear OS app (Compose for Wear OS): conversation reader (session browser and history),
+          push-to-talk, optional wake phrase with silence endpointing, playback on the Watch.
 scripts/  core-jvm-check.sh: compiles :core and runs its JUnit tests without Gradle or the
           Android SDK.
 ```
@@ -140,38 +140,123 @@ each, which keeps base64 frames under the 16 MiB WebSocket frame limit of older 
 - **The registry is local.** After a reinstall or on a second phone, earlier sessions aren't listed,
   even though they still carry the app's source on the server.
 - **The Watch holds no credentials.** It never calls Hermes and only exchanges `/hv/v1/*` messages
-  with the Phone.
+  with the Phone. Its conversation reader goes through the Phone with the same checks (see
+  [Watch conversation reader](#watch-conversation-reader)).
 
 ## Voice turns
 
 The flow is the same whether a turn starts on the Phone or the Watch:
 
-1. **Record a WAV.** On the Phone, the Talk button toggles recording. On the Watch, use
-   push-to-talk or an optional wake phrase with silence endpointing. The Watch sends the recording
-   to the Phone over the Data Layer (`/hv/v1/turn/<id>`).
-2. **Transcribe.** The Phone calls `POST /api/audio/transcribe`. If no speech is detected, the turn
-   ends without routing or delivering anything.
+1. **Record a WAV.** On the Phone, the Talk button toggles push-to-talk recording; the Phone
+   push-to-talk recorder keeps at most the first 2 minutes of a recording (a Phone-only limit). On
+   the Watch, push-to-talk records until you tap Send with no time limit. On either device the
+   optional [wake phrase](#wake-phrase-phone-and-watch) starts a hands-free recording that is sent
+   when you stop talking. The Watch sends its recording to the Phone over the Data Layer
+   (`/hv/v1/turn/<id>`). One Data Layer frame holds about 13 minutes of audio; a longer Watch
+   recording is not sent, and the Watch says so (a Phone hands-free recording has the same bound).
+2. **Check, then transcribe.** A recording with no usable audio (unreadable, digital silence or a
+   dead microphone, or only steady background noise) ends right away as "No speech detected": it
+   isn't sent, transcribed, routed or delivered, and it doesn't change where replies play. The Watch
+   checks before uploading and the Phone checks again before accepting. The check runs the same
+   voice-activity detector as the hands-free ending (see [Hands-free ending](#hands-free-ending-shared-vad)),
+   with a lower bar. It refuses a recording in which nothing stood out from its own background for
+   140 ms, or whose loud part (half a second or more) stays at one steady level, i.e. silence or
+   steady noise, also when the noise started and stopped during the recording. How far "stood
+   out" is depends on the background: half again above a steady one (speech 3 dB above loud
+   steady noise passes), and more when the background's own level moves: several times its usual
+   swing, up to four times the background. So a room whose noise merely wanders is refused
+   too, and speech there has to be clearly above the noise. It is a loudness check, not speech
+   recognition: it lets soft and short speech through, so changing non-speech sound (dishes, a
+   door, typing next to the microphone) still reaches speech-to-text, which
+   can mistake it for words. Otherwise the Phone calls `POST /api/audio/transcribe`. If that finds no speech,
+   the turn ends without routing or delivering anything. A wake-phrase request the recognizer
+   already heard in full arrives as text instead and skips this step; it is treated exactly like a
+   transcript.
 3. **Route.** The transcript goes to a **persistent routing session**. It is created hidden
    (`source = "recorder-phone-router"`) on first use, then reused, and never appears in lists. The
-   prompt restates the routing contract, lists the allowlisted aliases, and marks the transcript as
-   untrusted data.
-4. **Fail closed.** The router must reply with exactly one JSON object
-   `{"destination":"<alias>","ack":"<text>"}`.
+   prompt restates the routing contract (version 2), lists the allowlisted destinations (possibly
+   none) as one JSON object per line, and marks both their descriptions and the transcript as
+   untrusted data. A routing session created by an older version of the app is replaced once (see
+   [New conversations from the router](#new-conversations-from-the-router)).
+4. **Fail closed.** The router must reply with exactly one JSON object, one of:
+   - `{"action":"route","destination":"<alias>","ack":"<text>"}` to use an existing conversation.
+     The older `{"destination","ack"}` form without `action` still means this.
+   - `{"action":"create","title":"<title>","alias":"<alias>","description":"<text>"}` to ask for a
+     **new conversation**, only when none of the listed ones fits (see
+     [New conversations from the router](#new-conversations-from-the-router)). It carries no ack:
+     the Phone words that one itself, and ignores any the model adds.
    - The allowlist is built only from your **unarchived** conversations (at most 32). Archiving a
      conversation removes it as a destination. The routing session can never be a destination.
-   - The alias must match an allowlist entry exactly, and the ack must be 1–240 characters.
-   - Anything else fails closed: nothing is spoken and nothing is delivered. Extra keys, including
-     a session id the model invents, are ignored. Session ids never come from the model.
-5. **Acknowledge.** The ack is synthesized with `POST /api/audio/speak` and played. If it can't be
-   played, the transcript isn't delivered. For a Watch turn, only a `/hv/v1/played` ACK from that
+   - A `destination` must match an allowlist entry exactly, and the ack must be 1–240 characters.
+   - The two forms can't be mixed: a route (with or without `action`) that also has a title, alias
+     or description, a create with a destination, an unknown `action`, or anything else fails
+     closed: nothing is spoken, nothing is created and nothing is delivered. Extra keys, including a session id, source or role the model invents,
+     are ignored. Session ids never come from the model.
+5. **Acknowledge.** The ack is synthesized with `POST /api/audio/speak` and played. For an
+   existing conversation it is the router's sentence (its wording is the model's, so it can be
+   imprecise). If it can't be played, the transcript isn't delivered. For a Watch turn, only a `/hv/v1/played` ACK from that
    Watch's node counts. The Watch sends `ok=true` only when its player completes normally.
-6. **Deliver.** Only then is the original transcript submitted to the chosen conversation.
+6. **Deliver.** Only then is the original transcript submitted to the chosen conversation, after
+   one more check that it is still the app's and not archived, on the Phone or on the dashboard.
+   If it was archived while the ack played, nothing is sent, to it or anywhere else.
 7. **Speak replies.** The final reply (`message.complete`) is always spoken. The first and middle
    interim replies are spoken only if enabled in Settings (both are off by default). Text you
    already heard isn't repeated, and the app never makes up interim events.
 
 Turns are serialized from capture to delivery. Replayed turn ids, such as Data Layer retries, are
 ignored.
+
+### New conversations from the router
+
+When nothing you have fits what you said, including when you have no conversations yet, the router
+may ask for a new one. You are not asked to confirm; the request itself is the authorization.
+
+- **The router only proposes.** It suggests a title (up to 80 characters), an alias and a short
+  description, with the same limits as conversations you make by hand. The Phone creates the
+  conversation through the same dashboard call and the same ownership rules as the Create button:
+  visible, tagged with the app's source, recorded in the local registry. The Watch never creates
+  anything; its turns go through the Phone.
+- **The alias is assigned by the Phone.** If the suggested alias is already in use, the Phone adds
+  a short suffix derived from the turn (`garden-3fa2`). An existing conversation is never used in
+  its place. Titles don't have to be unique, so two conversations can share one; the alias is what
+  tells them apart, and the ack names it. Creating by hand, renaming, unarchiving and the router's
+  creations all go through one lock, so an alias can't be taken twice and the limit of 32 active
+  conversations holds; a manual alias that is already used is refused, never changed for you.
+- **The Phone words the ack.** For a new conversation the spoken ack is composed by the Phone
+  from what it actually created: "Creating a new conversation called *title*, alias *alias*, and
+  sending this there." (in Korean when your request contains Hangul). Whatever sentence the
+  model wrote for it is not used, so the ack can't name another conversation or claim nothing was
+  created.
+- **Order.** Save "about to create" → create → save the new id → read the new row back from the
+  dashboard and check it is the app's and not archived → save it in the registry → speak the ack
+  and wait for playback to finish → check again that it can receive → save "sent" → deliver your
+  words unchanged → speak the reply. Every "save" is written to the Phone's storage and
+  confirmed before the next step. If creating, checking or saving fails, the turn ends with a
+  message saying so: no ack is spoken and nothing is sent to any other conversation.
+- **Afterwards** the new conversation is a normal one: it is in the Phone list and the Watch
+  browser, and the router can pick its alias for later requests.
+- **At most once per request.** The Phone keeps a small journal (turn id, title, alias, the
+  created session id; never your words) next to its registry. A repeated or replayed turn, even
+  after the app restarts, reuses the conversation it created and never sends your words twice: a
+  turn already marked as sent is reported as a duplicate.
+- **If the Phone's storage fails.** A save that isn't confirmed stops the turn, and the app then
+  refuses to create, acknowledge or send anything from that data until it is restarted and has
+  read what really is on storage. Saved data that can't be read (damaged) is never replaced or
+  emptied: voice and lists fail with a message until it is dealt with.
+- **What can't be guaranteed.** Hermes's create call has no idempotency key or lookup. If the app
+  stops or the connection drops after the dashboard created the conversation but before the Phone
+  saved its id, the Phone can't tell whether one exists. That turn then fails with "a new
+  conversation may already have been created" and is never retried automatically, so there is no
+  duplicate, but an unused conversation may be left on the dashboard that the app doesn't list.
+  Likewise, if the app stops in the instant between saving "sent" and sending, a replay is treated
+  as already sent, so that request can be lost. It is at most once, not exactly once.
+- **Text from the model is cleaned.** Titles, descriptions and acks lose control characters,
+  invisible and direction-changing characters and line separators; ordinary letters of any
+  language stay. Descriptions reach later routing prompts only as quoted data.
+- **Upgrading.** An install whose hidden routing session was seeded for the old contract gets a
+  new hidden one, once. The old one is kept on the dashboard and stays the app's; it is just no
+  longer used. If that replacement is interrupted or can't be verified, it is not tried again
+  and the old routing session keeps being used (every request restates the current contract).
 
 ### Where audio plays: the latest accepted voice sender
 
@@ -187,6 +272,294 @@ accepted voice request**. That covers the ack and the first, middle and final re
 - For example, if you talk on the Watch and then on the Phone before the Watch turn's reply
   arrives, that reply plays on the Phone.
 - The Phone's Talk bar shows the current target. The route is held only in memory on the Phone.
+- Creating a conversation for a request doesn't change any of this: the request's device was
+  already the target when the request was accepted.
+
+## Watch conversation reader
+
+The Watch shows the app's conversations without ever calling Hermes itself:
+
+- **Swipe left** (right to left) switches between the session browser and the open conversation.
+  **Swipe right** (left to right) sends the app to the background; the task and what you were
+  reading stay alive. Vertical touch and the bezel/crown scroll whichever list is on screen. A
+  gesture a list already scrolled with never counts as a swipe.
+- The browser lists the app-owned, unarchived conversations. The conversation shows your own
+  messages right-aligned in blue and replies left-aligned in grey, newest at the bottom, with
+  "Load older" at the top.
+- New messages don't move the view while you're reading older ones. The view follows new
+  messages only if the newest one was already on screen.
+- Loading, "Phone not reachable", sign-in and timeout states are shown explicitly with a Retry.
+- **Wire:** `/hv/v1/reader/request` (Watch → Phone) and `/hv/v1/reader/response` (Phone → the
+  asking node only). Every request has an id; a response is applied only if it answers the
+  request still pending for that list or conversation and comes from the node it was sent to, so
+  late or duplicate answers are dropped.
+- **Ownership:** the Phone answers from the same registry and server `source` checks as its own
+  history. Router, archived, foreign or unknown ids fail closed. Reading never submits anything and
+  never changes where voice replies play or which conversation a voice turn goes to.
+- **Bounds:** at most 24 conversations, 20 messages per page and 60 KB per response (long texts are
+  shortened, marked "more on phone"). The Watch caches 4 conversations and 200 messages each.
+- **Haptics:** a 10 ms touch-feedback tick per bezel step that actually scrolled (nothing at the
+  ends), a 50 ms pulse when the microphone really
+  starts delivering audio, and a 2 × 30 ms pulse once when recording ends for any reason (also when
+  a wake-phrase request heard by the recognizer is sent). Recording pulses are marked as hardware
+  feedback rather than touch feedback (how each watch treats that is up to the watch); none of them
+  overrides Do Not Disturb or the watch's vibration settings. The Phone's Watch **Haptics** setting turns them all off.
+
+## Wake phrase (Phone and Watch)
+
+Off by default and edited only on the Phone (Settings → Wake phrase). **Listen on** chooses where
+it works: **Off**, **Watch**, **Phone** or **Both**. Settings saved before this selector existed
+migrate once: a Watch wake phrase that was on becomes **Watch**, anything else **Off**. The wake
+phrases themselves are one list shared by both devices: space-separated whole words, where `*`
+matches any letters inside one word and nothing else is special. A blank field restores the
+defaults. The Phone sends all voice settings to the Watch as one snapshot with an increasing
+revision (the `/hv/v1/settings` data item). The Watch refuses a snapshot with any invalid value
+(an unknown mode, a silence that isn't a number from 0.5 to 10 on the 0.5 grid, a wrong type) and
+ignores older or equal-revision ones, so a stale snapshot can't switch a listener back on; after
+it is opened, the Watch reads the synced snapshot before it listens. Settings shows each device's
+status: off, listening, or why it can't (no speech recognizer, no microphone permission, not
+signed in, Watch not reachable).
+
+By default it works only while that device's app is open on screen (foreground) and needs no
+permission beyond the microphone. Each time the app is shown, or the screen turns back on with the
+app shown, the platform `SpeechRecognizer` listens for 5 seconds. On the Watch it can also keep
+listening with the app closed and the screen off, once you start **Background** there (see
+[Background operation](#background-operation-opt-in)); the Phone's own wake phrase is always
+foreground-only. On-device
+recognition is used when available; if it reports that it lacks the wake phrases' language, the
+app falls back once to the system's default recognition service, which may send audio over the
+network. It never runs while recording, sending, waiting for a reply, playing
+audio, or for 4 seconds after playback. A device the setting excludes doesn't listen or respond;
+turning it off, leaving the app or the screen going off closes the recognizer and stops a
+hands-free recording without sending it (unless the Watch's background session is listening). The recognizer and the app's recorder never use the
+microphone at the same time: tapping Talk while the recognizer is listening releases it first and
+starts recording after the same short pause. Leaving the screen, which includes rotating the
+Phone, cancels a hands-free recording with "Cancelled"; nothing is sent. The Watch never holds
+credentials: its requests always go through the Phone.
+
+**Both** means both devices may hear the wake phrase, but one spoken wake phrase is answered by
+one device:
+
+- When a device's recognizer hears the wake phrase at the start of what you say, in a partial or
+  final result, it asks the Phone for the claim on that wake phrase before it records or sends
+  anything. The Phone is the only referee. The Watch asks over the paired link and the Phone
+  identifies it by the link, not by anything the Watch says.
+- The first to ask wins and keeps the claim while it listens, hands over to its recorder and
+  records, renewing it every few seconds for as long as that takes (this is not a time limit on
+  the recording). The Watch also keeps renewing it after the recording ended, while the recording
+  travels to the Phone, until the Phone has answered that request; a slow transfer doesn't lose
+  it. The other device is refused: it stops listening, shows that the other device answered, and
+  sends nothing.
+- The Phone accepts a wake-phrase request in Both only with the claim it gave that device, once.
+  A request without it, with another device's, with one that ran out, or made before the Phone
+  app restarted is refused before it is accepted: nothing is transcribed or delivered and where
+  replies play doesn't change.
+- If the answer doesn't arrive within 2.5 seconds, the claim was made under settings the Phone has
+  since changed, or a renewal is refused, the device stops without sending and asks you to say it
+  again. A claim that is no longer renewed (the app closed, the link dropped) runs out after 10
+  seconds. A recording on its way to the Phone gives its claim back when the transfer fails or the
+  Phone refuses it, and the Watch says so; a transfer that neither arrives nor fails is given up
+  after a minute plus the time its size needs at 2 kB/s. The Watch's claim messages go out one at
+  a time in order, so a late message can't undo or outrun a newer one.
+- The Phone counts the wake requests it has accepted, and each device notes that count when its
+  recognizer starts listening. A recognizer that was already listening when a request was accepted
+  can't claim that phrase any more, however late it finishes hearing it: the Phone refuses it, and
+  tells the other device so it stops listening. Listening that starts afterwards is a new request,
+  with no waiting time. If the first device gives its claim back without a request (its final
+  result didn't start with the wake phrase after all), the other device may still answer. Requests
+  are never compared or merged by their words: saying the same thing twice on purpose is two
+  requests.
+- Changing **Listen on** while a wake request is being recorded cancels that recording with a
+  notice; nothing is sent. Other setting changes don't interrupt it.
+- Push-to-talk and typed messages are never arbitrated, and with Watch or Phone alone there is
+  nothing to arbitrate.
+- Where a recognizer gives no partial results, the claim is made at its final result, so both
+  devices may listen to the whole phrase before one is refused; still only one request is
+  accepted.
+
+The wake phrase must come first: at the start of what you say, or right after one short greeting
+("hey", "hi", "hello", "ok", "okay", "안녕", "저기"). A mention in the middle of a sentence is
+ignored. What happens next depends on how you say it:
+
+- **Wake phrase, then pause:** the recognizer is released, the app's own recorder starts and
+  measures the room, and a buzz (a haptic on the Watch and on the Phone; no sound, which would be
+  recorded) means "speak now". The request is sent after the **trailing silence** you set (see
+  below); short pauses don't end it, and there is no time limit while you keep talking. Tap Send
+  (Watch) or "Send now" (Phone) to send it sooner. If you don't start within 8 seconds, nothing is
+  sent. This is the way to make a long request.
+- **Wake phrase and request in one breath:** only the recognizer's **final** result is used, and
+  it's sent whole as the request. While partial results keep changing, the device keeps waiting
+  (up to 8 seconds after the last new partial). Nothing is sent, and the device shows "Didn't
+  catch that", when the recognizer stops or fails before a final result, or when its final result
+  is empty or no longer starts with the wake phrase it heard. A request longer than 4,000
+  characters is refused, not cut.
+- **The system recognizer has its own limits.** It decides when you've finished (its own pause
+  detection, separate from the app's trailing-silence setting) and may end a session on its own,
+  so a pause in a one-breath request can end it early, and what you say after that isn't captured.
+  For a long request, say the wake phrase, wait for the buzz, then speak.
+
+A request spoken on the Phone plays its replies on the Phone, one spoken on the Watch on the Watch
+(the latest accepted voice sender, as for push-to-talk). The recognized text is never logged; only
+counts and outcomes are.
+
+### Hands-free ending (shared VAD)
+
+Both devices end a hands-free request with the same voice-activity detector (VAD), in `:core`:
+
+- **Trailing silence** (Settings → Wake phrase): 0.5 to 10 seconds in 0.5-second steps, 2 seconds
+  by default. The request is sent that long after you stop talking. A recording keeps the value it
+  started with; a change applies from the next request. Short values end at natural pauses between
+  phrases (0.5 s ends in a 0.7 s pause); long values wait through them.
+- **How it listens:** in 20 ms frames, it compares loudness with the room's background, which it
+  measures for 0.4 s before the "speak now" buzz. Speech is three times the background or louder
+  for at least 140 ms, with gaps between syllables of up to 200 ms tolerated and at least 45% of
+  that stretch voiced. A fading syllable stays "speech" for at most 200 ms. To start a request,
+  100 ms of it must also be unbroken, as a syllable is and a string of knocks is not. The same
+  140 ms continues a request after a pause, so words said one at a time keep it open. The
+  timing is the same on the Phone and the Watch and doesn't depend on how the microphone delivers
+  audio.
+- **The background estimate** comes from the last second of sound:
+  - *Before you speak* it is the usual level of that second (its median), as long as the second is
+    one level (the middle half of it within about 6 dB). It follows that level up within a third
+    of a second and down slowly, so a room whose noise wanders isn't taken for speech at its
+    louder moments.
+  - *Once you have spoken* it holds. Speech is quiet for seconds at a time without being
+    background (soft words, the end of a sentence), so nothing heard in one second may raise it.
+    It rises only slowly, towards the quietest tenth of the last three seconds (the pauses and
+    the gaps between words), and only to levels clearly below your voice (under about 45% of its
+    typical level): a background that rose doesn't hold the request open for ever, and soft
+    speech isn't absorbed.
+  - Sound a little above the background (two to three times it) neither counts as your silence
+    nor as speech: it pauses the count. Only background counts towards the trailing silence.
+  - If it started far too high (you spoke before the buzz, or a loud moment fell into the 0.4 s),
+    it drops at once to the quiet between your words.
+  - A steady sound about as loud as your speech is never taken for background once you have
+    spoken: a drawn-out "uhh", a held note, or a vacuum cleaner while you talk does not end your
+    request, however long it lasts.
+  - A steady sound that starts before you have said anything, and doesn't even waver the way a
+    held voice does (under about 1 dB), is noise: it becomes the background after a second or so
+    and the request counts as not started. A held "uhh" first, then speech, is kept whole.
+- **What it can't do:** it measures loudness, not speech.
+  - Loud changing sound (music, TV, other people talking, dishes) can start a request and keeps
+    one open until it stops or you tap Send.
+  - After you have spoken, steady noise that is about as loud as your speech was (in tests, from
+    about half of its level) can't be told from a held voice, so the request stays open for a tap
+    rather than being cut. Quieter steady noise ends it 3–4 s after the speech.
+  - Your voice has to stand clearly above the room. In tests with recorded speech mixed into
+    recordings of five real rooms, no request was cut short with the speech 15 dB or more above
+    the room noise, and a pause of one second between two sentences never ended a request. At
+    10 dB about one in twenty-five was sent without its last words; at 6 dB about one in six
+    was, and one in five wasn't heard at all. A pause of 1.5 s between sentences (with the 2 s
+    setting) ended 7 of 130 requests at 15 dB and none at 20 dB. In a noisy place use
+    push-to-talk, or a longer trailing silence.
+  - A room whose noise swings widely (by about 5 dB or more from moment to moment), or that has
+    loud events of its own (dishes, a door, someone else talking), can still be taken for a
+    request now and then, and a request there can take several seconds longer to end. The
+    recording check refuses most recordings that hold nothing but wandering noise, but not loud
+    events. With nobody speaking, 30-second recordings of a living room, a cafeteria and a
+    laundry room were never sent in these tests; of a kitchen and an office, 4 of 36 were.
+  - A word has to be voiced for 140 ms: very short words with long pauses between them, spoken
+    softly, may not count.
+  - A single click or knock of 100 ms or less doesn't count, and neither does sparse clicking
+    such as slow typing, nor a quick string of short knocks. Sounds that ring on for longer
+    (dishes, a door), and a burst of noise longer than 140 ms, like a cough, can start a request,
+    which speech-to-text may then find empty or mishear.
+
+## Background operation (opt-in)
+
+Both are off by default, on fresh and upgraded installs, and each is switched on only on its own
+device, by you, while that app is on screen. They are not voice settings: where the wake phrase
+listens, the phrases and the trailing silence stay Phone settings, and the Phone can't start
+anything on the Watch.
+
+- **Phone: Settings → Background → "Keep relaying for the Watch when this app is closed".** While
+  on, Watch requests are transcribed, routed, delivered and answered with the Phone app closed and
+  its screen off, and a reply due on the Phone (it sent the latest voice request) still plays. It
+  runs as a foreground service of the *connected device* and *media playback* types, with an
+  ongoing "Relaying …" notification that has **Stop**. This Phone doesn't listen or record in the
+  background: its Talk button and wake phrase work only with the app open. The relay is the same
+  one the open app uses (one dashboard client, one orchestrator, the same saved data).
+- **Watch: the "Background" control under Talk.** "Tap to start" starts a session; while it runs
+  the control says what it really does (listening, replies only, paused) and "Tap to stop" ends
+  it. The session always lets replies play with the app closed. It also keeps listening for the
+  wake phrase with the app closed and the screen off, but only when all of these hold: the Phone's
+  wake setting includes the Watch, the microphone is allowed, the Watch has a speech recognizer,
+  and the session's notification can be shown (notifications allowed, for the app and for its
+  channel). Then it runs one recognizer window after another (30 seconds each, a third of a second
+  apart, backing off up to a minute when the recognizer fails), and records, sends and plays
+  exactly as on screen, including the Both claim. It runs as a foreground service of the
+  *microphone* and *media playback* types with an ongoing notification and **Stop**. Otherwise it
+  runs for *media playback* only and says why ("replies only", with the reason). The Watch's
+  screen isn't kept on for it; only a recording keeps it on, as before.
+- **The microphone is armed only from the open app.** Android doesn't let an app start using the
+  microphone from the background, and the Watch doesn't try. It arms only while its app is on
+  screen, after that show's settings check has finished; a check that finishes after you left is
+  ignored. A Start before the check finishes (for example right after the notification prompt)
+  runs the session for replies only, showing "Background: checking Phone settings (replies
+  only)", and listening starts when the check finishes. If you leave first, it keeps playing
+  replies only ("replies only until opened") and listens after your next visit to the app. A
+  session that was already listening keeps listening while a new visit's check runs. Anything that stops it from listening (the Phone's setting no longer including the
+  Watch, the microphone or notification permission taken away, notifications switched off, no
+  recognizer found) disarms it at once and the session keeps only playback. When that changes
+  back while the app is closed, the Watch shows why it replies only and listens again only once
+  you open it. A missing recognizer is looked for again only when you open the app.
+- **Stop** (the notification's, or the control) is final and can be repeated: nothing listens or
+  records any more. With the app closed it also ends what was under way: a recording is dropped
+  unsent (a Both claim is given back), a recording not yet handed to the Phone is withdrawn, the
+  reply playing stops and the rest of that turn isn't played; on the Phone, turns in flight are
+  stopped and the Watch shows "Stopped on the phone". With the app open, Stop only ends the
+  background part. Withdrawing a recording is best effort once sending has begun: the Phone may
+  already have received it and started on it (transcription, routing, possibly creating a new
+  conversation). Even then, while the Watch remains the latest accepted voice sender, its
+  transcript isn't delivered after a Stop and nothing is confirmed as played: the stopped Watch
+  refuses to play the acknowledgement, and a request is delivered only after its acknowledgement
+  has played. If a newer request from the Phone is accepted first, replies move to the Phone, the
+  older request's acknowledgement can play there, and that request can then be delivered.
+- **Nothing restarts by itself.** A session the system ended (force stop, the system's own Stop,
+  a revoked permission, a reboot, an app update) shows as paused. The Phone's relay starts again
+  when you next open the Phone app; the Watch waits for your "Tap to start". There is no boot
+  start, battery-optimization exemption, assistant role, accessibility service, screen wake or
+  full-screen notification.
+- **Notifications.** Starting asks whether the app may show notifications (Android 13+; on the
+  Phone only the first time). Either way the session runs, but a hidden notification means no Stop
+  outside the app. So the Watch then never listens in the background; it plays replies only and
+  says "Allow notifications, then open this app to listen". Both apps also say when their
+  notification is hidden ("Notification hidden. Tap here to stop" on the Watch, a line under the
+  switch on the Phone), and their in-app control stops the session. The check is the system's
+  current answer each time (the permission, the app's notifications and the session's channel),
+  not a remembered one. The opt-ins and the "asked" flag belong to this install: backup and
+  device transfer leave them out, so a restored or transferred install starts with both off. An
+  update from a build that kept the relay switch in the backed-up settings also starts with the
+  Phone's relay off.
+- **Power.** While the Watch listens with its app closed it keeps the CPU awake with partial wake
+  locks: one for each open window (until its deadline), one from the wake phrase to the recorder
+  (the microphone handoff and, in Both, the Phone's answer), and one for each gap between windows
+  (the pause, a back-off or retry of up to a minute, and a reachability check of at most
+  5 seconds). A new lock is taken before the one it replaces is let go. So the CPU and the speech
+  recognizer keep running: expect a clearly shorter battery life while it is on. While it waits
+  to retry (recognizer failing, Phone unreachable, microphone muted) it says "retrying", not
+  "listening". Each retry's lock is short and time-limited, but retries have no overall limit. A
+  Phone that stays unreachable, a muted microphone or a recognizer that keeps failing can
+  therefore keep the Watch's CPU awake indefinitely, until you tap Stop or the cause goes away.
+  That can drain the battery, and the impact hasn't been measured. Waiting
+  for the Phone's answer after a request is sent holds nothing; the Phone's messages wake the
+  Watch. Every wake lock has a reason and a time limit (a window, a handoff, a gap, a recording, a
+  transfer, a turn, an utterance) and is released when that ends. No battery figure has been
+  measured, and whether a real watch in deep sleep keeps up hasn't been tried.
+- **Audio.** Replies take transient audio focus (other audio ducks) and respect the volume and Do
+  Not Disturb. If focus isn't granted, that utterance isn't played. On Android 15 this happens to
+  Phone replies that become due after you close the Phone app while the relay is off. What
+  follows depends on which utterance it is:
+  - If it's the **acknowledgement**, the request is **not delivered**: a transcript goes to its
+    conversation only after its acknowledgement has played. A conversation the router asked for
+    may already have been created.
+  - If it's the **final reply**, the request was already delivered and shows as delivered with
+    its reply not played.
+
+  Keep the relay on to have both play with the app closed.
+
+Without these switches, what worked before still works while the apps are open. Android may also
+keep a closed app running for a while and let it relay or play, but nothing promises that.
 
 ## Text chat and history
 
@@ -200,47 +573,331 @@ turn completes. Replies to text chat aren't spoken.
   (Dark by default, Light, or System), **Play first response** (off by default) and **Play middle
   responses** (off by default). There's deliberately no setting for the ack or the final reply.
   Settings also shows whether the Watch app is reachable.
-- **Watch settings** (edited on the Phone, synced as the `/hv/v1/settings` data item): wake phrase
-  on/off (off by default), the wake phrases, maximum recording length (5–300 seconds) and haptics.
+- **Voice settings** (edited on the Phone, synced to the Watch as the `/hv/v1/settings` data
+  item): where the wake phrase listens (Off by default), the shared wake phrases, the hands-free
+  trailing silence (2 s by default), and Watch haptics. There is no Watch recording time limit.
+- **Background** (each device's own, not synced; off by default): the Phone's relay switch and
+  the Watch's Background control (see [Background operation](#background-operation-opt-in)).
 - **Dark by default.** On the Phone, sign-in, lists, chat, Settings and dialogs follow the
   Appearance setting. The Watch is always dark and shows whether the Phone is reachable.
 - **Full-width Talk bar.** The Phone's Talk button is a full-width bar above the navigation bar,
   inset for the safe area. It never covers the chat composer, which moves above the keyboard.
 
-**Emulator QA input (debuggable builds only).** Emulator microphones on a headless host capture
-only silence. So a debuggable build accepts an `hv_qa_wav` string extra naming a `<name>.wav` file
-in the app's private `files/qa/` directory, and submits that file through the normal voice path in
-place of a recording. Non-debuggable builds ignore the extra.
+**Emulator QA input (debuggable builds only).** A debuggable build accepts an `hv_qa_wav` string
+extra naming a `<name>.wav` file in the app's private `files/qa/` directory, and submits that file
+through the normal voice path in place of a recording. Both apps accept
+`hv_qa_wake_handoff=second_utterance` (runs the wake handoff as a match would, to test the
+recorder on the real microphone, not recognition; a device the wake setting excludes ignores it).
+Both also accept `hv_qa_recognizer=fixture` with `hv_qa_wake_heard=<text>` (and
+`hv_qa_wake_final=false` for a partial): a simulated recognizer result for the window that launch
+opens. It tests the wake flow and the Both arbitration, never recognition.
+The Phone accepts `hv_qa_wake_location=<OFF|WATCH|PHONE|BOTH>` and `hv_qa_vad_silence=<seconds>`
+(saved and sent to the Watch exactly as from Settings; invalid values are refused). The Watch
+accepts `hv_qa_seed_reader=<n>` (shows synthetic reader rows, to test the reader UI without a
+paired Phone). Each extra is honoured once, for a fresh launch intent only, and non-debuggable
+builds ignore them. For the background session, which must not be brought to the screen, debuggable
+builds also register broadcast receivers (never registered otherwise): on the Watch
+`-a com.rumi.hermesvoice.QA_WATCH --es hv_qa_wake_heard <text> [--es hv_qa_wake_delay_ms <ms>]`
+is a simulated recognizer result for the window open at that moment (again never recognition), and
+`--es hv_qa_background stop` runs the notification's Stop; on the Phone
+`-a com.rumi.hermesvoice.QA_PHONE --es hv_qa_relay stop` does the same for the relay.
 
 ## Validation
 
 Only the following has been run:
 
-- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **97 JUnit tests**, all
+- **Core unit tests:** `scripts/core-jvm-check.sh` compiles `:core` and runs **381 JUnit tests**, all
   passing. They use an in-process fake dashboard and cover sign-in, session ownership, chat and
-  attachments, routing, playback routing and the Watch link contract.
+  attachments, routing, playback routing, the Watch link and reader contracts, the wake contract
+  (final-only, leading wake phrase, contradicted or empty finals, 30/60/120-second recognizer
+  streams), the shared VAD (every trailing-silence choice ends exactly that long after the last
+  speech; identical timing at 8/16/32/48 kHz and 20–160 ms reads; all-zero, peak-2, clicks at any
+  alignment and four background levels give no speech; 30, 60 and 120 seconds of modulated speech
+  are never cut and never raise the background estimate; background rises of 2.5× to 10× after
+  speech still end a request; a held sound or a steady noise burst in the middle of a request, a
+  shallow-modulated voice, and speaking before the buzz (40 seeds at four levels) never end it
+  early; isolated and sparse clicks don't count; short words and soft speech do; push-to-talk
+  speech 3, 5 and 7 dB above steady noise is accepted for 30 seeds at 4, 20 and 60 s while silence
+  and steady noise alone (throughout, or between quiet margins) are refused; whenever the ending finds speech the recording check
+  accepts the same audio), its behaviour in unsteady backgrounds (synthetic, 40 seeds per cell:
+  a background drifting by 1, 2, 3 and 4.5 dB with nobody speaking is recorded as a request in 0,
+  0, 0 and 10 of 40 half-minutes and uploaded in 0, 0, 0 and 9–10; one whose level jumps every
+  100 ms by 2–6 dB in 0, 0, 8 and 33; a request in a background drifting by up to 4.5 dB is never cut and
+  ends on average 2.0–3.1 s after the speech, at worst 10 s; six seconds of drifting noise alone pass the
+  recording check in 0, 2, 4 and 24 of 40; strings of short knocks never start a request; steady noise of 2.5–30 times the background that starts
+  with nobody speaking ends as "no request"; a held voice first, then speech, is kept whole; noise
+  after speech ends the request only when clearly quieter than the speech; words of 100–300 ms
+  said one at a time keep a request open at both the 0.5 s and the 2 s setting; soft speech 3.2–5
+  times the background is never cut in a minute), wake arbitration in Both (the claim lease, its renewal, expiry and
+  stale messages; two simulated recognizers hearing the same phrase in either order, by partial or
+  final result, phrase-only and in one breath; unanswered, refused and lost claims; push-to-talk
+  and deliberate repeats; the Watch link; a Watch recording that reaches the Phone 3 to 90 s after
+  it was recorded is accepted, and one whose transfer fails, is refused, outlasts its limit or
+  meets a restarted Phone gives its claim back with a notice; a recognizer that reports the phrase
+  0.5 s to an hour after the other device's request was accepted never delivers it again, told or
+  not told by the Phone, and the next wake works at once; claim messages arrive in order behind a
+  slow first send; changing the wake location during a wake recording cancels it unsent), the voice settings (0.5–10 s validation, the
+  wake-location modes, durable migration from the old Watch switch, strict Watch-side validation,
+  stale snapshots), the per-device wake flow both apps delegate to (which device listens for each
+  mode, turning a device off mid-window or mid-recording, the silence snapshot, same-breath
+  requests), routing to a new conversation (contract v2 parsing and rejections, an empty list,
+  reuse on the next request, alias collisions, refused and unverifiable creations, the same turn
+  repeated or run concurrently, and restarts after delivery, before delivery and with an
+  unresolved creation; the Phone-worded create ack; storage whose writes fail at each step, with
+  restarts that see only what was confirmed saved; unreadable saved data; alias and limit races
+  between manual and router creation, rename and unarchive; invisible characters and quoted
+  prompt data; a destination archived while the ack plays; the one-time routing-session
+  replacement and its interruption), the recording loop of both recorders (Phone and Watch read sizes), the recording input
+  check, haptic timing, gesture arbitration, bezel scrolling, the background session (off on fresh
+  and upgraded installs, started and its microphone armed only from the visible app, a refused
+  microphone, a Stop that is final and can be repeated, "paused" after the system ended it and no
+  restart by itself, callbacks of an older session ignored), listening with the app hidden (200
+  consecutive windows on a simulated clock, back-off, no recognizer, cooldown and an unreachable
+  Phone, a late result of an earlier window, the Both claim, Stop while listening or recording,
+  settings that exclude and include the device, showing and hiding the screen without a second
+  window), the Watch's session composed as its runtime composes it (a settings check that
+  finishes after the app was hidden never asks for the microphone, whether the platform would
+  grant or refuse it; normal reopen and visible Stop then Start listen again; a session never says
+  it listens when it can't; no microphone without a visible notification, with notifications
+  allowed later arming only at a visible show; a Start before the show's settings check, or
+  leaving before it finishes, plays replies only and never says it listens, while a session
+  already listening keeps its loop; no recognizer narrows it to playback; a hold covers
+  every step from window to handoff to recorder and every gap, taken before the previous one is
+  let go and released once), the device-local opt-ins (a restored or updated install never
+  starts the relay from a backed-up copy; the backup rules exclude the files the apps use),
+  time-limited wake locks, a Watch turn stopped on the Phone, and source checks of the Android
+  wiring (permissions and service types, where sessions may start, Stop paths, audio focus).
 - **Paired debug build:** `gradle :phone:assembleDebug :watch:assembleDebug` succeeded with
-  Gradle 8.13 and JDK 17. Both APKs were checked with `aapt2` and `apksigner`: they have the same
-  package, are v2-signed by the same debug certificate, and declare the expected `/hv/v1/*`
-  listener paths.
-- **One Phone emulator voice turn.** On an Android 15 (API 35) Phone emulator, a generated speech
-  WAV went in through the debug QA input. The dashboard backend used remote-whisper speech-to-text,
-  `glm-5.3-flash` for the routing and destination sessions, and edge text-to-speech. The turn
-  completed: routing JSON → ack played on the Phone → transcript delivered → final reply played.
-- **Real microphone, silence only.** The emulator microphone captured audio, but the headless host
-  fed it silence. The app correctly reported "No speech detected" and routed nothing.
-- **Watch, unpaired only.** The Watch app installed and ran on a Wear OS emulator with no paired
-  Phone. It recorded from the microphone and correctly reported the Phone as unreachable.
+  Gradle 8.13 and JDK 17. Both APKs have the same package and are v2-signed by the same debug
+  certificate.
+- **Paired emulators (Phone Android 15, Watch Wear OS 5), real microphone input.** Speech was
+  played into both emulators' microphones through a virtual audio cable, against a local test
+  dashboard with a real model, speech-to-text and text-to-speech:
+  - *Settings:* changing the wake location and trailing silence on the Phone (Settings screen
+    and debug extras) reached the Watch within about 2 seconds each time; equal-revision snapshots
+    read again on resume were ignored; invalid values (0.7, 12, NaN, an unknown mode) were refused
+    and not sent. A Phone that had the old Watch wake switch on started with **Watch** selected.
+  - *Hands-free ending:* on the Phone, requests ended 500, 2000, 5000 and 10000 ms after the last
+    speech for the 0.5, 2, 5 and 10 s settings; on the Watch 500, 1980 and 4960 ms for 0.5, 2 and
+    5 s (a short sound in the tail pauses the count without restarting it). A 73-second request
+    with pauses was recorded whole and ended once on each device. Soft speech (10 % level) and a
+    single short word ended correctly. A request followed by steady noise ended 2.3 s after the
+    speech while the noise kept playing. With no speech, the recording stopped 8 s after the buzz
+    and nothing was sent; where replies play did not change.
+  - *Phone wake phrase with the platform recognizer (English):* a request in one breath was sent
+    as text once the recognizer's final result arrived; the phrase alone started the recorder
+    0.3 s after the recognizer was released and the request ended at the set silence. Both ran
+    through routing, the ack, delivery and the final reply on the Phone. Speech without the wake
+    phrase sent nothing. With the default Korean phrases, this emulator's on-device recognizer had
+    no Korean model and its fallback recognizer returned no match, so Korean recognition was not
+    verified.
+  - *Wake location:* with **Phone**, the Watch ignored a wake handoff; with **Watch**, the Phone
+    never listened; with **Both**, the Phone answered. Turning the Watch off from the Phone while
+    the Watch was recording a hands-free request, and leaving the Phone app while it was
+    recording one, both stopped the recording without sending it.
+  - *Push-to-talk:* on both devices a recording with 6 seconds of silence after the speech was
+    sent only on the tap; a silent Phone recording was refused before speech-to-text.
+  - *Held sounds and noise bursts:* a 75-second request with a 2.5-second held "uhh" at speech
+    level in the middle (Watch and Phone), and one with a 4-second steady noise burst at speech
+    level (Watch), were recorded whole and ended 2.0 s after the speech; an early build cut
+    such requests and sent them truncated. Both were repeated on the Watch with a later build, before
+    background operation (synthesized voice), with the same result; the rest of this item is from an earlier build. Speech that was already under way when the
+    recorder started was detected and sent complete. Push-to-talk speech about 4 dB above steady
+    noise was accepted and answered on both devices; the same noise alone was refused before
+    speech-to-text on both. Tapping Talk while the Phone's real recognizer was listening released
+    it first and the recording had normal audio.
+  - *Both, with simulated recognizers:* the recognizers were replaced by a debug fixture that
+    reports a result on each device (this tests arbitration, not recognition; the Watch emulator
+    has no recognizer). With the same one-breath request on both devices, in either order, one
+    device's request was accepted and answered there, and the other showed that the other device
+    answered and sent nothing. With the phrase alone, only the winner recorded, on the real
+    microphone, renewing its claim throughout (25 renewals over a 77-second request), and the
+    other never started its recorder. Watch push-to-talk in Both needed no claim. One earlier
+    build let the Watch give its claim back as its recorder started; the Phone then accepted only
+    one of the two recordings, and that defect is fixed and covered by a test.
+  - *New conversations from the router:* starting with no conversations at all, a spoken request
+    on the Phone led the real routing model to ask for a new conversation; the Phone created it,
+    played the ack, delivered the transcript and played the reply, and the conversation appeared
+    in the Phone list. The next request on that topic was routed to it without creating another.
+    A hands-free Watch request on an unrelated topic created a second conversation, with the ack
+    and the reply played and acknowledged on the Watch; the Watch browser listed it on its own and
+    showed its history, and a follow-up from the Watch reused it. The dashboard held exactly those
+    two app conversations plus the hidden routing session. Whether to create was the model's own
+    choice in these runs; forced replies (refusals, malformed replies, failures, restarts) were
+    exercised only in the unit tests against the fake dashboard.
+  - *Saved data from an earlier build, and the create ack (an earlier build):* the build was installed over a Phone whose saved data for
+    a test dashboard had been created by an earlier build (one conversation and a routing session
+    seeded with the first routing instructions). The first spoken request replaced the routing
+    session once: the saved data then held the old one marked retired and a new one, and the
+    dashboard still held the old session with its history. In that same request the real routing
+    model asked for a new conversation; the ack the Phone composed and played named the title and
+    alias that were actually registered ("Creating a new conversation called Car Maintenance,
+    alias car-maintenance, and sending this there."), the conversation's first message on the
+    dashboard was the transcript, and the next request on that topic reused it. A Watch
+    push-to-talk request created another conversation with the composed ack played and
+    acknowledged on the Watch, a hands-free Watch follow-up (recorder started by the simulated
+    recognizer, ending 2.0 s after the speech) reused it, and the Watch browser listed and opened
+    the new conversations. Archiving the destination on the Phone while its ack was playing, and
+    in another run while the request was still being routed, ended both requests as not
+    delivered with nothing sent to the dashboard. One Both run with simulated recognizers again
+    gave one winner. The Korean ack wording wasn't heard: the test dashboard's speech-to-text
+    returned Latin text for the Korean recordings, so the English wording was used. Failed and
+    unreadable storage, restarts between steps, alias races and the interrupted or unverifiable
+    replacement of the routing session were exercised only in the unit tests.
+  - *Room recordings and recorded human speech (a build before background operation):* recordings of real rooms
+    (DEMAND, CC BY 4.0) and of people reading aloud (Mini LibriSpeech, CC BY 4.0), mixed offline,
+    were played into the microphones. With nobody speaking after the buzz (recorder started by
+    the simulated recognizer), 40 seconds of a living room, a cafeteria and an office each ended
+    as "Didn't hear a request" on the Watch with nothing sent, as did twelve further 20-second
+    stretches (three per room, kitchen included) and the office on the Phone. **The 40-second
+    kitchen recording, which has dishes clattering, was still recorded as a request for about
+    37 seconds on both devices, sent, transcribed into a few words and answered**, as on the
+    build before; loud, irregular household sounds are not told apart from speech. About a
+    minute of read speech 15 dB above the kitchen (Phone), with pauses between sentences, and a
+    ten-second sentence above the living room (Watch), were recorded whole, ended 2.0 and 1.9 s
+    after the last word while the room kept playing, and were transcribed completely. With
+    push-to-talk, a small voice 6 and 10 dB above the cafeteria was accepted, transcribed and
+    answered on both devices. Eight seconds of the cafeteria alone **passed the recording check
+    on both devices**; speech-to-text then returned nothing and the request ended as "no
+    speech" with nothing delivered.
+  - *Words said one at a time (a build before background operation):* eight synthesized words with 450 ms between
+    them, after a wake on the Watch, were recorded whole and ended 1.96 s after the last word.
+    Ten seconds of synthetic 160 ms syllables 240 ms apart ended 2.0 s after the last one; the
+    build before ended that recording 0.84 s after it.
+  - *Both and the wake location (a build before background operation, simulated recognizers, so this tests the flow
+    and not recognition):* with a debug delay holding a finished Watch recording back for 25
+    seconds, the Watch kept renewing its claim every 3 seconds, a wake on the Phone during the
+    wait was refused as "the other device is answering", and the recording was then accepted and
+    answered on the Watch. With both recognizers reporting one wake and the Watch's result
+    arriving 4.5 s late, only the Phone recorded and the Watch showed that the other device
+    answered. With the Watch's result arriving after the Phone's short request had been
+    accepted, the Watch's window had already closed and the late result started nothing. Each
+    run produced one request. Changing the wake location on the Phone while the Watch was
+    recording a wake request cancelled it unsent, and the Watch showed "Wake settings changed.
+    Say it again".
+  - *Routing (a build before background operation):* a spoken Phone request created a conversation with the composed
+    ack naming the registered title and alias, and the next request on that topic reused it.
+  - *Background operation, current build (installed on both emulators).* Notifications were
+    allowed through the system's own screens (the Watch's prompt; on the Phone, which had already
+    asked once, its notification settings page), and the test dashboard was signed in by hand on
+    the Phone. The Watch emulator has no speech recognizer, so every Watch wake below came from
+    the simulated recognizer (it tests the flow after a wake, never recognition); the microphone
+    audio, speech-to-text, routing, the model's replies and playback were real. The speech was
+    synthesized or a published recording played through the audio cable. Screen, app and service
+    states below were read from the emulators while the requests ran (the system's display and
+    activity state, its record of app activity and screen changes, its foreground-service list,
+    this app's notifications and its wake locks); the reply-target label and the chat were read
+    from the app's screen.
+    - Notifications: each app's session showed an ongoing "Hermes Voice" notification with a
+      **Stop** action ("Relaying voice requests and replies for your Watch" on the Phone,
+      "Listening for the wake phrase. Replies play here" on the Watch). Tapping Stop in the
+      notification ended the session and removed the notification on each device, and starting
+      again from the open app worked. With the real recognizer selected, the Watch's session
+      showed "replies only (no recognizer)" and ran as *media playback* only, without the
+      microphone type.
+    - Phone push-to-talk: requests were transcribed, routed (to existing conversations, and to
+      one the router created, with the composed ack), and the ack and the final reply played to
+      completion. For one request the conversation was read back in full afterwards: its new
+      message was the transcript, word for word.
+    - Watch with the Phone relay on (*connected device + media playback*) and the Phone app in
+      the background with its screen off: Watch push-to-talk requests were relayed, and the ack
+      and the final reply played on the Watch, each confirmed as played. With the Watch's
+      session on (*microphone + media playback*) and the Watch app in the background with its
+      screen off, four wake requests in two runs, each a recording of read speech with
+      room sound, were recorded through the end of the speech, sent, answered and played on the
+      Watch in the same way. In each run the Watch stayed in the background for more than three
+      minutes, opening one 30-second window after another; the device's wake-lock records show
+      the listen lock taken for each window and the recording and playback locks during each
+      request. These are emulator samples and records, not a measure of deep sleep or battery.
+      In an earlier run on this build, the app's logs showed listening carry on after the Watch
+      app was reopened or recreated.
+    - Where replies play (the Phone's label): after Watch requests it said the Watch; browsing
+      conversations on the Watch, a typed Phone message and a silent Phone recording (refused
+      before speech-to-text) left it there; a spoken Phone request moved it to the Phone, and a
+      Watch wake with nothing said (digital silence on the cable, discarded as "Didn't hear a
+      request") didn't move it back.
+    - Stop: the Watch notification's Stop during a recording discarded it unsent; during the ack
+      of a pending request it stopped the ack, and the request wasn't passed to its conversation
+      (it had already been transcribed and routed); during the final reply it stopped playback
+      (the request had been delivered after its ack). The Phone notification's Stop during a
+      Watch request, with the Phone app in the background, stopped that request before it was
+      passed to its conversation, stopped the ack on the Watch and told the Watch the request
+      was stopped. Afterwards no service, notification or wake lock of the app remained, and no
+      crash or ANR was recorded.
+    - **Not run:** recognition of any kind on the Watch or in Korean; live speech or a physical
+      microphone; showing the Watch's "checking Phone settings" state at runtime (the settings
+      check finished before a tap could land; unit tests cover it); a Watch that can't be
+      reached (it needs the link cut); rotation; and anything on physical devices, including
+      deep sleep, battery, Doze and manufacturer power rules.
+  - *Background operation, on the previous build, before the Watch waited for its settings
+    check (bounded).* The emulators'
+    notification permission is undecided (the prompt was dismissed, never answered), so the
+    Watch's new rule applied throughout. Its Start ran the session for *media playback* only,
+    showing "replies only. Allow notifications, then open this app to listen" and "Notification
+    hidden. Tap here to stop". With the app closed nothing listened: no window opened, no listen
+    wake lock was held, and a simulated wake result started nothing. With the real recognizer
+    selected it showed "replies only (no recognizer)", still without the microphone type. On
+    screen, push-to-talk recorded and sent a request, a simulated wake started a hands-free
+    recording, and leaving the app cancelled that recording unsent. The in-app Stop ended the
+    session. On the Phone, the relay was off after the update (its old copy in the backed-up
+    settings was dropped), and switching it on ran it as before, saying its notification is
+    hidden. The Phone's dashboard session had expired and wasn't signed in again, so no request
+    was transcribed or answered and no reply played. **Not run on that build:** listening,
+    recording and sending with the Watch app closed (they need notifications allowed), the
+    notification and its Stop, hidden playback, anything needing the dashboard, recognition, and
+    physical devices.
+  - *Background operation, on its first build, two builds before the current one (these runs
+    don't cover the current build, whose session code changed; the Watch emulator has no speech recognizer, so
+    every Watch wake below came from the simulated recognizer: it tests the flow after a wake,
+    never recognition).* Both switches started only from the open apps: the services ran as
+    *microphone + media playback* (Watch) and *connected device + media playback* (Phone). With
+    both apps closed and both screens off (the Watch dozing or asleep) for 3 minutes on that build,
+    and for 5 and 20 minutes on two development builds before it with the same session code, the Watch opened one
+    30-second window after another (41 in the 20 minutes, each ending on its own) and then recorded
+    a request, sent it, and played the ack and the reply, each acknowledged as played; the Phone
+    relayed it with its app closed. A recording carried on through Home, the
+    activity being recreated and the screen going off, and was sent once. Reopening the Watch app,
+    and recreating the Phone's, during a turn left one upload and one delivery. In Both with both
+    apps closed one request was delivered; with the Phone open and the Watch closed hearing the
+    same phrase, the Phone answered and the Watch showed that it had; a Watch result reported
+    6 seconds late was ignored. Stop in the open Watch app ended listening; Stop with the Watch
+    closed (through the debug trigger that runs the notification's Stop, see below) dropped a
+    recording in progress unsent, withdrew one waiting to be sent, and stopped the reply being
+    played (the Phone reported the turn not delivered); the Phone relay's Stop during a turn
+    ended it and the Watch showed that it had stopped. The Phone's setting excluding the Watch
+    dropped the microphone from the Watch's service at once; including it again while the Watch
+    app was closed left it without, and opening the app restored it. A Phone push-to-talk request
+    followed by Home and screen off was answered on the Phone speaker, with audio focus taken and
+    given back; with the relay off (on the development build before it), the final reply was not played (focus
+    refused) and the turn said so; its acknowledgement had played before the app was left. Without a session, leaving the Watch app still cancelled a hands-free recording, a
+    word-paced request ended 1.96 s after the last word, and 20 seconds of kitchen and office room
+    recordings after a wake sent nothing; with a session and the app closed, cafeteria and living
+    room recordings sent nothing either. With the real recognizer selected, the Watch said the
+    wake phrase is unavailable and its session showed "replies only (no recognizer)". After each
+    reinstall both switches showed "paused"; the Phone's relay resumed when its app was opened,
+    the Watch's only after "Tap to start". **Not run:** the notification itself and its Stop
+    button (the notification permission prompt was left unanswered; the service's notification
+    and its one action were checked through the system's service list), recognition with the
+    screen off, rotation (auto-rotate is off on the Phone emulator), Doze, battery drain, and any
+    physical device.
+  - *Earlier builds:* Watch reader, gestures, bezel scrolling and haptics, Watch playback with
+    `played` ACKs, and playback switching between devices.
 
-**Never run on devices:** Watch↔Phone Data Layer transfer, playback on the Watch, the Watch
-`played` ACK, and switching playback between devices. These are covered only by core unit tests.
-Nothing has been tested on physical devices, including audio routing and haptics.
+**Never run:** wake-phrase recognition on the Watch (the Watch emulator has no speech recognition
+service, so its recorder was started by the debug handoff), Korean wake-phrase recognition, and
+anything on physical devices, including audio routing, haptic strength, real room acoustics and
+a physical bezel. Live human speech and live room sound were never used: the human
+speech and rooms above are published recordings played through the audio cable, and the other
+spoken stimuli are synthesized voices. The emulator microphone occasionally delivers digital silence; those runs ended
+as "no speech" and were repeated.
 
 ## Known limitations
 
-- **Not release-ready.** Debug builds only: no release signing configuration and no R8. Voice has
-  one emulator run on generated audio, and the Watch has never been paired (see
-  [Validation](#validation)).
+- **Not release-ready.** Debug builds only: no release signing configuration and no R8. Tested
+  on emulators only (see [Validation](#validation)).
+- **A reset dashboard at the same address.** The app's saved sessions, including the hidden
+  routing session, belong to the dashboard data that created them. If that data is reset while the
+  address stays the same, voice turns stop with "session no longer exists on the dashboard".
 - **Playback route is in memory.** After the Phone process restarts, nothing plays until the next
   accepted voice request. If the route points to a Watch that has become unreachable, that
   utterance fails and the Phone doesn't play it instead. If the failed utterance is an ack, the turn
@@ -252,21 +909,25 @@ Nothing has been tested on physical devices, including audio routing and haptics
   already queued, the message is still delivered, but its reply isn't spoken or shown inline.
 - **Server-to-client requests aren't answered.** A turn that needs a tool approval or a
   clarification ends at the 15-minute timeout.
-- **Wake phrase is foreground-only.** It uses the platform `SpeechRecognizer` while the Watch app is
-  open. There's no always-on hotword.
+- **Wake phrase depends on each device's speech recognition service.** The Phone listens only with
+  its app open; the Watch also with its app closed once Background is started, by running the
+  platform recognizer window after window, not a dedicated low-power hotword. Where no recognizer
+  is installed (as on the Watch emulator used here), the device says the wake phrase is
+  unavailable, and a background session then only plays replies. The Watch also listens in the
+  background only while its notification can be shown. Whether a watch's recognizer
+  keeps working with the screen off for hours, and what that costs in battery, hasn't been
+  measured.
+- **Background sessions don't survive** a force stop, the system's Stop, a revoked permission, a
+  restart of either device, the microphone privacy switch, an OEM's own power rules or a Phone that
+  stays out of reach; the app shows them as paused and waits for you. The Phone relay's
+  foreground-service type is *connected device*; Android requires one of a few permissions for it,
+  and the app declares `CHANGE_NETWORK_STATE` for that reason only (it never changes network
+  state).
+- **Hands-free ending is loudness-based**, not speech understanding (see
+  [Hands-free ending](#hands-free-ending-shared-vad)).
+- **Watch reader history is a window.** The Watch keeps at most 200 messages per conversation;
+  older ones are shown on the Phone.
 - **Unverified:** whether the agent reads an attached `@file:` reference during a turn.
-
-Additional known issues:
-
-- **Sender label race.** If the Phone and the Watch submit voice requests at almost the same time,
-  the Talk bar's playback-target label can briefly disagree with the device that actually plays.
-- **Listener service context lifetime.** The Phone's Data Layer listener service passes its own
-  context to a transport that app-scoped coroutines keep using, so that transport can outlive the
-  service.
-- **Debug QA intent replay.** In debuggable builds, the `hv_qa_wav` extra may be processed again if
-  the activity is re-created from its original launch intent.
-- **Missing malformed-upload regression test.** The core suite rejects a malformed Watch frame, but
-  no test covers malformed or oversized uploads arriving through the Android Data Layer service.
 
 ## License
 

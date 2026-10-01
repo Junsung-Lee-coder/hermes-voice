@@ -2,6 +2,7 @@ package com.rumi.hermesvoice.core.watchlink
 
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
+import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import org.json.JSONException
@@ -17,6 +18,11 @@ import org.json.JSONObject
  * - `/hv/v1/played`              message, Watch → Phone: [PlayedAck] (sent when playback ends)
  * - `/hv/v1/stop`                message, Phone → Watch: stop playing this turn now (interruption)
  * - `/hv/v1/settings`            data item, Phone → Watch: [com.rumi.hermesvoice.core.settings.WatchSettings] JSON
+ * - `/hv/v1/reader/request`      message, Watch → Phone, and `/hv/v1/reader/response`, Phone → Watch:
+ *                                the conversation reader ([ReaderRequest], [ReaderResponse])
+ * - `/hv/v1/wake/claim`          message, Watch → Phone, and `/hv/v1/wake/verdict`, Phone → Watch:
+ *                                wake arbitration when both devices listen
+ *                                ([com.rumi.hermesvoice.core.wake.WakeAdmission])
  */
 object WatchLinkPaths {
     const val TURN_PREFIX = "/hv/v1/turn/"
@@ -25,6 +31,15 @@ object WatchLinkPaths {
     const val PLAYED = "/hv/v1/played"
     const val STOP = "/hv/v1/stop"
     const val SETTINGS = "/hv/v1/settings"
+    const val READER_REQUEST = "/hv/v1/reader/request"
+    const val READER_RESPONSE = "/hv/v1/reader/response"
+
+    /** Watch → Phone: claim, renew or release the wake episode ("Both"); Phone → that Watch: the verdict. */
+    const val WAKE_CLAIM = "/hv/v1/wake/claim"
+    const val WAKE_VERDICT = "/hv/v1/wake/verdict"
+
+    /** Phone → Watch data item: how many wake requests have been answered (see `WakeEpochItem`). */
+    const val WAKE_EPOCH = "/hv/v1/wake/epoch"
     const val CAPABILITY_PHONE = "hermes_voice_phone"
     const val CAPABILITY_WATCH = "hermes_voice_watch"
 
@@ -48,6 +63,25 @@ object WatchLinkPaths {
 }
 
 class LinkProtocolException(message: String) : Exception(message)
+
+/** Reads a Data Layer channel without ever buffering more than [limit] bytes. */
+object BoundedRead {
+    /** The whole stream, or null when it is longer than [limit] (the rest is not read). */
+    fun readAtMost(input: InputStream, limit: Int): ByteArray? = input.use { stream ->
+        val out = ByteArrayOutputStream()
+        val buffer = ByteArray(16 * 1024)
+        while (true) {
+            val read = stream.read(buffer)
+            if (read < 0) break
+            if (out.size() + read > limit) return null
+            out.write(buffer, 0, read)
+        }
+        out.toByteArray()
+    }
+
+    /** Upper bound of one encoded [LinkFrame]. */
+    const val FRAME_LIMIT = LinkFrame.MAX_PAYLOAD_BYTES + LinkFrame.MAX_HEADER_BYTES + 8
+}
 
 /** `HVL1` + u32 header length + UTF-8 JSON header + payload bytes. Bounded on both parts. */
 class LinkFrame(val header: JSONObject, val payload: ByteArray) {
@@ -91,15 +125,34 @@ class LinkFrame(val header: JSONObject, val payload: ByteArray) {
 
 enum class TurnTrigger { PUSH_TO_TALK, WAKE_PHRASE }
 
-/** A Watch-captured turn: the header of a `/hv/v1/turn/<id>` frame plus its WAV. */
-class WatchTurnUpload(val turnId: String, val trigger: TurnTrigger, val mimeType: String, val audio: ByteArray) {
+/**
+ * A Watch-captured turn: the header of a `/hv/v1/turn/<id>` frame plus its payload. The payload
+ * is a WAV recording, or, for a wake-phrase request the Watch's speech recognizer already heard
+ * in the same breath as the wake phrase, that request as UTF-8 text ([recognizedText]).
+ */
+class WatchTurnUpload(
+    val turnId: String,
+    val trigger: TurnTrigger,
+    val mimeType: String,
+    val audio: ByteArray,
+    /** The wake claim this wake-phrase turn was made under when both devices listen; else null. */
+    val wakeClaimId: String? = null,
+) {
+    val recognizedText: String? get() = if (mimeType == MIME_TEXT) String(audio, StandardCharsets.UTF_8).trim() else null
+
     fun toFrame(): LinkFrame = LinkFrame(
-        JSONObject().put("v", 1).put("turn_id", turnId).put("trigger", trigger.name).put("mime", mimeType).put("bytes", audio.size),
+        JSONObject().put("v", 1).put("turn_id", turnId).put("trigger", trigger.name).put("mime", mimeType).put("bytes", audio.size)
+            .apply { if (wakeClaimId != null) put("claim", wakeClaimId) },
         audio,
     )
 
     companion object {
         const val MIME_WAV = "audio/wav"
+        const val MIME_TEXT = "text/plain; charset=utf-8"
+        const val MAX_RECOGNIZED_CHARS = com.rumi.hermesvoice.core.wake.WakeContract.MAX_REQUEST_CHARS
+
+        fun recognized(turnId: String, text: String, wakeClaimId: String? = null): WatchTurnUpload =
+            WatchTurnUpload(turnId, TurnTrigger.WAKE_PHRASE, MIME_TEXT, text.trim().toByteArray(StandardCharsets.UTF_8), wakeClaimId)
 
         /** Validates the frame against the channel path it arrived on; anything off is rejected. */
         fun fromFrame(path: String, frame: LinkFrame): WatchTurnUpload {
@@ -107,12 +160,28 @@ class WatchTurnUpload(val turnId: String, val trigger: TurnTrigger, val mimeType
             val header = frame.header
             if (header.optInt("v") != 1) throw LinkProtocolException("unsupported turn version")
             if (header.optString("turn_id") != pathTurnId) throw LinkProtocolException("turn id does not match path")
-            if (header.optString("mime") != MIME_WAV) throw LinkProtocolException("turn audio must be $MIME_WAV")
-            if (header.optInt("bytes", -1) != frame.payload.size) throw LinkProtocolException("turn audio length mismatch")
-            if (frame.payload.size <= WAV_HEADER_BYTES) throw LinkProtocolException("turn audio is empty")
+            val mime = header.optString("mime")
+            if (mime != MIME_WAV && mime != MIME_TEXT) throw LinkProtocolException("turn payload must be $MIME_WAV or text")
+            if (header.optInt("bytes", -1) != frame.payload.size) throw LinkProtocolException("turn payload length mismatch")
             val trigger = runCatching { TurnTrigger.valueOf(header.optString("trigger")) }.getOrNull()
                 ?: throw LinkProtocolException("unknown turn trigger")
-            return WatchTurnUpload(pathTurnId, trigger, MIME_WAV, frame.payload)
+            val claim = when (val raw = header.opt("claim")) {
+                null -> null
+                is String -> raw.takeIf { trigger == TurnTrigger.WAKE_PHRASE && com.rumi.hermesvoice.core.wake.WakeClaimMessage.isValidClaimId(it) }
+                    ?: throw LinkProtocolException("bad wake claim")
+                else -> throw LinkProtocolException("bad wake claim")
+            }
+            val upload = WatchTurnUpload(pathTurnId, trigger, mime, frame.payload, claim)
+            if (mime == MIME_WAV) {
+                if (frame.payload.size <= WAV_HEADER_BYTES) throw LinkProtocolException("turn audio is empty")
+            } else {
+                if (trigger != TurnTrigger.WAKE_PHRASE) throw LinkProtocolException("only wake-phrase requests may be text")
+                val text = upload.recognizedText.orEmpty()
+                if (text.isEmpty() || text.length > MAX_RECOGNIZED_CHARS || text.contains('\uFFFD')) {
+                    throw LinkProtocolException("recognized request is empty, too long or not UTF-8")
+                }
+            }
+            return upload
         }
 
         private const val WAV_HEADER_BYTES = 44

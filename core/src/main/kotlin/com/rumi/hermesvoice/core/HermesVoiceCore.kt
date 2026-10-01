@@ -11,13 +11,15 @@ import com.rumi.hermesvoice.core.net.OutgoingAttachment
 import com.rumi.hermesvoice.core.net.SubmittedTurn
 import com.rumi.hermesvoice.core.sessions.AppSessionRepository
 import com.rumi.hermesvoice.core.sessions.HermesSessionsApi
-import com.rumi.hermesvoice.core.sessions.OwnedRole
 import com.rumi.hermesvoice.core.sessions.OwnedSessionRegistry
 import com.rumi.hermesvoice.core.settings.AppSettings
 import com.rumi.hermesvoice.core.voice.RecipientEvent
 import com.rumi.hermesvoice.core.voice.VoiceTurnConfig
 import com.rumi.hermesvoice.core.voice.VoiceTurnListener
 import com.rumi.hermesvoice.core.voice.VoiceTurnOrchestrator
+import com.rumi.hermesvoice.core.wake.WakeAdmission
+import com.rumi.hermesvoice.core.wake.WakeEpisode
+import com.rumi.hermesvoice.core.wake.WakeEpochStore
 import com.rumi.hermesvoice.core.watchlink.WatchAckRegistry
 import com.rumi.hermesvoice.core.watchlink.WatchTurnIntake
 import java.io.IOException
@@ -74,18 +76,29 @@ class HermesVoiceCore(
     registry: OwnedSessionRegistry,
     private val settings: AppSettings,
     voiceListener: VoiceTurnListener = object : VoiceTurnListener {},
+    /** Wall-clock millis for the wake claim leases. */
+    clock: () -> Long = System::currentTimeMillis,
 ) {
     val sessions = AppSessionRepository(sessionsApi, conversations, registry)
     val chat = ChatService(sessions)
-    val orchestrator = VoiceTurnOrchestrator(speech, sessions.guardedPort(), config = ::voiceConfig, listener = voiceListener)
+    /** Arbitrates the wake phrase when both devices listen: one spoken wake episode, one admitted device. */
+    val wakeAdmission = WakeAdmission(clock, settings::watchSettings,
+        epochs = object : WakeEpochStore {
+            override fun load(): Long = settings.wakeEpoch
+            override fun save(epoch: Long) { settings.wakeEpoch = epoch }
+        },
+        onAnswered = { episode -> onWakeEpisode(episode) })
+
+    /** Told of each admitted wake request in Both (see [WakeAdmission]); the Phone app publishes it to the Watch. */
+    @Volatile var onWakeEpisode: (WakeEpisode) -> Unit = {}
+    val orchestrator = VoiceTurnOrchestrator(speech, sessions.guardedPort(), config = ::voiceConfig, listener = voiceListener,
+        recipientCreator = sessions.recipientCreator(),
+        admission = { request -> wakeAdmission.admitTurn(request.wakeTurn, request.origin, request.originNodeId, request.wakeClaimId) })
     val watchAcks = WatchAckRegistry()
     val watchIntake = WatchTurnIntake(orchestrator, watchAcks)
 
-    /** Snapshotted per turn: fails closed (config_invalid) when there is no unarchived conversation to route to. */
+    /** Snapshotted per turn. The allowlist may be empty: the router can then ask for a new conversation. */
     private suspend fun voiceConfig(): VoiceTurnConfig {
-        require(sessions.registry.all().any { it.role == OwnedRole.CONVERSATION && !it.archived }) {
-            "create a conversation before using voice"
-        }
         val router = sessions.ensureRoutingSession()
         return VoiceTurnConfig(router.storedSessionId, sessions.allowlist(router.storedSessionId), settings.playback())
     }
@@ -99,11 +112,12 @@ class HermesVoiceCore(
             registry: OwnedSessionRegistry,
             settings: AppSettings,
             voiceListener: VoiceTurnListener = object : VoiceTurnListener {},
+            clock: () -> Long = System::currentTimeMillis,
         ): Pair<HermesVoiceCore, HermesGatewayConnector> {
             val dashboard = HermesDashboardClient(endpoint, http, tokens, settings.profile.ifBlank { null })
             val connector = HermesGatewayConnector(dashboard, http)
             val core = HermesVoiceCore(dashboard, dashboard, GatewayConversationPort(settings.profile.ifBlank { null }) { connector.connection() }, registry, settings,
-                voiceListener)
+                voiceListener, clock)
             return core to connector
         }
     }

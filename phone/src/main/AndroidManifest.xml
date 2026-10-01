@@ -4,6 +4,28 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
+    <!-- The optional background relay (PhoneRelayService), switched on only by the user from the
+         visible app: Watch requests are answered with this app closed. It is a connected-device
+         service (the paired Watch) that may also play replies; it never uses the microphone.
+         CHANGE_NETWORK_STATE is declared only because the platform requires one of its listed
+         permissions for that service type; the app does not change network state.
+         POST_NOTIFICATIONS shows the relay's notification with Stop; WAKE_LOCK is for a
+         time-limited CPU hold while a voice turn runs. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Package visibility (Android 11+) for the platform speech recognizer used by the foreground
+         wake phrase; without it SpeechRecognizer reports no recognition service. Not a permission. -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+    </queries>
+
     <!-- Cleartext is allowed at the platform level only because network security config cannot
          express 100.64.0.0/10; HermesDashboardEndpoint.parse refuses plain http except to loopback
          and Tailscale addresses. -->
@@ -27,6 +49,12 @@
             </intent-filter>
         </activity>
 
+        <!-- Not exported: started and stopped only by this app (the visible activity, or Stop in its own notification). -->
+        <service
+            android:name=".PhoneRelayService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice|mediaPlayback" />
+
         <service
             android:name=".PhoneWatchListenerService"
             android:exported="true">
@@ -37,6 +65,14 @@
             <intent-filter>
                 <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
                 <data android:scheme="wear" android:host="*" android:path="/hv/v1/played" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
+                <data android:scheme="wear" android:host="*" android:path="/hv/v1/reader/request" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
+                <data android:scheme="wear" android:host="*" android:path="/hv/v1/wake/claim" />
             </intent-filter>
         </service>
     </application>

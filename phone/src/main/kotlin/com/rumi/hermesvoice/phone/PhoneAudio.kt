@@ -3,10 +3,14 @@ package com.rumi.hermesvoice.phone
 import android.annotation.SuppressLint
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaPlayer
 import android.media.MediaRecorder
+import android.os.PowerManager
+import android.os.SystemClock
 import com.rumi.hermesvoice.core.HermesPlaybackException
 import com.rumi.hermesvoice.core.SpokenAudio
 import com.rumi.hermesvoice.core.voice.PlaybackCue
@@ -92,7 +96,12 @@ class WavRecorder(private val maxSeconds: Int = 120) {
     }
 }
 
-/** Plays on the Phone speaker; returns when playback ends; cancellation stops playback immediately. */
+/**
+ * Plays on the Phone speaker; returns when playback ends; cancellation stops playback immediately.
+ * It asks for audio focus like any player (transient, others may duck): without it (a call, or the
+ * app is closed with no background relay running) the utterance is not played and fails as a
+ * playback error; losing it ends the utterance the same way. Volume and Do Not Disturb are the system's.
+ */
 class PhoneSpeakerSink(private val context: Context) : PlaybackSink {
     override suspend fun play(audio: SpokenAudio, cue: PlaybackCue) {
         val extension = when {
@@ -103,15 +112,35 @@ class PhoneSpeakerSink(private val context: Context) : PlaybackSink {
         }
         val file = File(context.cacheDir, "hv-${cue.turnId.hashCode().toUInt()}-${cue.sequence}.$extension")
         withContext(Dispatchers.IO) { file.writeBytes(audio.bytes) }
+        val attributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_ASSISTANT)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+        val audioManager = context.getSystemService(AudioManager::class.java)
+        var focus: AudioFocusRequest? = null
         try {
             withContext(Dispatchers.Main) {
                 suspendCancellableCoroutine { continuation ->
                     val player = MediaPlayer()
                     continuation.invokeOnCancellation { runCatching { player.stop() }; player.release() }
-                    player.setAudioAttributes(AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_ASSISTANT)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build())
+                    val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                        .setAudioAttributes(attributes)
+                        .setOnAudioFocusChangeListener { change ->
+                            if ((change == AudioManager.AUDIOFOCUS_LOSS || change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) && continuation.isActive) {
+                                runCatching { player.stop() }
+                                player.release()
+                                continuation.resumeWithException(HermesPlaybackException("phone playback stopped: audio focus lost"))
+                            }
+                        }.build()
+                    focus = request
+                    if (audioManager.requestAudioFocus(request) != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                        player.release()
+                        continuation.resumeWithException(HermesPlaybackException("phone playback refused: audio focus denied"))
+                        return@suspendCancellableCoroutine
+                    }
+                    player.setAudioAttributes(attributes)
+                    // The player keeps the CPU awake while it plays, screen on or off.
+                    player.setWakeMode(context.applicationContext, PowerManager.PARTIAL_WAKE_LOCK)
                     player.setOnCompletionListener {
                         it.release()
                         if (continuation.isActive) continuation.resume(Unit)
@@ -132,7 +161,9 @@ class PhoneSpeakerSink(private val context: Context) : PlaybackSink {
                 }
             }
         } finally {
+            focus?.let { runCatching { audioManager.abandonAudioFocusRequest(it) } }
             file.delete()
+            PhoneApp.from(context).lastPhonePlaybackEndedAtMs = SystemClock.elapsedRealtime()
         }
     }
 }

@@ -1,73 +1,83 @@
 package com.rumi.hermesvoice.watch
 
 import android.Manifest
-import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
-import android.media.AudioFormat
-import android.media.AudioRecord
-import android.media.MediaRecorder
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
+import android.util.Log
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.ui.Alignment
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
-import androidx.wear.compose.material.Button
-import androidx.wear.compose.material.ButtonDefaults
 import androidx.wear.compose.material.Colors
 import androidx.wear.compose.material.MaterialTheme
-import androidx.wear.compose.material.Text
 import com.google.android.gms.wearable.DataMapItem
 import com.google.android.gms.wearable.PutDataRequest
 import com.google.android.gms.wearable.Wearable
-import com.rumi.hermesvoice.core.audio.EndpointDecision
 import com.rumi.hermesvoice.core.audio.QaAudio
-import com.rumi.hermesvoice.core.audio.SilenceEndpoint
-import com.rumi.hermesvoice.core.settings.WakePhrasePatterns
+import com.rumi.hermesvoice.core.audio.QaLaunchGuard
+import com.rumi.hermesvoice.core.wake.WakeContract
+import com.rumi.hermesvoice.core.watchlink.HapticEvent
+import com.rumi.hermesvoice.core.watchlink.LoadStatus
+import com.rumi.hermesvoice.core.watchlink.ReaderAction
+import com.rumi.hermesvoice.core.watchlink.ReaderGestureMapping
+import com.rumi.hermesvoice.core.watchlink.ReaderSurface
+import com.rumi.hermesvoice.core.watchlink.SwipeDirection
 import com.rumi.hermesvoice.core.watchlink.TurnTrigger
 import com.rumi.hermesvoice.core.watchlink.WatchLinkPaths
-import com.rumi.hermesvoice.core.watchlink.WatchPhase
-import java.io.ByteArrayOutputStream
 import java.io.File
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 
 /**
- * Push-to-talk (tap to start, tap to send; auto-stops at the max length) and, when enabled in the
- * Phone's Watch settings, a foreground-only wake phrase via the platform [SpeechRecognizer] that
- * starts a hands-free turn ended by [SilenceEndpoint]. The microphone is owned by one of them at a
- * time: the recognizer is released before capture starts, and re-armed only when the talk state is idle.
+ * The Watch UI: a conversation reader (session browser ↔ selected conversation, swipe left to
+ * switch, swipe right to send the app to the background, vertical touch or bezel to scroll) with
+ * push-to-talk, the wake phrase state and the control of the background session. It owns no voice
+ * logic: the wake flow, the recorder and the session live in the application's
+ * [WatchVoiceRuntime] (`app.voice`), which this activity tells when it is shown or hidden and
+ * whose state it renders. Permission prompts are asked here because only an activity can.
  */
 class WatchActivity : ComponentActivity() {
     private val app by lazy { WatchApp.from(this) }
-    private var capture: Capture? = null
-    private var recognizer: SpeechRecognizer? = null
-    private var resumed = false
+    private val voice get() = app.voice
+    private var qaWakeHandoffPending = false
+    private var qaHeardPending: Pair<String, Boolean>? = null
+    private var qaHeardDelayMs = QA_HEARD_DELAY_MS
 
-    private val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) rearmWakePhrase()
+    /** A tap on Start that waits for the notification prompt to close and the activity to be back on screen. */
+    private var startBackgroundPending = false
+
+    /** The settings read of the current show; cancelled when the app leaves the screen. */
+    private var settingsPull: Job? = null
+
+    private val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        voice.onPermissionResult()
+    }
+
+    /**
+     * Asked at Start while notifications aren't allowed (Android 13+; the system stops asking after
+     * repeated refusals). The session starts whatever the answer; the platform's answer, read again
+     * then, decides whether it may listen (see WatchVoiceCoordinator.block).
+     */
+    private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        startBackgroundPending = true
+        if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) startBackgroundNow()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -76,87 +86,146 @@ class WatchActivity : ComponentActivity() {
             val talk by app.talk.collectAsStateWithLifecycle()
             val settings by app.settings.collectAsStateWithLifecycle()
             val phone by app.phoneReachable.collectAsStateWithLifecycle()
+            val reader by app.reader.collectAsStateWithLifecycle()
+            val listening by voice.wakeListening.collectAsStateWithLifecycle()
+            val unavailable by voice.wakeUnavailable.collectAsStateWithLifecycle()
+            val background by voice.voiceStatus.collectAsStateWithLifecycle()
+            val chatFocus = remember { FocusRequester() }
+            val sessionsFocus = remember { FocusRequester() }
+            val onScrollStep = { app.haptic(HapticEvent.SCROLL_STEP) }
             MaterialTheme(colors = WatchColors) {
-                Box(Modifier.fillMaxSize().background(MaterialTheme.colors.background), contentAlignment = Alignment.Center) {
-                    Column(Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 14.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-                        Text(
-                            when (phone) {
-                                true -> "Phone connected"
-                                false -> "Phone not reachable"
-                                null -> "Checking phone…"
-                            },
-                            color = if (phone == false) MaterialTheme.colors.error else MaterialTheme.colors.onSurfaceVariant,
-                            style = MaterialTheme.typography.caption2, textAlign = TextAlign.Center,
-                        )
-                        val recording = talk.phase == WatchPhase.RECORDING
-                        Button(onClick = ::onTalkPressed, modifier = Modifier.padding(vertical = 6.dp).size(88.dp),
-                            enabled = talk.phase != WatchPhase.SENDING,
-                            colors = ButtonDefaults.buttonColors(
-                                backgroundColor = if (recording) MaterialTheme.colors.error else MaterialTheme.colors.primary)) {
-                            Text(if (recording) "Send" else "Talk", style = MaterialTheme.typography.title3)
+                Box(Modifier.fillMaxSize().background(MaterialTheme.colors.background).readerSwipe(::onSwipe)) {
+                    val history = reader.selectedHistory
+                    when {
+                        reader.surface == ReaderSurface.SESSIONS -> SessionsSurface(reader.sessions, reader.selectedSessionId, sessionsFocus,
+                            onSelect = app::selectSession, onRefresh = app::loadSessions, onScrollStep = onScrollStep)
+                        history != null -> ChatSurface(
+                            title = reader.sessions.rows.firstOrNull { it.id == history.sessionId }?.title ?: "Conversation",
+                            history = history, focusRequester = chatFocus, onOlder = app::loadOlder, onRetry = app::refreshSelected,
+                            onScrollStep = onScrollStep,
+                        ) { CompactTalk(talk, listening, ::onTalkPressed) }
+                        else -> TalkHome(phone, talk, settings.watchWakeEnabled, listening, unavailable, background, ::onTalkPressed, ::onBackgroundPressed)
+                    }
+                    // Bezel input goes to the list on screen; focus follows the surface.
+                    LaunchedEffect(reader.surface, history != null) {
+                        runCatching {
+                            when {
+                                reader.surface == ReaderSurface.SESSIONS -> sessionsFocus.requestFocus()
+                                history != null -> chatFocus.requestFocus()
+                            }
                         }
-                        Text(talk.line.ifBlank { if (settings.wakePhraseEnabled) "Say the wake phrase or tap" else "Tap to talk" },
-                            color = MaterialTheme.colors.onBackground, style = MaterialTheme.typography.body2,
-                            textAlign = TextAlign.Center, maxLines = 3)
                     }
                 }
             }
         }
-        handleQaAudio(intent)
+        handleQaIntent(intent, restored = savedInstanceState != null)
+        // The screen stays on while recording and while a foreground-only window listens; never for a whole background session.
         lifecycleScope.launch {
-            // Release the recognizer whenever the microphone or speaker is busy (including playback
-            // of a Phone turn's reply), so the wake phrase never listens to our own audio.
-            app.talk.collect { if (it.canArmWakePhrase) rearmWakePhrase() else if (capture == null) releaseRecognizer() }
-        }
-        lifecycleScope.launch {
-            app.settings.collect { if (it.wakePhraseEnabled) rearmWakePhrase() else releaseRecognizer() }
+            voice.keepScreenOn.collect { on ->
+                if (on) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
         }
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        handleQaAudio(intent)
-    }
-
-    /**
-     * Debuggable builds only: `am start ... --es hv_qa_wav <name>.wav` uploads files/qa/<name>.wav
-     * to the Phone as a push-to-talk turn, over the same Data Layer path as a recording.
-     */
-    private fun handleQaAudio(intent: Intent?) {
-        val name = intent?.getStringExtra(QaAudio.EXTRA) ?: return
-        intent.removeExtra(QaAudio.EXTRA)
-        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0 || capture != null) return
-        val file = QaAudio.resolve(File(filesDir, QaAudio.DIR), name) ?: return
-        val turnId = app.newTurn(TurnTrigger.PUSH_TO_TALK) ?: return
-        android.util.Log.i("HermesVoiceWatch", "qa audio submitted as a watch voice request turn=${turnId.take(12)}")
-        app.upload(turnId, TurnTrigger.PUSH_TO_TALK, file.readBytes())
+        handleQaIntent(intent, restored = false)
     }
 
     override fun onResume() {
         super.onResume()
-        resumed = true
-        lifecycleScope.launch { pullSettings() }
-        lifecycleScope.launch { app.refreshPhoneReachable() }
-        if (!hasMic()) micPermission.launch(Manifest.permission.RECORD_AUDIO) else rearmWakePhrase()
+        val visit = voice.onActivityResumed()
+        // Reachability and the synced settings item first; only then may the Watch listen. The read
+        // belongs to this show: leaving the screen cancels it, and a late one is ignored anyway.
+        settingsPull?.cancel()
+        settingsPull = lifecycleScope.launch {
+            app.refreshPhoneReachable()
+            pullSettings()
+            voice.onSettingsPulled(visit)
+        }
+        // Titles for the chat header and the browser; the open conversation is re-read for new messages.
+        if (app.reader.value.sessions.status == LoadStatus.IDLE) app.loadSessions()
+        if (app.reader.value.selectedSessionId != null) app.refreshSelected()
+        if (!voice.hasMic()) micPermission.launch(Manifest.permission.RECORD_AUDIO)
+        if (startBackgroundPending) startBackgroundNow()
+        qaHeardPending?.let { (text, final) ->
+            qaHeardPending = null
+            // After this resume's window opened (it waits for the synced settings): the simulated recognizer's result.
+            window.decorView.postDelayed({ voice.wake.qaHeard(text, final) }, qaHeardDelayMs)
+        }
+        if (qaWakeHandoffPending) {
+            qaWakeHandoffPending = false
+            // Posted: the wake window's new generation is set up after onResume returns.
+            window.decorView.post {
+                Log.i(TAG, "qa wake handoff fixture contract=SECOND_UTTERANCE gen=${voice.wake.wake.generation} " +
+                    "watch_listens=${voice.wake.wake.enabledHere} (recorder path only, not recognition)")
+                voice.wake.wake.qaSecondUtterance()
+            }
+        }
     }
 
     override fun onPause() {
-        resumed = false
-        releaseRecognizer()
-        capture?.let { finishCapture(send = false, reason = "Cancelled") }
+        settingsPull?.cancel()
+        settingsPull = null
+        // Without an armed background session this ends listening and any recording, unsent (WakePresence).
+        voice.onActivityPaused()
         super.onPause()
     }
 
-    private fun hasMic() = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+    // ── background session ───────────────────────────────────────────────────────────────────
 
-    /** The settings data item may predate this install's listener; read it directly on resume. */
+    /**
+     * The control on the home screen: Stop when a session runs, otherwise Start. Start happens
+     * here, in the visible activity, and nowhere else. While notifications aren't allowed, Start
+     * asks for them (Android 13+); the session starts whatever the answer, but without them it
+     * only plays replies: a hidden microphone always has its notification and Stop.
+     */
+    private fun onBackgroundPressed() {
+        if (voice.backgroundStatus.value.running) {
+            Log.i(TAG, "background stop requested (app)")
+            return voice.stopBackground()
+        }
+        val ask = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        if (!ask) return startBackgroundNow()
+        notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+
+    private fun startBackgroundNow() {
+        startBackgroundPending = false
+        val status = voice.startBackground()
+        Log.i(TAG, "background start requested (app) running=${status.running} microphone=${status.microphone} notice=${status.notice}")
+    }
+
+    private fun onSwipe(direction: SwipeDirection) {
+        when (ReaderGestureMapping.action(direction)) {
+            ReaderAction.TOGGLE_SURFACE -> {
+                app.toggleReaderSurface()
+                Log.i(TAG, "gesture swipe=$direction action=toggle surface=${app.reader.value.surface}")
+            }
+            ReaderAction.BACKGROUND_APP -> {
+                Log.i(TAG, "gesture swipe=$direction action=background")
+                // The task (and its reader state) stays alive; this is not process termination.
+                moveTaskToBack(true)
+            }
+        }
+    }
+
+    /**
+     * The settings data item may predate this install's listener; read it directly on resume, and
+     * with it the Phone's count of answered wake requests, which the next wake window must know.
+     */
     private suspend fun pullSettings() {
+        pullItem(WatchLinkPaths.SETTINGS, app::applySettings)
+        pullItem(WatchLinkPaths.WAKE_EPOCH, app::applyWakeEpoch)
+    }
+
+    private suspend fun pullItem(path: String, apply: (String) -> Unit) {
         runCatching {
             val items = Wearable.getDataClient(this).getDataItems(
-                Uri.Builder().scheme(PutDataRequest.WEAR_URI_SCHEME).path(WatchLinkPaths.SETTINGS).build()).await()
+                Uri.Builder().scheme(PutDataRequest.WEAR_URI_SCHEME).path(path).build()).await()
             try {
-                items.firstOrNull()?.let { DataMapItem.fromDataItem(it).dataMap.getString("json") }?.let(app::applySettings)
+                items.firstOrNull()?.let { DataMapItem.fromDataItem(it).dataMap.getString("json") }?.let(apply)
             } finally {
                 items.release()
             }
@@ -164,99 +233,79 @@ class WatchActivity : ComponentActivity() {
     }
 
     private fun onTalkPressed() {
-        val active = capture
-        if (active != null) {
-            finishCapture(send = true, reason = "")
+        if (!voice.onTalkPressed()) micPermission.launch(Manifest.permission.RECORD_AUDIO)
+    }
+
+    // ── debug QA (debuggable builds only) ────────────────────────────────────────────────────
+
+    /**
+     * `am start ... --es hv_qa_wav <name>.wav` uploads files/qa/<name>.wav as a push-to-talk turn;
+     * `--es hv_qa_wake_handoff second_utterance` runs the wake handoff exactly as a recognizer match
+     * would (fixture: it proves the recorder path, not recognition); `--es hv_qa_upload_delay_ms <ms>`
+     * makes every upload wait before it is handed to the link (a slow transfer); `--es hv_qa_wake_delay_ms <ms>`
+     * is when the simulated recognizer reports its result; `--ei hv_qa_seed_reader <n>
+     * [--el hv_qa_seed_newest <row>]` shows synthetic reader rows ([WatchApp.seedReaderForQa]).
+     * Once per fresh launch intent.
+     */
+    private fun handleQaIntent(intent: Intent?, restored: Boolean) {
+        intent ?: return
+        val wav = intent.getStringExtra(QaAudio.EXTRA)
+        val handoff = intent.getStringExtra(QA_WAKE_HANDOFF)
+        val seed = intent.getIntExtra(QA_SEED_READER, 0)
+        val recognizer = intent.getStringExtra(QA_RECOGNIZER)
+        val heard = intent.getStringExtra(QA_WAKE_HEARD)
+        val heardFinal = intent.getBooleanExtra(QA_WAKE_FINAL, true)
+        val heardDelay = intent.getStringExtra(QA_WAKE_DELAY)?.toLongOrNull()?.coerceIn(0L, WakeContract.WINDOW_MS - 300)
+        val uploadDelay = intent.getStringExtra(QA_UPLOAD_DELAY)?.toLongOrNull()?.coerceIn(0L, 120_000L)
+        if (wav == null && handoff == null && seed <= 0 && recognizer == null && heard == null && uploadDelay == null) return
+        val fromHistory = intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0
+        val handled = intent.getBooleanExtra(QA_HANDLED, false)
+        intent.removeExtra(QaAudio.EXTRA)
+        intent.removeExtra(QA_WAKE_HANDOFF)
+        intent.removeExtra(QA_SEED_READER)
+        listOf(QA_RECOGNIZER, QA_WAKE_HEARD, QA_WAKE_FINAL, QA_WAKE_DELAY, QA_UPLOAD_DELAY).forEach(intent::removeExtra)
+        intent.putExtra(QA_HANDLED, true)
+        setIntent(intent)
+        if (!QaLaunchGuard.shouldHandle(restored, fromHistory, handled)) return
+        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0 || voice.capturing) return
+        if (recognizer != null) voice.wake.qaFixtureRecognizer = recognizer == "fixture"
+        if (heard != null) {
+            qaHeardPending = heard to heardFinal
+            qaHeardDelayMs = heardDelay ?: QA_HEARD_DELAY_MS
+        }
+        if (uploadDelay != null) {
+            // A slow link for QA: every upload waits this long before it is handed to the Data Layer.
+            app.qaUploadDelayMs = uploadDelay
+            Log.i(TAG, "qa slow transfer set to $uploadDelay ms (debug builds only)")
+        }
+        if (recognizer != null || heard != null || uploadDelay != null) return
+        if (seed > 0) {
+            app.seedReaderForQa(seed.coerceAtMost(40), intent.getLongExtra(QA_SEED_NEWEST, seed.toLong()))
             return
         }
-        if (!hasMic()) {
-            micPermission.launch(Manifest.permission.RECORD_AUDIO)
+        if (handoff == "second_utterance") {
+            // Runs from onResume, in the visible generation, like a recognizer match would.
+            qaWakeHandoffPending = true
             return
         }
-        startCapture(TurnTrigger.PUSH_TO_TALK)
-    }
-
-    private fun startCapture(trigger: TurnTrigger) {
-        releaseRecognizer()
-        val turnId = app.newTurn(trigger) ?: return
-        val endpoint = if (trigger == TurnTrigger.WAKE_PHRASE) {
-            SilenceEndpoint(maxDurationMs = app.settings.value.maxTurnSeconds * 1000L)
-        } else {
-            null
-        }
-        val started = Capture(turnId, trigger, app.settings.value.maxTurnSeconds, endpoint) { decision ->
-            runOnUiThread {
-                if (capture?.turnId != turnId) return@runOnUiThread
-                when (decision) {
-                    EndpointDecision.NO_SPEECH -> finishCapture(send = false, reason = "Didn't hear anything")
-                    else -> finishCapture(send = true, reason = "")
-                }
-            }
-        }
-        if (!started.start()) {
-            app.discard("Microphone unavailable")
-            return
-        }
-        capture = started
-        app.buzz()
-    }
-
-    private fun finishCapture(send: Boolean, reason: String) {
-        val active = capture ?: return
-        capture = null
-        val wav = active.stop()
-        android.util.Log.i("HermesVoiceWatch", "watch mic captured bytes=${wav?.size ?: 0} send=$send")
-        if (send && wav != null) app.upload(active.turnId, active.trigger, wav) else app.discard(reason.ifBlank { "Too short" })
-    }
-
-    // ── wake phrase ──────────────────────────────────────────────────────────────────────────
-
-    private fun rearmWakePhrase() {
-        if (!resumed || recognizer != null || capture != null || !hasMic()) return
-        if (!app.settings.value.wakePhraseEnabled || !app.talk.value.canArmWakePhrase) return
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) return
-        val created = SpeechRecognizer.createSpeechRecognizer(this)
-        recognizer = created
-        created.setRecognitionListener(object : RecognitionListener {
-            override fun onResults(results: Bundle?) = onRecognized(results, final = true)
-            override fun onPartialResults(partialResults: Bundle?) = onRecognized(partialResults, final = false)
-            override fun onError(error: Int) {
-                releaseRecognizer()
-                window.decorView.postDelayed({ rearmWakePhrase() }, REARM_DELAY_MS)
-            }
-            override fun onReadyForSpeech(params: Bundle?) {}
-            override fun onBeginningOfSpeech() {}
-            override fun onRmsChanged(rmsdB: Float) {}
-            override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() {}
-            override fun onEvent(eventType: Int, params: Bundle?) {}
-        })
-        created.startListening(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-            .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            .putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true))
-    }
-
-    private fun onRecognized(bundle: Bundle?, final: Boolean) {
-        if (recognizer == null) return
-        val heard = bundle?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION).orEmpty()
-        if (heard.any { WakePhrasePatterns.matches(app.settings.value.wakePatterns, it) }) {
-            // Release the recognizer's microphone before the recorder takes it.
-            releaseRecognizer()
-            startCapture(TurnTrigger.WAKE_PHRASE)
-        } else if (final) {
-            releaseRecognizer()
-            window.decorView.postDelayed({ rearmWakePhrase() }, REARM_DELAY_MS)
-        }
-    }
-
-    private fun releaseRecognizer() {
-        recognizer?.let { runCatching { it.cancel() }; it.destroy() }
-        recognizer = null
+        val file = QaAudio.resolve(File(filesDir, QaAudio.DIR), wav) ?: return
+        val turnId = app.newTurn(TurnTrigger.PUSH_TO_TALK) ?: return
+        Log.i(TAG, "qa audio submitted as a watch voice request turn=${turnId.take(12)}")
+        app.upload(turnId, TurnTrigger.PUSH_TO_TALK, file.readBytes())
     }
 
     companion object {
-        private const val REARM_DELAY_MS = 400L
+        private const val TAG = "HermesVoiceWatch"
+        private const val QA_WAKE_HANDOFF = "hv_qa_wake_handoff"
+        private const val QA_RECOGNIZER = "hv_qa_recognizer"
+        private const val QA_WAKE_HEARD = "hv_qa_wake_heard"
+        private const val QA_WAKE_FINAL = "hv_qa_wake_final"
+        private const val QA_WAKE_DELAY = "hv_qa_wake_delay_ms"
+        private const val QA_UPLOAD_DELAY = "hv_qa_upload_delay_ms"
+        private const val QA_HEARD_DELAY_MS = 1_500L
+        private const val QA_HANDLED = "hv_qa_handled"
+        private const val QA_SEED_READER = "hv_qa_seed_reader"
+        private const val QA_SEED_NEWEST = "hv_qa_seed_newest"
     }
 }
 
@@ -275,68 +324,3 @@ private val WatchColors = Colors(
     onSurfaceVariant = Color(0xFFBDC1C6),
     onError = Color(0xFF3B0A08),
 )
-
-/** 16 kHz mono PCM16 capture to an in-memory WAV, with an optional hands-free endpoint. */
-private class Capture(
-    val turnId: String,
-    val trigger: TurnTrigger,
-    maxSeconds: Int,
-    private val endpoint: SilenceEndpoint?,
-    private val onEndpoint: (EndpointDecision) -> Unit,
-) {
-    private val limitBytes = SAMPLE_RATE * 2L * maxSeconds
-    private val pcm = ByteArrayOutputStream()
-    private val running = AtomicBoolean(false)
-    private var record: AudioRecord? = null
-    private var worker: Thread? = null
-
-    @SuppressLint("MissingPermission") // Checked by the activity before starting.
-    fun start(): Boolean {
-        val min = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-        val recorder = runCatching {
-            AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT, min.coerceAtLeast(FRAME_BYTES))
-        }.getOrNull()?.takeIf { it.state == AudioRecord.STATE_INITIALIZED } ?: return false
-        record = recorder
-        running.set(true)
-        recorder.startRecording()
-        worker = Thread({
-            val buffer = ByteArray(FRAME_BYTES)
-            while (running.get()) {
-                val read = recorder.read(buffer, 0, buffer.size)
-                if (read <= 0) continue
-                val frame = buffer.copyOf(read)
-                synchronized(pcm) { pcm.write(frame) }
-                val decision = endpoint?.accept(frame) ?: EndpointDecision.CONTINUE
-                val full = synchronized(pcm) { pcm.size() } >= limitBytes
-                if (decision != EndpointDecision.CONTINUE || full) {
-                    running.set(false)
-                    onEndpoint(if (full && decision == EndpointDecision.CONTINUE) EndpointDecision.MAX_DURATION else decision)
-                }
-            }
-        }, "hermes-voice-watch-capture").apply { start() }
-        return true
-    }
-
-    fun stop(): ByteArray? {
-        running.set(false)
-        runCatching { record?.stop() }
-        if (Thread.currentThread() !== worker) runCatching { worker?.join(1_500) }
-        runCatching { record?.release() }
-        record = null
-        val data = synchronized(pcm) { pcm.toByteArray() }
-        if (data.size < SAMPLE_RATE / 5) return null
-        val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN).apply {
-            put("RIFF".toByteArray()); putInt(36 + data.size); put("WAVE".toByteArray())
-            put("fmt ".toByteArray()); putInt(16); putShort(1); putShort(1)
-            putInt(SAMPLE_RATE); putInt(SAMPLE_RATE * 2); putShort(2); putShort(16)
-            put("data".toByteArray()); putInt(data.size)
-        }
-        return header.array() + data
-    }
-
-    companion object {
-        const val SAMPLE_RATE = 16_000
-        const val FRAME_BYTES = 3_200
-    }
-}

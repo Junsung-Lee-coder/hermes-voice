@@ -30,7 +30,7 @@ import org.junit.Assert.fail
 import org.junit.Test
 
 class WatchLinkTest {
-    private val wav = ByteArray(200) { it.toByte() }
+    private val wav = TestAudio.speechWav()
 
     /**
      * Plays instantly (or not at all) and acks through the registry from its own node, as the Watch
@@ -159,7 +159,7 @@ class WatchLinkTest {
             val outcome = runBlocking { h.core.watchIntake.onTurnChannel(WatchLinkPaths.turnPath("turn-watch-1"), frame, watch) }
             assertTrue(outcome is VoiceTurnOutcome.Completed)
             assertEquals(listOf("ACK:0:On it.", "FIRST:1:Looking.", "FINAL:2:Done."), watch.log.toList())
-            assertEquals(listOf("transcribing", "routing", "routed", "acknowledging", "delivering", "responding", "done"),
+            assertEquals(listOf("accepted", "transcribing", "routing", "routed", "acknowledging", "delivering", "responding", "done"),
                 watch.states.map { it.stage })
             assertTrue(watch.states.last().terminal)
             assertEquals("Delivered to work", watch.states.last().detail)

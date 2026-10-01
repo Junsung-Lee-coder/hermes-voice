@@ -1,6 +1,8 @@
 package com.rumi.hermesvoice.core.voice
 
 import com.rumi.hermesvoice.core.VoiceOrigin
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 
 /** A device that can play spoken audio: the Phone speaker, or the Watch node a voice request came from. */
 class PlaybackTarget(val device: VoiceOrigin, val sink: PlaybackSink)
@@ -18,13 +20,20 @@ class PlaybackTarget(val device: VoiceOrigin, val sink: PlaybackSink)
  *   interrupted, on the device it was handed to.
  * - It is in memory only: turns do not survive the Phone process, and the next accepted voice
  *   request sets the route before anything plays.
+ * - [device] is updated inside the same lock as the route itself, so a UI label observing it can
+ *   never settle on a different device than the one that actually plays.
  */
 class PlaybackRoute {
     private var latest: PlaybackTarget? = null
+    private val _device = MutableStateFlow<VoiceOrigin?>(null)
+
+    /** The current target's device, for display; null before any voice request was accepted. */
+    val device: StateFlow<VoiceOrigin?> = _device
 
     @Synchronized
     fun accept(target: PlaybackTarget) {
         latest = target
+        _device.value = target.device
     }
 
     /** The current target; null only before any voice request was accepted. */

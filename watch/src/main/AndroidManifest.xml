@@ -5,8 +5,28 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.VIBRATE" />
 
+    <!-- The optional background session (WatchVoiceService), started only by the user from the
+         visible app: replies play and, when the Phone's wake settings include the Watch, the wake
+         phrase is heard with the app hidden. POST_NOTIFICATIONS shows its notification with Stop;
+         WAKE_LOCK is for short, time-limited CPU holds while it listens, records, sends or plays. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Package visibility (Android 11+) for the platform speech recognizer used by the
+         wake phrase; without it SpeechRecognizer reports no recognition service. Not a permission. -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+    </queries>
+
     <application
         android:name=".WatchApp"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
         android:label="@string/app_name"
         android:theme="@style/Theme.HermesVoiceWatch">
 
@@ -22,6 +42,12 @@
             </intent-filter>
         </activity>
 
+        <!-- Not exported: started and stopped only by this app (the visible activity, or Stop in its own notification). -->
+        <service
+            android:name=".WatchVoiceService"
+            android:exported="false"
+            android:foregroundServiceType="microphone|mediaPlayback" />
+
         <service
             android:name=".WatchListenerService"
             android:exported="true">
@@ -36,6 +62,10 @@
             <intent-filter>
                 <action android:name="com.google.android.gms.wearable.DATA_CHANGED" />
                 <data android:scheme="wear" android:host="*" android:path="/hv/v1/settings" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.DATA_CHANGED" />
+                <data android:scheme="wear" android:host="*" android:path="/hv/v1/wake/epoch" />
             </intent-filter>
         </service>
     </application>

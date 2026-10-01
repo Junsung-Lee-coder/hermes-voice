@@ -11,8 +11,9 @@ data class DestinationEntry(
 
 /**
  * The only mapping from a model-chosen alias to a Hermes session id. It is built from the
- * app's own (unarchived) session registry; construction validates every entry and rejects the
- * routing session itself as a destination. Lookups are exact on the normalized alias, so
+ * app's own (unarchived) session registry (it may be empty: the router can then only ask for a
+ * new conversation); construction validates every entry and rejects the routing session itself
+ * as a destination. Lookups are exact on the normalized alias, so
  * anything the router invents resolves to null (fail closed).
  */
 class DestinationAllowlist private constructor(val entries: List<DestinationEntry>) {
@@ -25,19 +26,16 @@ class DestinationAllowlist private constructor(val entries: List<DestinationEntr
         const val MAX_DESCRIPTION_CHARS = 160
         private val ALIAS = Regex("^[a-z0-9][a-z0-9_-]{0,31}$")
         private val SESSION_ID = Regex("^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-        private val CONTROL = Regex("[\\p{Cntrl}]")
 
         fun normalizeAlias(raw: String): String? = raw.trim().lowercase(Locale.ROOT).takeIf(ALIAS::matches)
 
         fun isValidSessionId(raw: String): Boolean = SESSION_ID.matches(raw)
 
-        fun cleanDescription(raw: String): String =
-            raw.replace(CONTROL, " ").replace(Regex("\\s+"), " ").trim()
+        fun cleanDescription(raw: String): String = TextSanitizer.clean(raw)
 
         /** Throws [IllegalArgumentException] naming the first invalid entry; never silently drops one. */
         fun create(entries: List<DestinationEntry>, routingStoredSessionId: String): DestinationAllowlist {
             require(isValidSessionId(routingStoredSessionId)) { "routing session id is invalid" }
-            require(entries.isNotEmpty()) { "at least one destination is required" }
             require(entries.size <= MAX_ENTRIES) { "at most $MAX_ENTRIES destinations are allowed" }
             val seen = HashSet<String>()
             val clean = entries.map { entry ->

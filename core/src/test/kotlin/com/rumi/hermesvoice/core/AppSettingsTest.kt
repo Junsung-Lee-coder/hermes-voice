@@ -2,6 +2,7 @@ package com.rumi.hermesvoice.core
 
 import com.rumi.hermesvoice.core.settings.AppSettings
 import com.rumi.hermesvoice.core.settings.ThemeMode
+import com.rumi.hermesvoice.core.settings.WakeLocation
 import com.rumi.hermesvoice.core.settings.WakePhrasePatterns
 import com.rumi.hermesvoice.core.settings.WatchSettings
 import org.junit.Assert.assertEquals
@@ -30,19 +31,18 @@ class AppSettingsTest {
     }
 
     @Test
-    fun `watch settings default to push-to-talk only and clamp on read and decode`() {
+    fun `watch settings default to push-to-talk only, carry no recording cap, and round trip`() {
         val settings = AppSettings(InMemoryKeyValueStore())
         assertEquals(WatchSettings(), settings.watchSettings())
-        assertFalse(settings.watchSettings().wakePhraseEnabled)
-        settings.watchMaxTurnSeconds = 10_000
-        assertEquals(WatchSettings.MAX_TURN_SECONDS, settings.watchMaxTurnSeconds)
-        settings.watchWakePhraseEnabled = true
+        assertFalse(settings.watchSettings().watchWakeEnabled)
+        assertFalse(WatchSettings::class.java.declaredFields.any { it.name.contains("maxTurn", ignoreCase = true) })
+        settings.wakeLocation = WakeLocation.BOTH
         settings.watchWakePatterns = "  hermes  헤르메스 hermes "
         val decoded = WatchSettings.fromJson(settings.watchSettings().toJson())
         assertEquals(settings.watchSettings(), decoded)
         assertEquals("hermes 헤르메스", decoded.wakePatterns)
         assertEquals(WatchSettings(), WatchSettings.fromJson("not json"))
-        assertEquals(WatchSettings.MIN_TURN_SECONDS, WatchSettings.fromJson("""{"max_turn_seconds":1}""").maxTurnSeconds)
+        assertEquals(WatchSettings(), WatchSettings.fromJson("""{"max_turn_seconds":1}"""))
     }
 
     @Test

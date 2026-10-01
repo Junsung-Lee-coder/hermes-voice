@@ -107,17 +107,28 @@ class WatchTurnIntake(
     private val orchestrator: VoiceTurnOrchestrator,
     private val acks: WatchAckRegistry,
 ) {
-    suspend fun onTurnChannel(path: String, bytes: ByteArray, transport: WatchTransport): VoiceTurnOutcome? {
+    /**
+     * [bytes] is the channel content, or null when it could not be read or exceeded the frame
+     * bound. Anything that is not a valid upload is rejected to the Watch before the orchestrator
+     * sees it, so it is never accepted as a voice request and never moves the playback route.
+     */
+    suspend fun onTurnChannel(path: String, bytes: ByteArray?, transport: WatchTransport): VoiceTurnOutcome? {
         val upload = try {
+            if (bytes == null) throw LinkProtocolException("recording transfer failed or too large")
             WatchTurnUpload.fromFrame(path, LinkFrame.decode(bytes))
         } catch (error: LinkProtocolException) {
             WatchLinkPaths.turnIdFromPath(path)?.let { turnId ->
-                runCatching { transport.sendMessage(WatchLinkPaths.STATE, TurnStateMessage(turnId, "rejected", "Bad recording", true).encode()) }
+                val detail = if (bytes == null) "Recording transfer failed" else "Bad recording"
+                runCatching { transport.sendMessage(WatchLinkPaths.STATE, TurnStateMessage(turnId, "rejected", detail, true).encode()) }
             }
             return null
         }
         val states = Channel<TurnStateMessage>(Channel.UNLIMITED)
         val listener = object : VoiceTurnListener {
+            // Told at once, before the turn waits its place in line: the Watch keeps its wake claim until this.
+            override fun onAccepted(turnId: String, origin: VoiceOrigin) {
+                states.trySend(TurnStateMessage(turnId, "accepted", "", false))
+            }
             override fun onStage(turnId: String, stage: VoiceTurnStage) {
                 states.trySend(TurnStateMessage(turnId, stage.name.lowercase(), "", false))
             }
@@ -125,13 +136,30 @@ class WatchTurnIntake(
                 states.trySend(TurnStateMessage(route.turnId, "routed", route.destination.alias, false))
             }
         }
-        return coroutineScope {
+        return try {
+            relay(upload, transport, states, listener)
+        } catch (cancelled: CancellationException) {
+            // The turn was stopped on the Phone (its background relay was stopped): the Watch is told, so it does not wait on.
+            withContext(NonCancellable) {
+                runCatching {
+                    transport.sendMessage(WatchLinkPaths.STATE, TurnStateMessage(upload.turnId, "done", STOPPED_ON_PHONE, true).encode())
+                }
+            }
+            throw cancelled
+        }
+    }
+
+    private suspend fun relay(upload: WatchTurnUpload, transport: WatchTransport, states: Channel<TurnStateMessage>,
+                              listener: VoiceTurnListener): VoiceTurnOutcome =
+        coroutineScope {
             val forwarder = launch {
                 for (state in states) runCatching { transport.sendMessage(WatchLinkPaths.STATE, state.encode()) }
             }
             val outcome = try {
                 orchestrator.run(VoiceTurnRequest(upload.turnId, VoiceOrigin.WATCH, upload.audio, upload.mimeType,
-                    WatchPlaybackSink(transport, acks), listener))
+                    WatchPlaybackSink(transport, acks), listener, recognizedText = upload.recognizedText,
+                    wakeTurn = upload.trigger == TurnTrigger.WAKE_PHRASE, wakeClaimId = upload.wakeClaimId,
+                    originNodeId = transport.nodeId))
             } finally {
                 states.close()
             }
@@ -142,13 +170,17 @@ class WatchTurnIntake(
             }
             outcome
         }
+
+    companion object {
+        const val STOPPED_ON_PHONE = "Stopped on the phone"
     }
 }
 
 /** Short user-facing text for a turn outcome (Phone status line and Watch terminal state). */
 object VoiceOutcomeText {
     fun describe(outcome: VoiceTurnOutcome): String = when (outcome) {
-        is VoiceTurnOutcome.Completed -> "Delivered to ${outcome.route.destination.alias}"
+        is VoiceTurnOutcome.Completed ->
+            "Delivered to ${outcome.route.destination.alias}" + if (outcome.route.created) " (new conversation)" else ""
         is VoiceTurnOutcome.Interrupted -> "Delivered to ${outcome.route.destination.alias}; playback interrupted"
         is VoiceTurnOutcome.DeliveredUnattributed ->
             "Delivered to ${outcome.route.destination.alias}; reply not spoken (destination busy)"
@@ -159,5 +191,9 @@ object VoiceOutcomeText {
             if (outcome.authRequired) "Not delivered: sign in on the phone" else "Not delivered: ${outcome.reason.take(120)}"
         VoiceTurnOutcome.NoSpeech -> "No speech detected"
         is VoiceTurnOutcome.Duplicate -> "Duplicate turn ignored"
+        is VoiceTurnOutcome.NotAdmitted ->
+            if (outcome.reason == "wake_claim_missing") "Not sent: the wake settings changed while you spoke. Say it again"
+            else if (outcome.reason.startsWith("wake_claim")) "Not sent: the wake phrase was answered elsewhere or timed out. Say it again"
+            else "Not sent: ${outcome.reason.take(120)}"
     }
 }

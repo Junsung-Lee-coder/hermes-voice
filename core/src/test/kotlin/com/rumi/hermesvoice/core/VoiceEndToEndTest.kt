@@ -39,7 +39,7 @@ class VoiceEndToEndTest {
     @After fun tearDown() = h.close()
 
     private fun run(turnId: String, origin: VoiceOrigin) = runBlocking {
-        h.core.orchestrator.run(VoiceTurnRequest(turnId, origin, ByteArray(64) { 7 }, "audio/wav", PlaybackSink { audio, cue ->
+        h.core.orchestrator.run(VoiceTurnRequest(turnId, origin, TestAudio.speechWav(), "audio/wav", PlaybackSink { audio, cue ->
             played += "${origin.name.lowercase()}:${cue.role}:${cue.sequence}:${h.fake.decodeSpoken(audio)}"
         }))
     }
@@ -50,8 +50,8 @@ class VoiceEndToEndTest {
         assertEquals(listOf("watch:ACK:0:Sending that to work.", "watch:FINAL:1:Moved it to 3pm."), played.toList())
         val router = h.registry.router()!!.storedSessionId
         assertEquals(listOf(router, workId), h.fake.prompts.map { it.first })
-        assertTrue(h.fake.prompts[0].second.contains("- work: Calendar"))
-        assertTrue(h.fake.prompts[0].second.contains("- home: Home"))
+        assertTrue(h.fake.prompts[0].second.contains("""{"alias":"work","description":"Calendar"}"""))
+        assertTrue(h.fake.prompts[0].second.contains("""{"alias":"home","description":"Home"}"""))
         assertEquals("move my 2pm meeting to 3", h.fake.prompts[1].second)
         assertEquals("move my 2pm meeting to 3", outcome.route.originalTranscript)
         val timeline = h.fake.timeline.toList()
@@ -87,20 +87,6 @@ class VoiceEndToEndTest {
     }
 
     @Test
-    fun `no conversations means no router is created and nothing is transcribed`() {
-        val fresh = CoreHarness()
-        try {
-            val outcome = runBlocking {
-                fresh.core.orchestrator.run(VoiceTurnRequest("x1", VoiceOrigin.PHONE, ByteArray(64), "audio/wav", PlaybackSink { _, _ -> }))
-            } as VoiceTurnOutcome.NotDelivered
-            assertTrue(outcome.reason, outcome.reason.startsWith("config_invalid"))
-            assertEquals(0, fresh.fake.server.requestCount)
-        } finally {
-            fresh.close()
-        }
-    }
-
-    @Test
     fun `expired access token is refreshed transparently mid-turn`() {
         h.fake.rejectAccessTokens = setOf("AT-1")
         run("w3", VoiceOrigin.WATCH) as VoiceTurnOutcome.Completed
@@ -113,7 +99,7 @@ class VoiceEndToEndTest {
         h.tokens.clear()
         val before = h.fake.server.requestCount
         val outcome = run("w4", VoiceOrigin.WATCH) as VoiceTurnOutcome.NotDelivered
-        assertTrue(outcome.authRequired)
+        assertTrue("$outcome", outcome.authRequired)
         assertEquals(before, h.fake.server.requestCount)
     }
 }

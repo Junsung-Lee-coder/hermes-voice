@@ -5,7 +5,12 @@ import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Color as AndroidColor
+import android.media.AudioManager
 import android.os.Bundle
+import android.os.PowerManager
+import android.os.SystemClock
+import android.util.Log
+import android.view.HapticFeedbackConstants
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -51,6 +56,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -59,6 +65,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -66,26 +73,166 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
 import java.io.File
+import java.util.UUID
+import kotlin.math.roundToInt
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import com.rumi.hermesvoice.core.VoiceOrigin
 import com.rumi.hermesvoice.core.audio.QaAudio
+import com.rumi.hermesvoice.core.audio.QaLaunchGuard
+import com.rumi.hermesvoice.core.background.BackgroundText
 import com.rumi.hermesvoice.core.sessions.AppConversation
 import com.rumi.hermesvoice.core.settings.ThemeMode
-import com.rumi.hermesvoice.core.settings.WatchSettings
+import com.rumi.hermesvoice.core.settings.VadSilence
+import com.rumi.hermesvoice.core.settings.WakeLocation
+import com.rumi.hermesvoice.core.wake.ClaimVerdict
+import com.rumi.hermesvoice.core.wake.WakeArmInputs
+import com.rumi.hermesvoice.core.wake.WakeClaim
+import com.rumi.hermesvoice.core.wake.WakeClaimPort
+import com.rumi.hermesvoice.core.wake.WakeBlock
+import com.rumi.hermesvoice.core.wake.WakeContract
+import com.rumi.hermesvoice.core.wake.WakeDevicePort
 
 class MainActivity : ComponentActivity() {
     private val model: PhoneViewModel by viewModels()
+    private lateinit var phoneWake: PhoneWakeController
+    private var qaWakeHandoffPending = false
+    private var qaHeardPending: Pair<String, Boolean>? = null
+    private var qaHeardDelayMs = QA_HEARD_DELAY_MS
+    private var recognizerAvailable by mutableStateOf(false)
+    private val handoffRunnable: Runnable = Runnable {
+        if (!phoneWake.wake.onHandoffDue(captureIdle = model.voiceIdle())) Log.i(TAG, "phone wake handoff dropped gen=${phoneWake.wake.generation}")
+    }
+
+    /** What the shared wake flow ([PhoneWakeController.wake]) does on this Phone. */
+    private val wakePort: WakeDevicePort = object : WakeDevicePort {
+        override fun windowChanged(open: Boolean) = model.setWakeListening(open)
+
+        override fun scheduleHandoff(delayMs: Long) {
+            // Give the recognizer's microphone a moment to be released before our recorder opens it.
+            window.decorView.removeCallbacks(handoffRunnable)
+            window.decorView.postDelayed(handoffRunnable, delayMs)
+        }
+
+        override fun cancelHandoff() {
+            window.decorView.removeCallbacks(handoffRunnable)
+        }
+        override fun startRequestCapture(silenceMs: Long): Boolean = startRequestCapture(silenceMs, null)
+        override fun startRequestCapture(silenceMs: Long, claimId: String?): Boolean = hasMic() && model.startHandsFree(silenceMs, claimId)
+        override fun cancelRequestCapture(reason: String) = model.cancelHandsFree(reason)
+        override fun sendRecognized(request: String) = sendRecognized(request, null)
+        override fun sendRecognized(request: String, claimId: String?) = model.sendRecognizedRequest(request, claimId)
+
+        override fun closed(reason: String) {
+            Log.i(TAG, "phone wake window closed reason=$reason")
+            model.onWakeClosed(reason)
+        }
+
+        override fun armInputs() = WakeArmInputs(
+            enabled = true,
+            resumed = lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED),
+            interactive = getSystemService(PowerManager::class.java)?.isInteractive == true,
+            ambient = false,
+            permission = hasMic(),
+            microphoneMuted = getSystemService(AudioManager::class.java)?.isMicrophoneMute == true,
+            talkIdle = model.voiceIdle(),
+            // The Phone delivers requests itself: it needs a Hermes sign-in, not a reachable peer.
+            phoneReachable = model.state.value.signedIn,
+            nowMs = SystemClock.elapsedRealtime(),
+            cooldownUntilMs = PhoneApp.from(this@MainActivity).lastPhonePlaybackEndedAtMs.let {
+                if (it == 0L) 0L else it + WakeContract.PLAYBACK_COOLDOWN_MS
+            },
+            generation = 0,
+            lastArmedGeneration = null,
+        )
+
+        override fun armBlocked(source: String, block: WakeBlock) {
+            if (block != WakeBlock.DISABLED) Log.i(TAG, "phone wake window blocked source=$source reason=$block")
+        }
+    }
+
+    private val claimTimer: Runnable = Runnable { phoneWake.wake.onClaimTimer() }
+
+    /**
+     * "Both": the Phone is the coordinator, so its own claims are direct calls to the shared
+     * [com.rumi.hermesvoice.core.wake.WakeAdmission] the Watch's claims also go to. Answers are
+     * posted, like the Watch's arrive, so a claim is never answered re-entrantly.
+     */
+    private val claimPort: WakeClaimPort = object : WakeClaimPort {
+        private fun admission() = runCatching { PhoneApp.from(this@MainActivity).wiring().core.wakeAdmission }.getOrNull()
+
+        override fun newClaimId(): String = "p-" + UUID.randomUUID().toString()
+
+        override fun epoch(): Long = admission()?.epoch ?: 0L
+
+        override fun request(claimId: String, settingsRevision: Long, generation: Long, epoch: Long) {
+            val verdict = admission()?.claim(WakeClaim(claimId, VoiceOrigin.PHONE, "", settingsRevision, generation, epoch)) ?: ClaimVerdict.EXPIRED
+            Log.i(TAG, "phone wake claim ${claimId.take(10)} gen=$generation epoch=$epoch verdict=$verdict")
+            window.decorView.post { phoneWake.wake.onClaimVerdict(claimId, verdict) }
+        }
+
+        override fun renew(claimId: String) {
+            val verdict = admission()?.renew(claimId, VoiceOrigin.PHONE, "") ?: ClaimVerdict.EXPIRED
+            if (verdict != ClaimVerdict.GRANTED) window.decorView.post { phoneWake.wake.onClaimVerdict(claimId, verdict) }
+        }
+
+        override fun release(claimId: String) {
+            admission()?.release(claimId, VoiceOrigin.PHONE, "")
+            Log.i(TAG, "phone wake claim ${claimId.take(10)} released")
+        }
+
+        override fun scheduleTimer(delayMs: Long) {
+            window.decorView.removeCallbacks(claimTimer)
+            window.decorView.postDelayed(claimTimer, delayMs)
+        }
+
+        override fun cancelTimer() {
+            window.decorView.removeCallbacks(claimTimer)
+        }
+    }
+
+    /** A Talk tap waiting for the recognizer's microphone to be released. */
+    private var talkPending = false
+    private val talkAfterRelease: Runnable = Runnable {
+        talkPending = false
+        if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) model.toggleRecording()
+    }
+
+    /**
+     * The Talk button. During a hands-free recording it sends it now. While the wake window is
+     * open, the recognizer is released first and push-to-talk starts after the same short pause
+     * as the wake handoff, so the two never hold the microphone together.
+     */
+    private fun onTalk() {
+        if (talkPending) return
+        if (model.handsFreeCapturing() || model.state.value.recording) return model.toggleRecording()
+        val listening = model.state.value.handsFree == HandsFree.LISTENING
+        phoneWake.wake.onBusy()
+        if (!listening) return model.toggleRecording()
+        talkPending = true
+        Log.i(TAG, "phone talk tapped in the wake window: recognizer released, recording in ${WakeContract.MIC_HANDOFF_MS} ms")
+        window.decorView.postDelayed(talkAfterRelease, WakeContract.MIC_HANDOFF_MS)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         applySystemBars(dark = PhoneApp.from(this).settings.themeMode.isDark(systemDark = isSystemNight()))
+        phoneWake = PhoneWakeController(this, wakePort, model.state.value.watch, claimPort)
+        lifecycle.addObserver(phoneWake)
+        model.onHandsFreeEnded = { sent -> phoneWake.wake.onRequestCaptureEnded(sent) }
+        recognizerAvailable = phoneWake.recognizerAvailable()
         setContent {
             val state by model.state.collectAsStateWithLifecycle()
             val dark = state.themeMode.isDark(isSystemInDarkTheme())
@@ -94,26 +241,131 @@ class MainActivity : ComponentActivity() {
                 onDispose {}
             }
             HermesVoiceTheme(dark) {
-                PhoneScreen(model)
+                PhoneScreen(model, recognizerAvailable, onTalk = ::onTalk)
+            }
+        }
+        // Phone-owned settings: a mode that excludes the Phone stops listening and any hands-free capture at once.
+        lifecycleScope.launch { model.state.map { it.watch }.distinctUntilChanged().collect { phoneWake.wake.onSettings(it) } }
+        // Both: a wake request was admitted (from the Watch, or this Phone's own): a window that was already listening closes.
+        lifecycleScope.launch {
+            PhoneApp.from(this@MainActivity).wakeEpisodes.collect { episode -> episode?.let { phoneWake.wake.onEpisodeAnswered(it.epoch, it.claimId) } }
+        }
+        // Push-to-talk or a turn in flight closes the window; idle again may re-arm (once per visibility generation).
+        lifecycleScope.launch {
+            model.state.map { it.recording || it.voiceBusy }.distinctUntilChanged().collect { busy ->
+                if (busy) phoneWake.wake.onBusy() else if (model.voiceIdle()) phoneWake.wake.onIdle()
             }
         }
         if (model.state.value.signedIn) model.refresh()
-        handleQaAudio(intent)
+        handleQaIntent(intent, restored = savedInstanceState != null)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // Visible: a background relay the user left switched on may (re)start now, and only now.
+        PhoneApp.from(this).onActivityStarted()
+    }
+
+    override fun onStop() {
+        PhoneApp.from(this).onActivityStopped()
+        super.onStop()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        recognizerAvailable = phoneWake.recognizerAvailable()
+        qaHeardPending?.let { (text, final) ->
+            qaHeardPending = null
+            // After the resume's window opened: the simulated recognizer reports this result.
+            window.decorView.postDelayed({ phoneWake.qaHeard(text, final) }, qaHeardDelayMs)
+        }
+        if (qaWakeHandoffPending) {
+            qaWakeHandoffPending = false
+            // Posted: lifecycle observers (the wake window's new generation) run after onResume returns.
+            window.decorView.post {
+                Log.i(TAG, "qa wake handoff fixture contract=SECOND_UTTERANCE gen=${phoneWake.wake.generation} " +
+                    "phone_listens=${phoneWake.wake.enabledHere} (recorder path only, not recognition)")
+                phoneWake.wake.qaSecondUtterance()
+            }
+        }
+    }
+
+    override fun onPause() {
+        window.decorView.removeCallbacks(handoffRunnable)
+        window.decorView.removeCallbacks(talkAfterRelease)
+        talkPending = false
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        model.onHandsFreeEnded = null
+        super.onDestroy()
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        handleQaAudio(intent)
+        handleQaIntent(intent, restored = false)
     }
 
-    /** Debuggable builds only: `am start ... --es hv_qa_wav <name>.wav` submits files/qa/<name>.wav as a Phone voice request. */
-    private fun handleQaAudio(intent: Intent?) {
-        val name = intent?.getStringExtra(QaAudio.EXTRA) ?: return
-        intent.removeExtra(QaAudio.EXTRA)
+    private fun hasMic() = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    /**
+     * Debuggable builds only, once per fresh launch intent (see [QaLaunchGuard]):
+     * `--es hv_qa_wav <name>.wav` submits files/qa/<name>.wav as a Phone voice request;
+     * `--es hv_qa_wake_handoff second_utterance` runs the phrase-only wake handoff exactly as a
+     * recognizer match would (fixture: it proves the recorder path, not recognition);
+     * `--es hv_qa_wake_location <OFF|WATCH|PHONE|BOTH>` and `--es hv_qa_vad_silence <seconds>` save
+     * and publish the settings through the same path as the Settings screen (invalid values are refused);
+     * `--es hv_qa_recognizer fixture` replaces the platform recognizer with a simulated one (`real`
+     * restores it) and `--es hv_qa_wake_heard "<text>" [--ez hv_qa_wake_final false]` is its result
+     * for the window this launch opens (it tests the wake flow and arbitration, never recognition).
+     */
+    private fun handleQaIntent(intent: Intent?, restored: Boolean) {
+        intent ?: return
+        val name = intent.getStringExtra(QaAudio.EXTRA)
+        val handoff = intent.getStringExtra(QA_WAKE_HANDOFF)
+        val location = intent.getStringExtra(QA_WAKE_LOCATION)
+        val silence = intent.getStringExtra(QA_VAD_SILENCE)
+        val recognizer = intent.getStringExtra(QA_RECOGNIZER)
+        val heard = intent.getStringExtra(QA_WAKE_HEARD)
+        val heardFinal = intent.getBooleanExtra(QA_WAKE_FINAL, true)
+        val heardDelay = intent.getStringExtra(QA_WAKE_DELAY)?.toLongOrNull()?.coerceIn(0L, WakeContract.WINDOW_MS - 300)
+        if (name == null && handoff == null && location == null && silence == null && recognizer == null && heard == null) return
+        val fromHistory = intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0
+        val handled = intent.getBooleanExtra(QA_HANDLED, false)
+        listOf(QaAudio.EXTRA, QA_WAKE_HANDOFF, QA_WAKE_LOCATION, QA_VAD_SILENCE, QA_RECOGNIZER, QA_WAKE_HEARD, QA_WAKE_FINAL, QA_WAKE_DELAY).forEach(intent::removeExtra)
+        intent.putExtra(QA_HANDLED, true)
+        setIntent(intent)
+        if (!QaLaunchGuard.shouldHandle(restored, fromHistory, handled)) return
         if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0) return
-        val file = QaAudio.resolve(File(filesDir, QaAudio.DIR), name) ?: return
-        android.util.Log.i("HermesVoice", "qa audio submitted as a phone voice request bytes=${file.length()}")
+        if (location != null || silence != null) {
+            val mode = location?.let { WakeLocation.parse(it) ?: run { Log.w(TAG, "qa settings refused: unknown wake location"); return } }
+            val seconds = silence?.let { VadSilence.validOrNull(it.toDoubleOrNull()) ?: run { Log.w(TAG, "qa settings refused: invalid trailing silence"); return } }
+            val current = model.state.value.watch
+            model.updateWatch(current.copy(wakeLocation = mode ?: current.wakeLocation, vadSilenceSeconds = seconds ?: current.vadSilenceSeconds))
+        }
+        if (handoff == "second_utterance") qaWakeHandoffPending = true
+        if (recognizer != null) phoneWake.qaFixtureRecognizer = recognizer == "fixture"
+        if (heard != null) {
+            qaHeardPending = heard to heardFinal
+            qaHeardDelayMs = heardDelay ?: QA_HEARD_DELAY_MS
+        }
+        val file = name?.let { QaAudio.resolve(File(filesDir, QaAudio.DIR), it) } ?: return
+        Log.i("HermesVoice", "qa audio submitted as a phone voice request bytes=${file.length()}")
         model.submitQaWav(file.readBytes())
+    }
+
+    private companion object {
+        const val TAG = "HermesVoiceWake"
+        const val QA_HANDLED = "hv_qa_handled"
+        const val QA_WAKE_HANDOFF = "hv_qa_wake_handoff"
+        const val QA_WAKE_LOCATION = "hv_qa_wake_location"
+        const val QA_VAD_SILENCE = "hv_qa_vad_silence"
+        const val QA_RECOGNIZER = "hv_qa_recognizer"
+        const val QA_WAKE_HEARD = "hv_qa_wake_heard"
+        const val QA_WAKE_FINAL = "hv_qa_wake_final"
+        const val QA_WAKE_DELAY = "hv_qa_wake_delay_ms"
+        const val QA_HEARD_DELAY_MS = 600L
     }
 
     private fun isSystemNight(): Boolean =
@@ -132,12 +384,19 @@ private enum class Tab(val label: String) { CONVERSATIONS("Conversations"), CHAT
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-private fun PhoneScreen(model: PhoneViewModel) {
+private fun PhoneScreen(model: PhoneViewModel, recognizerAvailable: Boolean, onTalk: () -> Unit) {
     val state by model.state.collectAsStateWithLifecycle()
     var tab by rememberSaveable { mutableStateOf(Tab.CONVERSATIONS) }
     val context = androidx.compose.ui.platform.LocalContext.current
+    val view = LocalView.current
     val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) model.toggleRecording()
+        if (granted) onTalk()
+    }
+    // Hands-free recording start ("speak now") and end: a short system haptic, no sound (a tone would be recorded).
+    LaunchedEffect(state.hapticTick) {
+        if (state.hapticTick > 0) {
+            view.performHapticFeedback(if (android.os.Build.VERSION.SDK_INT >= 30) HapticFeedbackConstants.CONFIRM else HapticFeedbackConstants.LONG_PRESS)
+        }
     }
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
@@ -154,7 +413,7 @@ private fun PhoneScreen(model: PhoneViewModel) {
                     TalkBar(state) {
                         val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
                             PackageManager.PERMISSION_GRANTED
-                        if (granted) model.toggleRecording() else micPermission.launch(Manifest.permission.RECORD_AUDIO)
+                        if (granted) onTalk() else micPermission.launch(Manifest.permission.RECORD_AUDIO)
                     }
                 }
                 NavigationBar(containerColor = MaterialTheme.colorScheme.surfaceContainer) {
@@ -175,7 +434,7 @@ private fun PhoneScreen(model: PhoneViewModel) {
             when (tab) {
                 Tab.CONVERSATIONS -> ConversationsTab(state, model, onOpen = { model.open(it.owned); tab = Tab.CHAT })
                 Tab.CHAT -> ChatTab(state, model)
-                Tab.SETTINGS -> SettingsTab(state, model)
+                Tab.SETTINGS -> SettingsTab(state, model, recognizerAvailable)
             }
         }
     }
@@ -200,7 +459,18 @@ private fun TalkBar(state: PhoneUiState, onTalk: () -> Unit) {
                 style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center, modifier = Modifier.padding(bottom = 6.dp),
             )
-            val colors = if (state.recording) {
+            val handsFreeLine = when (state.handsFree) {
+                HandsFree.LISTENING -> "Listening for the wake phrase…"
+                HandsFree.GET_READY -> "Get ready…"
+                HandsFree.SPEAK_NOW -> "Speak now. It sends when you stop, or tap to send"
+                HandsFree.IDLE -> null
+            }
+            if (handsFreeLine != null) {
+                Text(handsFreeLine, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary,
+                    textAlign = TextAlign.Center, modifier = Modifier.padding(bottom = 6.dp).testTag("hands_free"))
+            }
+            val capturing = state.handsFree == HandsFree.GET_READY || state.handsFree == HandsFree.SPEAK_NOW
+            val colors = if (state.recording || capturing) {
                 ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error,
                     contentColor = MaterialTheme.colorScheme.onError)
             } else {
@@ -208,7 +478,7 @@ private fun TalkBar(state: PhoneUiState, onTalk: () -> Unit) {
             }
             Button(onClick = onTalk, colors = colors, shape = RoundedCornerShape(28.dp),
                 modifier = Modifier.fillMaxWidth().height(60.dp).testTag("talk")) {
-                Text(if (state.recording) "Stop & send" else "Talk", fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+                Text(if (state.recording) "Stop & send" else if (capturing) "Send now" else "Talk", fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
             }
         }
     }
@@ -249,7 +519,7 @@ private fun ConversationsTab(state: PhoneUiState, model: PhoneViewModel, onOpen:
             }
         }
         if (state.conversations.isEmpty()) item {
-            Text(if (state.showArchived) "No archived conversations." else "No conversations yet.",
+            Text(if (state.showArchived) "No archived conversations." else "No conversations yet. Create one below, or just talk: one is created when nothing fits.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         if (!state.showArchived) item {
@@ -357,9 +627,11 @@ private fun ChatTab(state: PhoneUiState, model: PhoneViewModel) {
 }
 
 @Composable
-private fun SettingsTab(state: PhoneUiState, model: PhoneViewModel) {
+private fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerAvailable: Boolean) {
     var patterns by remember(state.watch.wakePatterns) { mutableStateOf(state.watch.wakePatterns) }
-    var seconds by remember(state.watch.maxTurnSeconds) { mutableStateOf(state.watch.maxTurnSeconds.toString()) }
+    var silence by remember(state.watch.vadSilenceSeconds) { mutableStateOf(state.watch.vadSilenceSeconds.toFloat()) }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val micGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("Hermes dashboard", style = MaterialTheme.typography.titleSmall)
         ConnectionFields(state, model, primaryAction = "Sign in")
@@ -394,20 +666,91 @@ private fun SettingsTab(state: PhoneUiState, model: PhoneViewModel) {
             color = if (state.watchReachable == false) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.tertiary,
             style = MaterialTheme.typography.bodyMedium,
         )
-        Text("Push-to-talk is always available on the Watch.",
+        Text("Push-to-talk is always available on the Watch and this phone and records until you tap Send (no time limit).",
             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        SwitchRow("Wake phrase (while the Watch app is open)", state.watch.wakePhraseEnabled) {
-            model.updateWatch(state.watch.copy(wakePhraseEnabled = it))
+        SwitchRow("Watch haptics", state.watch.hapticsEnabled) { model.updateWatch(state.watch.copy(hapticsEnabled = it)) }
+
+        HorizontalDivider()
+        Text("Background", style = MaterialTheme.typography.titleSmall)
+        // The first switch-on asks whether the app may show its notification (Android 13+); the relay starts whatever the answer.
+        // Whether the relay's notification can really be seen now: the permission, the app's notifications and its channel.
+        val notifications = PhoneApp.from(context).relayNotificationCapability().shown
+        val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { model.setBackgroundRelay(true) }
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("Keep relaying for the Watch when this app is closed", Modifier.weight(1f))
+            Switch(checked = state.relay.running, modifier = Modifier.testTag("background_relay"), onCheckedChange = { on ->
+                if (on && !notifications && model.askNotificationsOnce()) {
+                    notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                } else {
+                    model.setBackgroundRelay(on)
+                }
+            })
         }
-        OutlinedTextField(patterns, { patterns = it }, label = { Text("Wake phrases (space-separated, * wildcard)") },
+        Text(BackgroundText.phoneStatus(state.relay, notifications), style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.testTag("background_relay_status"),
+            color = if (state.relay.wanted && !state.relay.running) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.tertiary)
+        Text("Off by default. While on, Watch requests are transcribed, routed, delivered and answered with this app closed and " +
+            "the screen off, and a notification with Stop stays visible. This phone doesn't listen or record in the background: " +
+            "its own Talk button and wake phrase work only while the app is open. It doesn't survive a force stop, a restart of the " +
+            "phone or the system's own Stop; it starts again when you open the app. It uses more battery.",
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+        HorizontalDivider()
+        Text("Wake phrase", style = MaterialTheme.typography.titleSmall)
+        Text("Listen on", style = MaterialTheme.typography.bodyMedium)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            WakeLocation.values().forEach { location ->
+                FilterChip(selected = state.watch.wakeLocation == location, onClick = { model.setWakeLocation(location) },
+                    label = { Text(location.label) }, modifier = Modifier.testTag("wake_${location.name.lowercase()}"))
+            }
+        }
+        val phoneListens = state.watch.wakeLocation.listensOn(VoiceOrigin.PHONE)
+        val watchListens = state.watch.wakeLocation.listensOn(VoiceOrigin.WATCH)
+        Text(
+            when {
+                !phoneListens -> "Phone: off"
+                !recognizerAvailable -> "Phone: unavailable, this phone has no speech recognizer"
+                !micGranted -> "Phone: needs the microphone permission (tap Talk once to grant it)"
+                !state.signedIn -> "Phone: sign in to Hermes first"
+                state.handsFree == HandsFree.LISTENING -> "Phone: listening now"
+                else -> "Phone: listens for ${WakeContract.WINDOW_MS / 1000} s each time you open this app, screen on"
+            },
+            style = MaterialTheme.typography.bodyMedium, modifier = Modifier.testTag("phone_wake_status"),
+            color = if (phoneListens && (!recognizerAvailable || !micGranted)) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.tertiary,
+        )
+        Text(
+            when {
+                !watchListens -> "Watch: off"
+                state.watchReachable == false -> "Watch: app not reachable; it applies this when it syncs"
+                else -> "Watch: listens for ${WakeContract.WINDOW_MS / 1000} s each time the Watch app opens, or continuously while " +
+                    "Background is started on the Watch; the Watch shows if it has no recognizer"
+            },
+            style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.tertiary,
+        )
+        Text("On this phone only while the app is open on screen. On the Watch also with its app closed, once you start " +
+            "Background there. Say the wake phrase, pause for the buzz, " +
+            "then speak: the request is sent when you stop talking (no time limit). Or say the request right after " +
+            "the phrase: it's sent only once the speech recognizer has finished hearing it; if it can't, nothing is " +
+            "sent and you're asked to repeat.",
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        OutlinedTextField(patterns, { patterns = it }, label = { Text("Wake phrases for both devices (space-separated, * wildcard)") },
             modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(seconds, { seconds = it.filter(Char::isDigit).take(3) }, label = { Text("Max recording seconds") },
-            singleLine = true, modifier = Modifier.fillMaxWidth())
-        SwitchRow("Haptics", state.watch.hapticsEnabled) { model.updateWatch(state.watch.copy(hapticsEnabled = it)) }
-        OutlinedButton(onClick = {
-            model.updateWatch(state.watch.copy(wakePatterns = patterns,
-                maxTurnSeconds = seconds.toIntOrNull() ?: WatchSettings.DEFAULT_MAX_TURN_SECONDS))
-        }) { Text("Save Watch settings") }
+        OutlinedButton(onClick = { model.updateWatch(state.watch.copy(wakePatterns = patterns)) }) { Text("Save wake phrases") }
+        Text("Send after ${VadSilence.label(silence.toDouble())} of silence", style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.testTag("vad_silence_label"))
+        Slider(
+            value = silence,
+            onValueChange = { silence = ((it / VadSilence.STEP_SECONDS).roundToInt() * VadSilence.STEP_SECONDS).toFloat() },
+            onValueChangeFinished = { model.setVadSilence(silence.toDouble()) },
+            valueRange = VadSilence.MIN_SECONDS.toFloat()..VadSilence.MAX_SECONDS.toFloat(),
+            steps = VadSilence.choices.size - 2,
+            modifier = Modifier.fillMaxWidth().testTag("vad_silence"),
+        )
+        Text("Applies to hands-free requests on both devices, from the next request on. Silence is judged by loudness " +
+            "against the room's background, not by understanding speech: steady noise such as a fan fades into the " +
+            "background, but loud changing sound (music, TV, other voices) can keep a request open until you tap, and " +
+            "very soft speech may count as silence.",
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 

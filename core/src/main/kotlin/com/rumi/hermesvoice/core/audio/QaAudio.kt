@@ -21,3 +21,13 @@ object QaAudio {
         return file.takeIf { it.isFile && it.length() in 45..MAX_BYTES.toLong() }
     }
 }
+
+/**
+ * The debug QA extra is honoured only for a fresh launch intent: never when the activity is
+ * re-created from saved state (rotation, process restore) or relaunched from Recents, both of
+ * which replay the original intent, and never twice for the same intent.
+ */
+object QaLaunchGuard {
+    fun shouldHandle(restoredFromSavedState: Boolean, launchedFromHistory: Boolean, alreadyHandled: Boolean): Boolean =
+        !restoredFromSavedState && !launchedFromHistory && !alreadyHandled
+}

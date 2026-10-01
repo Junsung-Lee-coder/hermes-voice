@@ -42,6 +42,9 @@ class FakeHermesDashboard : AutoCloseable {
     @Volatile var submitStatus: (String) -> String = { "streaming" }
     @Volatile var resumeQueued = false
 
+    /** How `session.create` behaves for given params: "ok", "rpc_error", "wrong_source" or "drop_after_create". */
+    @Volatile var createBehavior: (JSONObject) -> String = { "ok" }
+
     /** Stored sessions (the dashboard's state.db rows): id → row fields, plus their transcript. */
     class Row(val id: String, val source: String, var title: String, var archived: Boolean, val hidden: Boolean) {
         val messages: MutableList<JSONObject> = Collections.synchronizedList(mutableListOf())
@@ -232,20 +235,24 @@ class FakeHermesDashboard : AutoCloseable {
                 .put("error", JSONObject().put("code", code).put("message", message)).toString())
             when (frame.optString("method")) {
                 "session.create" -> {
+                    val behavior = createBehavior(params)
+                    if (behavior == "rpc_error") { fail(5001, "create refused"); return }
                     val stored = "s${createCounter.incrementAndGet()}"
                     val runtime = "rt-$stored"
                     runtimeIds[stored] = runtime
                     val seed = params.optJSONArray("messages")
                     // methods_session._seed_row: a seeded parentless session is persisted at create time.
                     if (seed != null && seed.length() > 0) {
-                        rows[stored] = Row(stored, params.optString("source"), params.optString("title"), false,
-                            params.optBoolean("hidden"))
+                        rows[stored] = Row(stored, if (behavior == "wrong_source") "someone-else" else params.optString("source"),
+                            params.optString("title"), false, params.optBoolean("hidden"))
                         for (i in 0 until seed.length()) {
                             val m = seed.getJSONObject(i)
                             addMessage(stored, m.getString("role"), m.getString("content"), m.optString("display_kind") == "hidden")
                         }
                     }
                     scripts.putIfAbsent(stored, sourceScripts[params.optString("source")] ?: { listOf(complete("reply from $stored")) })
+                    // The server created the session but the answer never arrives (connection lost).
+                    if (behavior == "drop_after_create") { webSocket.cancel(); return }
                     reply(JSONObject().put("session_id", runtime).put("stored_session_id", stored).put("message_count", 0)
                         .put("messages", org.json.JSONArray()).put("info", JSONObject()))
                 }

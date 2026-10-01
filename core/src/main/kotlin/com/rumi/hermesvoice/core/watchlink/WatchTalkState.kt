@@ -29,6 +29,9 @@ data class WatchTalkState(
         return WatchTalkState(WatchPhase.RECORDING, turnId, trigger, "Listening…", speakingTurnId)
     }
 
+    /** Updates the prompt of the capture in progress (e.g. "Speak now" once the microphone is calibrated). */
+    fun recordingCue(line: String): WatchTalkState = if (phase == WatchPhase.RECORDING) copy(line = line) else this
+
     fun recordingDiscarded(reason: String): WatchTalkState = WatchTalkState(line = reason, speakingTurnId = speakingTurnId)
 
     fun sending(): WatchTalkState = copy(phase = WatchPhase.SENDING, line = "Sending to phone…")
@@ -41,6 +44,7 @@ data class WatchTalkState(
         val line = when (message.stage) {
             "transcribing" -> "Transcribing…"
             "routing" -> "Choosing where to send…"
+            "creating" -> "Creating a conversation…"
             "routed" -> "→ ${message.detail}"
             "acknowledging", "delivering" -> line
             "responding" -> "Waiting for reply…"
