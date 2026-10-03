@@ -37,7 +37,10 @@ class HermesProtocolException(message: String, cause: Throwable? = null) : Herme
 class HermesRpcException(val code: Int, message: String) : HermesException(message)
 
 /** The originating device could not play (or confirm playing) an utterance. */
-class HermesPlaybackException(message: String) : HermesException(message)
+open class HermesPlaybackException(message: String) : HermesException(message)
+
+/** The device didn't play a later reply because its microphone is recording: not played, to be tried again. */
+class HermesPlaybackBusyException(message: String) : HermesPlaybackException(message)
 
 /** A session id the app did not create (or that is not tagged with the app source) was used. Fail closed. */
 class SessionNotOwnedException(message: String) : HermesException(message)

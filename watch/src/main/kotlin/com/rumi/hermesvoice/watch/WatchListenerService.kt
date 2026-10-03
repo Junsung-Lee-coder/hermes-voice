@@ -28,6 +28,9 @@ class WatchListenerService : WearableListenerService() {
         if (!channel.path.startsWith(WatchLinkPaths.PLAY_PREFIX)) return
         val context = applicationContext
         val app = WatchApp.from(context)
+        // Capture before queuing/reading: local Stop revokes already-open channels, not future
+        // legitimate Phone-origin replies admitted in the new generation.
+        val receivedGeneration = app.playbackStopGeneration
         app.scope.launch {
             val client = Wearable.getChannelClient(context)
             val request = runCatching {
@@ -38,7 +41,7 @@ class WatchListenerService : WearableListenerService() {
                 }
             }
             runCatching { client.close(channel).await() }
-            request.onSuccess { app.play(it, channel.nodeId) }.onFailure {
+            request.onSuccess { app.playReceived(it, channel.nodeId, receivedGeneration) }.onFailure {
                 // Tell the Phone so it does not wait for the ack timeout.
                 val parts = channel.path.removePrefix(WatchLinkPaths.PLAY_PREFIX).split('/')
                 val seq = parts.getOrNull(1)?.toIntOrNull()

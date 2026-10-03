@@ -33,9 +33,12 @@ class DestinationAllowlist private constructor(val entries: List<DestinationEntr
 
         fun cleanDescription(raw: String): String = TextSanitizer.clean(raw)
 
-        /** Throws [IllegalArgumentException] naming the first invalid entry; never silently drops one. */
-        fun create(entries: List<DestinationEntry>, routingStoredSessionId: String): DestinationAllowlist {
-            require(isValidSessionId(routingStoredSessionId)) { "routing session id is invalid" }
+        /**
+         * Throws [IllegalArgumentException] naming the first invalid entry; never silently drops one.
+         * [routingStoredSessionId] is null only for a routing-off turn, which has no router.
+         */
+        fun create(entries: List<DestinationEntry>, routingStoredSessionId: String?): DestinationAllowlist {
+            require(routingStoredSessionId == null || isValidSessionId(routingStoredSessionId)) { "routing session id is invalid" }
             require(entries.size <= MAX_ENTRIES) { "at most $MAX_ENTRIES destinations are allowed" }
             val seen = HashSet<String>()
             val clean = entries.map { entry ->
@@ -45,7 +48,9 @@ class DestinationAllowlist private constructor(val entries: List<DestinationEntr
                 require(seen.add(alias)) { "duplicate destination alias '$alias'" }
                 val sessionId = entry.storedSessionId.trim()
                 require(isValidSessionId(sessionId)) { "destination '$alias' has an invalid session id" }
-                require(sessionId != routingStoredSessionId) { "destination '$alias' must not be the routing session" }
+                require(routingStoredSessionId == null || sessionId != routingStoredSessionId) {
+                    "destination '$alias' must not be the routing session"
+                }
                 val description = cleanDescription(entry.description)
                 require(description.length <= MAX_DESCRIPTION_CHARS) {
                     "destination '$alias' description exceeds $MAX_DESCRIPTION_CHARS characters"

@@ -77,11 +77,15 @@ interface WatchVoiceHost {
  *   (handoff pause, claim answer), and the gap between windows including the reachability check.
  *   A new hold is taken before the one it replaces is let go. The recorder, the transfer and
  *   playback take their own holds.
+ * - Background operation is on by default ([ensureDefault]): every real open of the app starts it
+ *   once, from the visible app; the user's Stop holds until the next real open ([onUserOpened]).
+ *   A start is only a request ([BackgroundPort.confirmsEntry]): the microphone is armed, and the
+ *   session says it listens, only once the service entered the foreground typed for it ([onServiceEntered]).
  */
 class WatchVoiceCoordinator(
-    store: KeyValueStore,
-    key: String,
-    service: BackgroundPort,
+    private val store: KeyValueStore,
+    private val key: String,
+    private val service: BackgroundPort,
     private val host: WatchVoiceHost,
     val holds: WakeHolds,
     private val clock: () -> Long,
@@ -105,6 +109,21 @@ class WatchVoiceCoordinator(
         private set
 
     private var syncPosted = false
+
+    /** The service's own report that it entered the foreground: (session generation, typed for the microphone). */
+    private var admission: Pair<Long, Boolean>? = null
+
+    /** The microphone the session holds is really the running service's (always, for a service whose start is its entry). */
+    private val microphoneAdmitted: Boolean get() = !service.confirmsEntry || admission == (session.generation to true)
+
+    /** The user stopped background operation during this open: nothing starts it again before the next real open. */
+    private var stoppedThisOpen = store.getBoolean("$key.stopped", false)
+
+    /** A restored process cannot request a default service before an actual launcher entry. */
+    private var openedThisProcess = false
+
+    /** This open already started (or tried to start) background operation; a failed or ended one is not retried in it. */
+    private var triedThisOpen = false
     private var last: WatchVoiceStatus? = null
 
     private val presencePort = object : WakePresencePort {
@@ -165,7 +184,7 @@ class WatchVoiceCoordinator(
         /** Present while the app is visible or a session is armed; the screen state is waived only for an armed session. */
         override fun armInputs(): WakeArmInputs {
             val platform = inner.armInputs()
-            return platform.copy(resumed = presence.present, interactive = presence.armed || platform.interactive)
+            return platform.copy(resumed = !stoppedThisOpen && presence.present, interactive = presence.armed || platform.interactive)
         }
 
         override fun armBlocked(source: String, block: WakeBlock) {
@@ -241,11 +260,58 @@ class WatchVoiceCoordinator(
 
     // ── the session ──────────────────────────────────────────────────────────────────────────
 
-    /** The user's Start, from the visible app. */
-    fun start(): BackgroundStatus = session.start(presence.visible, block()).also { sync() }
+    /** Starts the session from the visible app (see [ensureDefault]). */
+    fun start(): BackgroundStatus {
+        // Legacy explicit-start API (not called by passive callbacks or app UI). Only a visible
+        // caller can authorize it; ensureDefault additionally requires an observed user open.
+        if (presence.visible && stoppedThisOpen) onUserOpened()
+        return session.start(presence.visible, block()).also { sync() }
+    }
 
-    /** The user's Stop (app or notification). Final; safe to repeat. */
-    fun stop(): BackgroundStatus = session.stop().also { sync() }
+    /** The user's Stop (the notification's, or the system's). Final until the next real open; safe to repeat. */
+    fun stop(): BackgroundStatus {
+        stoppedThisOpen = true
+        store.putBoolean("$key.stopped", true)
+        val status = session.stop()
+        // Disarming an on-screen session alone keeps foreground wake alive. Stop is stronger:
+        // invalidate the recognizer generation and cancel its handoff/claim even while visible.
+        wake.onPause()
+        sync()
+        return status
+    }
+
+    /** The user really opened the app (launched it, or brought it back to the front): background operation may start again. */
+    fun onUserOpened() {
+        stoppedThisOpen = false
+        store.putBoolean("$key.stopped", false)
+        openedThisProcess = true
+        triedThisOpen = false
+    }
+
+    /**
+     * Background operation is on by default: started once per real open from the visible app, unless the user stopped it
+     * during this open. A running session is left exactly as it is (never restarted, doubled or stopped), and a start the
+     * platform refused or a service it ended is not retried before the next open. True when a session started now.
+     */
+    fun ensureDefault(): Boolean {
+        if (!openedThisProcess || stoppedThisOpen || triedThisOpen || session.status.running || !presence.visible) return false
+        triedThisOpen = true
+        return start().running
+    }
+
+    /**
+     * The service of session [generation] entered the foreground, typed for the microphone or not. Only now does a
+     * microphone the session asked for count as armed; one asked for meanwhile (the settings read finished before the
+     * platform delivered the service) is armed after this event, while the app is still visible.
+     */
+    fun onServiceEntered(generation: Long, microphone: Boolean) {
+        if (!session.isCurrent(generation)) return host.log("service entry of an ended session ignored (generation=$generation)")
+        admission = generation to microphone
+        host.post {
+            if (presence.visible && session.isCurrent(generation)) session.onVisible(block())
+            onSessionChanged()
+        }
+    }
 
     fun onServiceGone(generation: Long) {
         session.onServiceGone(generation)
@@ -314,9 +380,11 @@ class WatchVoiceCoordinator(
 
     private fun onSessionChanged() {
         val status = session.status
-        val armed = presence.onArmed(status.microphone)
+        // Asked for but not entered yet: not armed (and not given back: the entry decides).
+        val admitted = status.microphone && microphoneAdmitted
+        val armed = presence.onArmed(admitted)
         // Granted to an app that isn't visible (or a stale state): never keep a microphone the loop can't use.
-        if (status.microphone && !armed) session.onMicrophoneStalled(session.generation)
+        if (admitted && !armed) session.onMicrophoneStalled(session.generation)
         sync()
     }
 

@@ -3,6 +3,18 @@ package com.rumi.hermesvoice.core.watchlink
 enum class WatchPhase { IDLE, RECORDING, SENDING, WAITING, PLAYING }
 
 /**
+ * The Watch's own guard for LATER replies ([PlayRequest.later]): one never plays over a recording.
+ * The Phone can't see a Watch recording that hasn't been sent, so the Watch answers for itself.
+ */
+object LaterPlaybackGuard {
+    /** The error to refuse [request] with now ([PlayedAck.BUSY_RECORDING]), or null to play it. */
+    fun refusal(request: PlayRequest, recording: Boolean): String? = if (request.later && recording) PlayedAck.BUSY_RECORDING else null
+
+    /** A recording starts while [playing] plays: the error to stop it with, or null to let it play (an in-turn reply). */
+    fun onRecordingStarted(playing: PlayRequest?): String? = if (playing?.later == true) PlayedAck.BUSY_RECORDING else null
+}
+
+/**
  * The Watch's talk state, driven by local capture and by the Phone's [TurnStateMessage]s and
  * playback. Pure so it can be tested off-device. Only one turn is in flight from the Watch at a
  * time; stage messages for any other turn id are ignored (stale or replayed messages).

@@ -13,6 +13,13 @@ interface BackgroundPort {
     /** Changes whether the running service is typed for the microphone. False when the platform refused; the old type stays. */
     fun retypeService(microphone: Boolean): Boolean
     fun stopService()
+
+    /**
+     * True when [startService] only ASKS the platform: the service reports later that it really entered the
+     * foreground (the Watch's WatchVoiceCoordinator.onServiceEntered), and a microphone counts as armed only then.
+     * False: a start that returned true is the service running.
+     */
+    val confirmsEntry: Boolean get() = false
 }
 
 /** Why a running session's microphone is not armed; null when nothing stands in the way but visibility. */

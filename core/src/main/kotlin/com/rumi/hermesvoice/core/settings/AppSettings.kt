@@ -256,6 +256,24 @@ class AppSettings(private val store: KeyValueStore) {
         get() = ThemeMode.parse(store.getString(KEY_THEME_MODE))
         set(value) = store.putString(KEY_THEME_MODE, value.name)
 
+    /**
+     * Voice routing (Phone-owned, on by default): on, the router picks or creates the conversation;
+     * off, a voice request goes to the conversation selected on the device that sent it.
+     */
+    var routingEnabled: Boolean
+        get() = store.getBoolean(KEY_ROUTING_ENABLED, true)
+        set(value) = store.putBoolean(KEY_ROUTING_ENABLED, value)
+
+    /**
+     * Open the routed conversation on this Phone after a routed request was delivered (off by
+     * default). Kept while routing is off, but applies only while routing is on ([autoNavigationApplies]).
+     */
+    var autoNavigateToRouted: Boolean
+        get() = store.getBoolean(KEY_AUTO_NAVIGATE, false)
+        set(value) = store.putBoolean(KEY_AUTO_NAVIGATE, value)
+
+    val autoNavigationApplies: Boolean get() = routingEnabled && autoNavigateToRouted
+
     fun playback(): ResponsePlaybackSettings = ResponsePlaybackSettings(playFirstResponse, playMiddleResponses)
 
     fun watchSettings(): WatchSettings =
@@ -276,6 +294,8 @@ class AppSettings(private val store: KeyValueStore) {
         const val KEY_WATCH_HAPTICS = "watch_haptics_enabled"
         const val KEY_WATCH_REVISION = "watch_settings_revision"
         const val KEY_THEME_MODE = "theme_mode"
+        const val KEY_ROUTING_ENABLED = "voice_routing_enabled"
+        const val KEY_AUTO_NAVIGATE = "open_routed_conversation"
     }
 }
 

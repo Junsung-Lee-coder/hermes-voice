@@ -3,6 +3,8 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- One short pulse when a wake phrase is accepted, and the recording cues with the screen off. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <!-- The optional background relay (PhoneRelayService), switched on only by the user from the
          visible app: Watch requests are answered with this app closed. It is a connected-device
@@ -13,6 +15,9 @@
          time-limited CPU hold while a voice turn runs. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- Only for the opt-in background listening (PhoneWakeService), started from the visible app with
+         the notification and its Stop showing; the relay never has the microphone. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -34,7 +39,9 @@
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.HermesVoice"
         android:usesCleartextTraffic="true">
@@ -54,6 +61,13 @@
             android:name=".PhoneRelayService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice|mediaPlayback" />
+
+        <!-- Not exported: the opt-in background listening for the wake phrase, started only from the visible app
+             (Settings), stopped there or by Stop in its own notification. -->
+        <service
+            android:name=".PhoneWakeService"
+            android:exported="false"
+            android:foregroundServiceType="microphone|mediaPlayback" />
 
         <service
             android:name=".PhoneWatchListenerService"

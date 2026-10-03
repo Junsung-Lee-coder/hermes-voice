@@ -38,6 +38,7 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -64,15 +65,19 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Stable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -86,6 +91,7 @@ import androidx.lifecycle.lifecycleScope
 import java.io.File
 import java.util.UUID
 import kotlin.math.roundToInt
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
@@ -93,10 +99,13 @@ import com.rumi.hermesvoice.core.VoiceOrigin
 import com.rumi.hermesvoice.core.audio.QaAudio
 import com.rumi.hermesvoice.core.audio.QaLaunchGuard
 import com.rumi.hermesvoice.core.background.BackgroundText
+import com.rumi.hermesvoice.core.net.HistoryMessage
+import com.rumi.hermesvoice.core.net.OutgoingAttachment
 import com.rumi.hermesvoice.core.sessions.AppConversation
 import com.rumi.hermesvoice.core.settings.ThemeMode
 import com.rumi.hermesvoice.core.settings.VadSilence
 import com.rumi.hermesvoice.core.settings.WakeLocation
+import com.rumi.hermesvoice.core.voice.EpisodeMicrophone
 import com.rumi.hermesvoice.core.wake.ClaimVerdict
 import com.rumi.hermesvoice.core.wake.WakeArmInputs
 import com.rumi.hermesvoice.core.wake.WakeClaim
@@ -113,8 +122,12 @@ class MainActivity : ComponentActivity() {
     private var qaHeardDelayMs = QA_HEARD_DELAY_MS
     private var recognizerAvailable by mutableStateOf(false)
     private val handoffRunnable: Runnable = Runnable {
-        if (!phoneWake.wake.onHandoffDue(captureIdle = model.voiceIdle())) Log.i(TAG, "phone wake handoff dropped gen=${phoneWake.wake.generation}")
+        // A later reply does not count here: the accepted phrase owns the microphone (it stopped that reply).
+        if (!phoneWake.wake.onHandoffDue(captureIdle = model.captureIdle())) Log.i(TAG, "phone wake handoff dropped gen=${phoneWake.wake.generation}")
     }
+
+    /** The wake episode's microphone hold, from the phrase (before the accepted cue) to its recording or request. */
+    private val episodeMicrophone by lazy { EpisodeMicrophone(PhoneApp.from(this).audio, VoiceOrigin.PHONE) }
 
     /** What the shared wake flow ([PhoneWakeController.wake]) does on this Phone. */
     private val wakePort: WakeDevicePort = object : WakeDevicePort {
@@ -130,10 +143,14 @@ class MainActivity : ComponentActivity() {
             window.decorView.removeCallbacks(handoffRunnable)
         }
         override fun startRequestCapture(silenceMs: Long): Boolean = startRequestCapture(silenceMs, null)
-        override fun startRequestCapture(silenceMs: Long, claimId: String?): Boolean = hasMic() && model.startHandsFree(silenceMs, claimId)
+        override fun startRequestCapture(silenceMs: Long, claimId: String?): Boolean =
+            hasMic() && model.startHandsFree(silenceMs, claimId, episodeMicrophone.take())
         override fun cancelRequestCapture(reason: String) = model.cancelHandsFree(reason)
         override fun sendRecognized(request: String) = sendRecognized(request, null)
-        override fun sendRecognized(request: String, claimId: String?) = model.sendRecognizedRequest(request, claimId)
+        override fun sendRecognized(request: String, claimId: String?) = model.sendRecognizedRequest(request, claimId, episodeMicrophone.take())
+
+        // From the phrase until the recording or request takes it over: no later reply starts on this Phone.
+        override fun holdMicrophone(held: Boolean) = episodeMicrophone.hold(held)
 
         override fun closed(reason: String) {
             Log.i(TAG, "phone wake window closed reason=$reason")
@@ -161,6 +178,9 @@ class MainActivity : ComponentActivity() {
         override fun armBlocked(source: String, block: WakeBlock) {
             if (block != WakeBlock.DISABLED) Log.i(TAG, "phone wake window blocked source=$source reason=$block")
         }
+
+        /** A wake phrase was accepted here (see WakeDevicePort.wakeAccepted): one short pulse, screen on or off. */
+        override fun wakeAccepted() = PhoneHaptics(this@MainActivity).wakeAccepted()
     }
 
     private val claimTimer: Runnable = Runnable { phoneWake.wake.onClaimTimer() }
@@ -250,10 +270,18 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             PhoneApp.from(this@MainActivity).wakeEpisodes.collect { episode -> episode?.let { phoneWake.wake.onEpisodeAnswered(it.epoch, it.claimId) } }
         }
-        // Push-to-talk or a turn in flight closes the window; idle again may re-arm (once per visibility generation).
+        // Push-to-talk or a turn in flight closes the window and ends a wake episode; a later reply holding
+        // this Phone's speaker closes an open window only (an episode under way owns the microphone). Idle
+        // again may re-arm (once per visibility generation).
         lifecycleScope.launch {
-            model.state.map { it.recording || it.voiceBusy }.distinctUntilChanged().collect { busy ->
-                if (busy) phoneWake.wake.onBusy() else if (model.voiceIdle()) phoneWake.wake.onIdle()
+            combine(model.state.map { it.recording || it.voiceBusy }, PhoneApp.from(this@MainActivity).speakingLater) { busy, later ->
+                if (busy) WakeBusy.VOICE else if (later) WakeBusy.SPEAKER else WakeBusy.IDLE
+            }.distinctUntilChanged().collect { busy ->
+                when (busy) {
+                    WakeBusy.VOICE -> phoneWake.wake.onBusy()
+                    WakeBusy.SPEAKER -> phoneWake.wake.onPlaybackBusy()
+                    WakeBusy.IDLE -> if (model.voiceIdle()) phoneWake.wake.onIdle()
+                }
             }
         }
         if (model.state.value.signedIn) model.refresh()
@@ -299,8 +327,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         model.onHandsFreeEnded = null
+        // Never left held by a screen that is gone (the paused wake flow already gave it back).
+        episodeMicrophone.hold(false)
         super.onDestroy()
     }
+
+    private enum class WakeBusy { IDLE, VOICE, SPEAKER }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -380,16 +412,26 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class Tab(val label: String) { CONVERSATIONS("Conversations"), CHAT("Chat"), SETTINGS("Settings") }
+internal enum class Tab(val label: String) { CONVERSATIONS("Conversations"), CHAT("Chat"), SETTINGS("Settings") }
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 private fun PhoneScreen(model: PhoneViewModel, recognizerAvailable: Boolean, onTalk: () -> Unit) {
     val state by model.state.collectAsStateWithLifecycle()
     var tab by rememberSaveable { mutableStateOf(Tab.CONVERSATIONS) }
+    // A routed turn's conversation was opened for the user ("Open the routed conversation"): show it,
+    // once per request (not again when the screen is recreated).
+    var shownOpenRequest by rememberSaveable { mutableStateOf(state.chatOpenRequest) }
+    LaunchedEffect(state.chatOpenRequest) {
+        if (state.chatOpenRequest != shownOpenRequest) {
+            shownOpenRequest = state.chatOpenRequest
+            tab = Tab.CHAT
+        }
+    }
     val context = androidx.compose.ui.platform.LocalContext.current
     val view = LocalView.current
     val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        // Background listening re-checks the platform's answer (it may now be allowed to listen).
+        model.onPermissionsChanged()
         if (granted) onTalk()
     }
     // Hands-free recording start ("speak now") and end: a short system haptic, no sound (a tone would be recorded).
@@ -398,51 +440,84 @@ private fun PhoneScreen(model: PhoneViewModel, recognizerAvailable: Boolean, onT
             view.performHapticFeedback(if (android.os.Build.VERSION.SDK_INT >= 30) HapticFeedbackConstants.CONFIRM else HapticFeedbackConstants.LONG_PRESS)
         }
     }
+    PhoneChrome(
+        title = state.selected?.title?.takeIf { tab == Tab.CHAT } ?: "Hermes Voice",
+        tab = tab,
+        onTab = { item ->
+            if (item != tab) model.onUserNavigated()
+            tab = item
+        },
+        statusLines = listOf(state.status, state.voiceStatus),
+        talkBar = if (!state.signedIn) null else ({
+            TalkBar(state) {
+                val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                    PackageManager.PERMISSION_GRANTED
+                if (granted) onTalk() else micPermission.launch(Manifest.permission.RECORD_AUDIO)
+            }
+        }),
+    ) {
+        when (tab) {
+            Tab.CONVERSATIONS -> ConversationsTab(state, model, onOpen = {
+                model.onUserNavigated()
+                model.open(it.owned)
+                tab = Tab.CHAT
+            })
+            Tab.CHAT -> ChatTab(state, model)
+            Tab.SETTINGS -> SettingsTab(state, model, recognizerAvailable)
+        }
+    }
+}
+
+/**
+ * The Phone's frame: title bar, content, and at the bottom the Talk bar (when signed in) above the
+ * tabs. The keyboard lifts the content (e.g. the chat composer) by exactly what the bottom bar
+ * doesn't already cover: the bar's height is consumed as insets, so nothing is padded twice.
+ */
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@Composable
+internal fun PhoneChrome(
+    title: String,
+    tab: Tab,
+    onTab: (Tab) -> Unit,
+    statusLines: List<String>,
+    talkBar: (@Composable () -> Unit)?,
+    content: @Composable () -> Unit,
+) {
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
-                title = { Text(state.selected?.title?.takeIf { tab == Tab.CHAT } ?: "Hermes Voice", maxLines = 1) },
+                title = { Text(title, maxLines = 1) },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
             )
         },
         bottomBar = {
             // The Talk bar sits above the navigation bar, never over the chat composer or the tabs.
-            Column {
-                if (state.signedIn) {
-                    TalkBar(state) {
-                        val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
-                            PackageManager.PERMISSION_GRANTED
-                        if (granted) onTalk() else micPermission.launch(Manifest.permission.RECORD_AUDIO)
-                    }
-                }
+            Column(Modifier.testTag("bottom_bar")) {
+                talkBar?.invoke()
                 NavigationBar(containerColor = MaterialTheme.colorScheme.surfaceContainer) {
                     Tab.values().forEach { item ->
-                        NavigationBarItem(selected = tab == item, onClick = { tab = item }, icon = {},
-                            label = { Text(item.label, fontWeight = if (tab == item) FontWeight.SemiBold else FontWeight.Normal) })
+                        NavigationBarItem(selected = tab == item, onClick = { onTab(item) }, icon = {},
+                            label = { Text(item.label, fontWeight = if (tab == item) FontWeight.SemiBold else FontWeight.Normal) },
+                            modifier = Modifier.testTag("tab_${item.name.lowercase()}"))
                     }
                 }
             }
         },
     ) { padding ->
-        // The keyboard lifts the content (e.g. the chat composer) by whatever the bottom bar doesn't already cover.
         Column(Modifier.padding(padding).consumeWindowInsets(padding).imePadding().fillMaxSize()) {
-            listOf(state.status, state.voiceStatus).filter { it.isNotBlank() }.forEach {
+            statusLines.filter { it.isNotBlank() }.forEach {
                 Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
             }
-            when (tab) {
-                Tab.CONVERSATIONS -> ConversationsTab(state, model, onOpen = { model.open(it.owned); tab = Tab.CHAT })
-                Tab.CHAT -> ChatTab(state, model)
-                Tab.SETTINGS -> SettingsTab(state, model, recognizerAvailable)
-            }
+            content()
         }
     }
 }
 
 /** Full-width push-to-talk, centered within the horizontal safe area, with where replies will play. */
 @Composable
-private fun TalkBar(state: PhoneUiState, onTalk: () -> Unit) {
+internal fun TalkBar(state: PhoneUiState, onTalk: () -> Unit) {
     Surface(color = MaterialTheme.colorScheme.surfaceContainerLow) {
         Column(
             Modifier.fillMaxWidth()
@@ -459,6 +534,15 @@ private fun TalkBar(state: PhoneUiState, onTalk: () -> Unit) {
                 style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center, modifier = Modifier.padding(bottom = 6.dp),
             )
+            if (!state.routingEnabled) {
+                // Routing off: where this phone's voice requests go, or that one has to be chosen first.
+                val target = state.selected
+                Text(target?.let { "Routing off: voice requests go to ${it.title.ifBlank { it.alias }}" }
+                    ?: "Routing off: open a conversation to send voice requests",
+                    style = MaterialTheme.typography.labelMedium, textAlign = TextAlign.Center,
+                    color = if (target == null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(bottom = 6.dp).testTag("routing_target"))
+            }
             val handsFreeLine = when (state.handsFree) {
                 HandsFree.LISTENING -> "Listening for the wake phrase…"
                 HandsFree.GET_READY -> "Get ready…"
@@ -591,14 +675,100 @@ private fun ChatTab(state: PhoneUiState, model: PhoneViewModel) {
         return
     }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let(model::addAttachment) }
+    ChatPane(
+        sessionKey = selected.storedSessionId,
+        history = state.history,
+        hasOlder = state.hasOlder,
+        draft = state.draft,
+        attachments = state.attachments,
+        sending = state.sending,
+        onLoadOlder = model::loadOlder,
+        onDraft = model::setDraft,
+        onSend = model::send,
+        onAttach = { picker.launch(arrayOf("*/*")) },
+        onRemoveAttachment = model::removeAttachment,
+    )
+}
+
+/**
+ * Whether the conversation follows its newest message. It does until the user scrolls away from
+ * it (by touch, fling, accessibility or keyboard: any scroll this pane did not start itself), and
+ * again once they scroll back, send, or start typing. Content arriving or the keyboard resizing
+ * the list is not a scroll and never changes it.
+ */
+@Stable
+internal class ChatFollow {
+    var atLatest by mutableStateOf(true)
+
+    /** Scrolls this pane started ([toLatest]); every other scroll is the user's. */
+    private var own = 0
+
+    suspend fun toLatest(list: LazyListState) {
+        atLatest = true
+        own += 1
+        try {
+            list.scrollToItem(0)
+        } finally {
+            own -= 1
+        }
+    }
+
+    suspend fun track(list: LazyListState) {
+        var userScrolling = false
+        // Reverse layout: "backward" is toward item 0, the newest message; none left means it is fully shown.
+        // (Should one of this pane's own jumps be taken for the user's, it ends at the newest message anyway.)
+        snapshotFlow { list.isScrollInProgress to list.canScrollBackward }.collect { (scrolling, canGoNewer) ->
+            if (scrolling && own == 0) userScrolling = true
+            if (userScrolling) atLatest = !canGoNewer
+            if (!scrolling) userScrolling = false
+        }
+    }
+}
+
+/**
+ * The open conversation: newest message at the bottom, right above the composer.
+ *
+ * The list is laid out from the bottom (reverse layout, item 0 = newest), so when the keyboard or
+ * anything else shrinks it, the bottom (the newest message) stays put, and a reply that grows
+ * keeps its latest line in view. While [ChatFollow.atLatest], a new or grown newest message is
+ * scrolled to; while the user reads older messages their place is kept (items are keyed by row,
+ * so loading older pages above does not move it either). Sending or focusing the composer
+ * returns to the newest message. Each conversation ([sessionKey]) opens at its newest message.
+ */
+@Composable
+internal fun ChatPane(
+    sessionKey: String,
+    history: List<HistoryMessage>,
+    hasOlder: Boolean,
+    draft: String,
+    attachments: List<OutgoingAttachment>,
+    sending: Boolean,
+    onLoadOlder: () -> Unit,
+    onDraft: (String) -> Unit,
+    onSend: () -> Unit,
+    onAttach: () -> Unit,
+    onRemoveAttachment: (Int) -> Unit,
+) {
+    val listState = remember(sessionKey) { LazyListState() }
+    val follow = remember(sessionKey) { ChatFollow() }
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(listState) { follow.track(listState) }
+    val newest = history.lastOrNull()
+    LaunchedEffect(listState, history.size, newest?.rowId, newest?.text?.length) {
+        if (follow.atLatest && history.isNotEmpty()) follow.toLatest(listState)
+    }
+    val toLatest: () -> Unit = {
+        follow.atLatest = true
+        if (history.isNotEmpty()) scope.launch { follow.toLatest(listState) }
+    }
     Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
-        LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            if (state.hasOlder) item { TextButton(onClick = model::loadOlder) { Text("Load older") } }
-            items(state.history, key = { it.rowId }) { message ->
+        LazyColumn(Modifier.weight(1f).fillMaxWidth().testTag("chat_list"), state = listState, reverseLayout = true,
+            verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.Bottom)) {
+            items(history.asReversed(), key = { it.rowId }) { message ->
                 val mine = message.role == "user"
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
                     Card(
-                        Modifier.fillMaxWidth(0.85f),
+                        Modifier.fillMaxWidth(0.85f).testTag("message_${message.rowId}"),
                         colors = CardDefaults.cardColors(
                             containerColor = if (mine) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
                             contentColor = if (mine) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
@@ -608,26 +778,31 @@ private fun ChatTab(state: PhoneUiState, model: PhoneViewModel) {
                     }
                 }
             }
-        }
-        state.attachments.forEachIndexed { index, attachment ->
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("📎 ${attachment.name} (${attachment.bytes.size / 1024} KiB)", Modifier.weight(1f))
-                TextButton(onClick = { model.removeAttachment(index) }) { Text("Remove") }
+            if (hasOlder) item(key = "load_older") {
+                TextButton(onClick = onLoadOlder, modifier = Modifier.testTag("load_older")) { Text("Load older") }
             }
         }
-        Row(Modifier.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically,
+        attachments.forEachIndexed { index, attachment ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("📎 ${attachment.name} (${attachment.bytes.size / 1024} KiB)", Modifier.weight(1f))
+                TextButton(onClick = { onRemoveAttachment(index) }) { Text("Remove") }
+            }
+        }
+        Row(Modifier.padding(vertical = 8.dp).testTag("composer_row"), verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = { picker.launch(arrayOf("*/*")) }, enabled = !state.sending) { Text("Attach") }
-            OutlinedTextField(state.draft, model::setDraft, Modifier.weight(1f), placeholder = { Text("Message") })
-            Button(onClick = model::send, enabled = !state.sending && (state.draft.isNotBlank() || state.attachments.isNotEmpty())) {
-                Text(if (state.sending) "…" else "Send")
+            OutlinedButton(onClick = onAttach, enabled = !sending) { Text("Attach") }
+            OutlinedTextField(draft, onDraft, Modifier.weight(1f).testTag("composer").onFocusChanged { if (it.isFocused) toLatest() },
+                placeholder = { Text("Message") })
+            Button(onClick = { toLatest(); onSend() }, enabled = !sending && (draft.isNotBlank() || attachments.isNotEmpty()),
+                modifier = Modifier.testTag("send")) {
+                Text(if (sending) "…" else "Send")
             }
         }
     }
 }
 
 @Composable
-private fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerAvailable: Boolean) {
+internal fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerAvailable: Boolean) {
     var patterns by remember(state.watch.wakePatterns) { mutableStateOf(state.watch.wakePatterns) }
     var silence by remember(state.watch.vadSilenceSeconds) { mutableStateOf(state.watch.vadSilenceSeconds.toFloat()) }
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -649,8 +824,40 @@ private fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerAv
         Text("The routing acknowledgement and the final reply always play. They play on whichever device, " +
             "this phone or the Watch, sent the most recent voice request; text messages don't change that.",
             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        SwitchRow("Play first response", state.playFirst, model::setPlayFirst)
-        SwitchRow("Play middle responses", state.playMiddle, model::setPlayMiddle)
+        SwitchRow("Play first response", state.playFirst, onChange = model::setPlayFirst)
+        SwitchRow("Play middle responses", state.playMiddle, onChange = model::setPlayMiddle)
+        SwitchRow("Speak later replies (30 minutes)", state.speakLater, tag = "speak_later_replies", onChange = model::setSpeakLaterReplies)
+        Text("Off by default, and this phone's own choice: it isn't restored from a backup or moved to a new phone. When on, " +
+            "after a voice request has been answered, assistant replies that arrive later in that same conversation within " +
+            "30 minutes are spoken too, for example when a task Hermes started finishes. Hermes doesn't mark which request a " +
+            "later reply belongs to, so this can also speak a reply to something you or someone else sent to that conversation " +
+            "from another Hermes app or the dashboard in that time. Nothing else is spoken: other conversations stay silent. A " +
+            "later reply plays on the device of your latest voice request. It waits while a voice request is being answered and " +
+            "while the device it will play on records; a recording started on this phone stops it first (it plays again " +
+            "afterwards). It doesn't wait for the other device: a reply may play on the other device while one records, and " +
+            "nothing keeps the two apart acoustically. This was checked on a computer, not yet on a phone or Watch. Replies " +
+            "arriving after 30 minutes, after the connection to Hermes drops, or after Android closes the app are lost. One that " +
+            "arrived must get a free speaker within 10 minutes of arriving; preparing it can then take up to 2 more minutes, " +
+            "plus up to 3 seconds for a listening window to close. " +
+            "Turning this off, the background relay's Stop, or background listening's Stop ends it and every waiting reply.",
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.testTag("speak_later_warning"))
+
+        HorizontalDivider()
+        Text("Voice routing", style = MaterialTheme.typography.titleSmall)
+        SwitchRow("Route voice requests automatically", state.routingEnabled, tag = "routing_enabled", onChange = model::setRoutingEnabled)
+        Text(
+            if (state.routingEnabled) "On: Hermes picks the conversation for each voice request, or creates one when none fits."
+            else "Off: a voice request goes to the conversation open on the device you spoke to (this phone's Chat, or the " +
+                "conversation open on the Watch). With none open, nothing is sent and you're asked to open one.",
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        SwitchRow("Open the routed conversation on this phone", state.autoNavigate, enabled = state.routingEnabled,
+            tag = "auto_navigate", onChange = model::setAutoNavigate)
+        Text(
+            if (state.routingEnabled) "When on, once a voice request has been delivered, this phone shows the conversation it went to " +
+                "(only while this app is open; the Watch keeps its own conversation)."
+            else "Only used while routing is on. Your choice is kept.",
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
 
         HorizontalDivider()
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -690,8 +897,9 @@ private fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerAv
             modifier = Modifier.testTag("background_relay_status"),
             color = if (state.relay.wanted && !state.relay.running) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.tertiary)
         Text("Off by default. While on, Watch requests are transcribed, routed, delivered and answered with this app closed and " +
-            "the screen off, and a notification with Stop stays visible. This phone doesn't listen or record in the background: " +
-            "its own Talk button and wake phrase work only while the app is open. It doesn't survive a force stop, a restart of the " +
+            "the screen off, and a notification with Stop stays visible. The relay itself never listens or records: this phone's " +
+            "Talk button works only while the app is open, and its wake phrase too unless you switch on background listening " +
+            "under Wake phrase. It doesn't survive a force stop, a restart of the " +
             "phone or the system's own Stop; it starts again when you open the app. It uses more battery.",
             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
 
@@ -727,7 +935,9 @@ private fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerAv
             },
             style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.tertiary,
         )
-        Text("On this phone only while the app is open on screen. On the Watch also with its app closed, once you start " +
+        PhoneBackgroundWakeRow(state, model)
+        Text("On this phone while the app is open on screen, and with it closed or the screen off once you switch that on " +
+            "above. On the Watch also with its app closed, once you start " +
             "Background there. Say the wake phrase, pause for the buzz, " +
             "then speak: the request is sent when you stop talking (no time limit). Or say the request right after " +
             "the phrase: it's sent only once the speech recognizer has finished hearing it; if it can't, nothing is " +
@@ -754,10 +964,44 @@ private fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerAv
     }
 }
 
+/**
+ * The Phone's opt-in background listening: off by default, switched on only here (in the visible
+ * app), with what it really does now and its limits.
+ */
 @Composable
-private fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+private fun PhoneBackgroundWakeRow(state: PhoneUiState, model: PhoneViewModel) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val wake = state.phoneWake ?: return
+    val notifications = PhoneApp.from(context).phoneWake.notificationCapability().shown
+    val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        model.setPhoneBackgroundWake(true)
+    }
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Text(label, Modifier.weight(1f))
-        Switch(checked = checked, onCheckedChange = onChange)
+        Text("Keep listening with this app closed or the screen off", Modifier.weight(1f))
+        Switch(checked = wake.session.running, modifier = Modifier.testTag("phone_background_wake"), onCheckedChange = { on ->
+            if (on && !notifications && model.askNotificationsOnce()) {
+                notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+            } else {
+                model.setPhoneBackgroundWake(on)
+            }
+        })
+    }
+    Text(BackgroundText.phoneWakeStatus(wake, notifications), style = MaterialTheme.typography.bodyMedium,
+        modifier = Modifier.testTag("phone_background_wake_status"),
+        color = if (wake.session.wanted && !wake.session.microphone) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.tertiary)
+    Text("Off by default. While on, a notification with Stop stays visible, and when this app is closed or the screen is off " +
+        "the phone listens for the wake phrase with its ON-DEVICE speech recognizer only (nothing is streamed to a server; a " +
+        "phone without one, or without the wake phrase's language, doesn't listen and says so). It uses noticeably more " +
+        "battery, has short gaps between listening windows, and Android or the phone's maker may still stop it. Opening the " +
+        "app hands listening back to the app. It doesn't survive a restart of the phone; switch it on again then.",
+        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+}
+
+@Composable
+private fun SwitchRow(label: String, checked: Boolean, enabled: Boolean = true, tag: String? = null, onChange: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, Modifier.weight(1f), color = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
+        Switch(checked = checked, onCheckedChange = onChange, enabled = enabled,
+            modifier = if (tag != null) Modifier.testTag(tag) else Modifier)
     }
 }

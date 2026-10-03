@@ -16,9 +16,10 @@ import com.rumi.hermesvoice.core.background.BackgroundText
 import com.rumi.hermesvoice.core.background.WatchVoiceStatus
 
 /**
- * Keeps the Watch process in the foreground-service state for a background session the user
- * started from the visible app, with an ongoing notification that says what it is doing and a
- * Stop action. It holds no voice logic: listening, recording, sending and playback belong to the
+ * Keeps the Watch process in the foreground-service state for the background session (started by
+ * default from the visible app, see WatchVoiceCoordinator.ensureDefault), with an ongoing
+ * notification that says what it is doing and a Stop action. Its entry into the foreground is
+ * reported to the runtime: a start request alone never counts as a running, listening session. It holds no voice logic: listening, recording, sending and playback belong to the
  * application's [WatchVoiceRuntime] and [WatchApp].
  *
  * Types: `mediaPlayback` always (replies play with the app hidden); `microphone` only when the
@@ -73,6 +74,8 @@ class WatchVoiceService : Service() {
         val status = voice.coordinator.status.let { if (it.session.running) it else it.copy(session = it.session.copy(running = true, microphone = microphone)) }
         ServiceCompat.startForeground(this, NOTIFICATION_ID, notification(this, status), type)
         Log.i(TAG, "background service foreground microphone=$microphone generation=$generation")
+        // Only now is the session's service really running with this type (a start request alone is not).
+        voice.onServiceEntered(generation, microphone)
     }.onFailure { Log.w(TAG, "background service type refused microphone=$microphone: ${it.javaClass.simpleName}") }.isSuccess
 
     /** Adds or drops the microphone type. Adding is only ever asked for while the app is on screen. */
@@ -125,6 +128,7 @@ class WatchVoiceService : Service() {
 
         private fun notification(context: Context, status: WatchVoiceStatus): Notification {
             val open = PendingIntent.getActivity(context, 0, Intent(context, WatchActivity::class.java)
+                .setAction(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP), PendingIntent.FLAG_IMMUTABLE)
             val stop = PendingIntent.getService(context, 1, Intent(context, WatchVoiceService::class.java).setAction(ACTION_STOP),
                 PendingIntent.FLAG_IMMUTABLE)

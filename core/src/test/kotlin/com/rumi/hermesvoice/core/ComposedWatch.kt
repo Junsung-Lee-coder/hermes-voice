@@ -33,7 +33,16 @@ import org.junit.Assert.assertTrue
  * microphone), the recognizer, timers on a simulated clock, and live platform facts. Tests drive it
  * in the order the Android adapters produce events, including work posted to run after an event.
  */
-internal class ComposedWatch(mode: WakeLocation = WakeLocation.WATCH, arbitrated: Boolean = false) {
+internal class ComposedWatch(
+    mode: WakeLocation = WakeLocation.WATCH,
+    arbitrated: Boolean = false,
+    /**
+     * The foreground service as WatchVoiceService runs it: a start is only a REQUEST, and the service reports its entry
+     * into the foreground later ([serviceEnters]); a retype goes through the running service at once. False: the legacy
+     * double where a start counts as entered.
+     */
+    private val asyncService: Boolean = false,
+) {
     var now = 1_000L
     val log = mutableListOf<String>()
 
@@ -51,6 +60,10 @@ internal class ComposedWatch(mode: WakeLocation = WakeLocation.WATCH, arbitrated
 
     // ── platform state ──
     var serviceType: String? = null
+
+    /** An async start the platform has not delivered yet: the microphone type it asked for. */
+    var pendingStart: Boolean? = null
+    private var pendingGeneration = -1L
     var windowOpen = false
     var handoffIn: Long? = null
     var rearmIn: Long? = null
@@ -67,8 +80,17 @@ internal class ComposedWatch(mode: WakeLocation = WakeLocation.WATCH, arbitrated
     }) { now }
 
     private val service = object : BackgroundPort {
+        override val confirmsEntry: Boolean get() = asyncService
+
         override fun startService(microphone: Boolean): Boolean {
             log += "startService(mic=$microphone)"
+            if (failStart) return false
+            if (asyncService) {
+                // Only asked for: the platform delivers it later (serviceEnters), typed then.
+                pendingStart = microphone
+                pendingGeneration = coordinator.session.generation + 1
+                return true
+            }
             if (microphone && !serviceAcceptsMic) return false
             serviceType = if (microphone) "microphone|mediaPlayback" else "mediaPlayback"
             return true
@@ -76,12 +98,26 @@ internal class ComposedWatch(mode: WakeLocation = WakeLocation.WATCH, arbitrated
 
         override fun retypeService(microphone: Boolean): Boolean {
             log += "retype(mic=$microphone)"
+            if (asyncService && serviceType == null) return false
             if (microphone && !serviceAcceptsMic) return false
             serviceType = if (microphone) "microphone|mediaPlayback" else "mediaPlayback"
+            if (asyncService) coordinator.onServiceEntered(coordinator.session.generation, microphone)
             return true
         }
 
-        override fun stopService() { log += "stopService"; serviceType = null }
+        override fun stopService() { log += "stopService"; serviceType = null; pendingStart = null }
+    }
+
+    /** The platform delivers the requested start to the service, which enters the foreground (as WatchVoiceService does). */
+    fun serviceEnters() {
+        val microphone = pendingStart ?: return
+        pendingStart = null
+        val typed = microphone && serviceAcceptsMic
+        serviceType = if (typed) "microphone|mediaPlayback" else "mediaPlayback"
+        log += "entered(mic=$typed)"
+        if (microphone && !typed) coordinator.onMicrophoneRefused(pendingGeneration)
+        coordinator.onServiceEntered(pendingGeneration, typed)
+        drain()
     }
 
     private val host = object : WatchVoiceHost {
@@ -96,7 +132,7 @@ internal class ComposedWatch(mode: WakeLocation = WakeLocation.WATCH, arbitrated
         override fun statusChanged(status: WatchVoiceStatus) { statuses += status }
     }
 
-    val coordinator = WatchVoiceCoordinator(InMemoryKeyValueStore(), "background_operation", service, host, holds) { now }
+    val coordinator: WatchVoiceCoordinator = WatchVoiceCoordinator(InMemoryKeyValueStore(), "background_operation", service, host, holds) { now }
 
     /** What WatchVoiceRuntime's own port does (the platform side of the wake flow). */
     private val inner = object : WakeDevicePort {

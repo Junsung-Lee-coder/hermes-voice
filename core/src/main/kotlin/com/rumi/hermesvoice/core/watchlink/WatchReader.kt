@@ -418,3 +418,51 @@ class SwipeTracker(
         return if (dx < 0) SwipeDirection.RIGHT_TO_LEFT else SwipeDirection.LEFT_TO_RIGHT
     }
 }
+
+
+/**
+ * The Watch's talk gesture: a stationary press of [HOLD_MS] anywhere on the main screen toggles
+ * recording (start, then a new press to stop). One press fires at most once. Moving past the touch
+ * slop (cumulative, so out and back still counts), movement a child (a list) consumed, a second
+ * finger, an interruption (bezel, the screen changing, the app leaving the screen) or releasing
+ * early cancels it for good. Once it fired, the rest of that press is swallowed so the release is
+ * not also a tap, a scroll or a swipe.
+ */
+class HoldToggleTracker(private val touchSlopPx: Float) {
+    private enum class State { PENDING, CANCELLED, FIRED, ENDED }
+
+    private var state = State.PENDING
+
+    /** The press fired and is still down: its events belong to no one else. */
+    val swallowing: Boolean get() = state == State.FIRED
+
+    /** Cumulative travel since touch-down. */
+    fun onMove(dx: Float, dy: Float, consumedByOther: Boolean) {
+        if (state != State.PENDING) return
+        if (consumedByOther || dx * dx + dy * dy > touchSlopPx * touchSlopPx) state = State.CANCELLED
+    }
+
+    fun onOtherPointer() = cancel()
+
+    fun onInterrupted() = cancel()
+
+    fun onUp() {
+        state = State.ENDED
+    }
+
+    /** The press stayed down and still for [HOLD_MS]: true exactly once, if nothing cancelled it. */
+    fun onHoldElapsed(): Boolean {
+        if (state != State.PENDING) return false
+        state = State.FIRED
+        return true
+    }
+
+    private fun cancel() {
+        if (state == State.PENDING) state = State.CANCELLED
+    }
+
+    companion object {
+        /** Deliberately longer than the platform long-press (~500 ms). */
+        const val HOLD_MS = 1_000L
+    }
+}

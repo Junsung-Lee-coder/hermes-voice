@@ -18,6 +18,7 @@ import com.rumi.hermesvoice.core.background.BackgroundNotice
 import com.rumi.hermesvoice.core.background.BackgroundStatus
 import com.rumi.hermesvoice.core.net.AttachmentPolicy
 import com.rumi.hermesvoice.core.net.HistoryMessage
+import com.rumi.hermesvoice.core.net.HistoryPages
 import com.rumi.hermesvoice.core.net.OutgoingAttachment
 import com.rumi.hermesvoice.core.sessions.AppConversation
 import com.rumi.hermesvoice.core.sessions.OwnedSession
@@ -25,6 +26,8 @@ import com.rumi.hermesvoice.core.settings.ThemeMode
 import com.rumi.hermesvoice.core.settings.VadSilence
 import com.rumi.hermesvoice.core.settings.WakeLocation
 import com.rumi.hermesvoice.core.settings.WatchSettings
+import com.rumi.hermesvoice.core.voice.MicrophoneClaim
+import com.rumi.hermesvoice.core.voice.TurnRouting
 import com.rumi.hermesvoice.core.voice.VoiceTurnRequest
 import com.rumi.hermesvoice.core.watchlink.CaptureCoordinator
 import com.rumi.hermesvoice.core.watchlink.CapturePort
@@ -33,6 +36,7 @@ import com.rumi.hermesvoice.core.watchlink.HapticEvent
 import com.rumi.hermesvoice.core.watchlink.TurnTrigger
 import com.rumi.hermesvoice.core.watchlink.VoiceOutcomeText
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -73,6 +77,16 @@ data class PhoneUiState(
     val hapticTick: Int = 0,
     /** The optional background relay as it really is now (see [PhoneApp.relay]). */
     val relay: BackgroundStatus = BackgroundStatus(false, false, false, BackgroundNotice.OFF),
+    /** Voice routing (Settings): on, the router picks the conversation; off, voice goes to [selected]. */
+    val routingEnabled: Boolean = true,
+    /** Open the routed conversation after delivery (Settings); kept but not applied while routing is off. */
+    val autoNavigate: Boolean = false,
+    /** Bumped when a routed turn's conversation was opened for the user: the screen shows Chat. */
+    val chatOpenRequest: Long = 0,
+    /** Speak later replies (Settings; informed opt-in, off by default). */
+    val speakLater: Boolean = false,
+    /** The opt-in background listening for the wake phrase as it really is now (see [PhoneBackgroundRuntime]). */
+    val phoneWake: com.rumi.hermesvoice.core.background.PhoneWakeStatus? = null,
 )
 
 enum class HandsFree { IDLE, LISTENING, GET_READY, SPEAK_NOW }
@@ -87,6 +101,13 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
 
     /** The wake claim the active hands-free capture was started under ("Both"), or null. */
     private var handsFreeClaimId: String? = null
+
+    /** The microphone claims of the push-to-talk and hands-free recordings ([PhoneApp.audio]); handed to their request. */
+    private var pushToTalkMicrophone: MicrophoneClaim? = null
+    private var handsFreeMicrophone: MicrophoneClaim? = null
+
+    /** Push-to-talk claimed the microphone and waits for a later reply it stopped to stop (a moment). */
+    private var pushToTalkOpening = false
 
     /** Told when a hands-free capture ended: true if it was handed on as a request (with its claim). */
     var onHandsFreeEnded: ((sent: Boolean) -> Unit)? = null
@@ -117,15 +138,23 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         override fun upload(captureId: String, trigger: TurnTrigger, wav: ByteArray) {
             val claimId = handsFreeClaimId
             handsFreeClaimId = null
+            val microphone = handsFreeMicrophone
+            handsFreeMicrophone = null
             onHandsFreeEnded?.invoke(true)
-            submitVoice(wav, wakeTurn = true, wakeClaimId = claimId)
+            submitVoice(wav, wakeTurn = true, wakeClaimId = claimId, microphone = microphone)
         }
 
-        override fun uploadRecognized(turnId: String, text: String) = submitRecognized(turnId, text, recognizedClaimId)
+        override fun uploadRecognized(turnId: String, text: String) {
+            val microphone = recognizedMicrophone
+            recognizedMicrophone = null
+            submitRecognized(turnId, text, recognizedClaimId, microphone)
+        }
 
         override fun discard(message: String) {
             Log.i(TAG, "phone hands-free discarded: $message")
             handsFreeClaimId = null
+            handsFreeMicrophone?.release()
+            handsFreeMicrophone = null
             onHandsFreeEnded?.invoke(false)
             _state.update { it.copy(voiceStatus = message) }
         }
@@ -133,11 +162,24 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
     private val _state = MutableStateFlow(initialState())
     val state: StateFlow<PhoneUiState> = _state
 
+    /** Bumped for every selection; a history read made for an earlier selection is dropped when it lands. */
+    private val selection = AtomicLong(0)
+
+    /** Unsent text and attachments of conversations switched away from, so changing conversations never loses them. */
+    private val drafts = HashMap<String, Pair<String, List<OutgoingAttachment>>>()
+
     init {
         viewModelScope.launch { app.playbackDevice.collect { device -> _state.update { it.copy(playbackDevice = device) } } }
+        // "Open the routed conversation": only requests made while this screen exists (never a replayed old one).
+        viewModelScope.launch { app.routedOpen.collect { storedSessionId -> openRouted(storedSessionId) } }
         // A voice turn (from the Phone or the Watch) created a conversation: show it.
         viewModelScope.launch { app.conversationsCreated.collect { count -> if (count > 0 && _state.value.signedIn) refresh() } }
         viewModelScope.launch { app.relayStatus.collect { relay -> _state.update { it.copy(relay = relay) } } }
+        viewModelScope.launch { app.phoneWake.status.collect { wake -> _state.update { it.copy(phoneWake = wake) } } }
+        // A request heard with the app closed: its result shows here when the app is opened.
+        viewModelScope.launch { app.phoneWake.notice.collect { line -> if (line != null) _state.update { it.copy(voiceStatus = line) } } }
+        // A later reply of a delivered request (a background completion) was spoken, or couldn't be.
+        viewModelScope.launch { app.laterReplies.collect { line -> if (line != null) _state.update { it.copy(voiceStatus = line) } } }
         // Phone voice turns run in the application, so one started before this screen was (re)created still counts as busy.
         viewModelScope.launch { app.phoneTurns.collect { running -> _state.update { it.copy(voiceBusy = running > 0) } } }
         refreshWatchStatus()
@@ -151,6 +193,9 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         playMiddle = app.settings.playMiddleResponses,
         watch = app.settings.watchSettings(),
         themeMode = app.settings.themeMode,
+        routingEnabled = app.settings.routingEnabled,
+        autoNavigate = app.settings.autoNavigateToRouted,
+        speakLater = app.laterConsent.enabled,
     )
 
     private fun wiringOrStatus(): PhoneApp.Wiring? = try {
@@ -182,6 +227,8 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         app.settings.profile = profile
         // A bearer pair belongs to the dashboard that minted it; never replay it elsewhere.
         if (changed) app.tokens.clear()
+        selection.incrementAndGet()
+        app.selectedConversationId = null
         _state.update { it.copy(dashboardUrl = app.settings.dashboardUrl, profile = app.settings.profile,
             signedIn = app.tokens.load() != null, selected = null, history = emptyList(), conversations = emptyList(),
             status = "Saved") }
@@ -224,6 +271,8 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
     fun setArchived(session: OwnedSession, archived: Boolean) = launchGuarded { wiring ->
         wiring.core.sessions.setArchived(session.storedSessionId, archived)
         if (archived && _state.value.selected?.storedSessionId == session.storedSessionId) {
+            selection.incrementAndGet()
+            app.selectedConversationId = null
             _state.update { it.copy(selected = null, history = emptyList()) }
         }
         refresh()
@@ -234,21 +283,79 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         refresh()
     }
 
-    fun open(session: OwnedSession) = launchGuarded { wiring ->
-        val page = wiring.core.sessions.history(session.storedSessionId, limit = HISTORY_PAGE)
-        _state.update { it.copy(selected = session, history = page.messages, hasOlder = page.returned >= HISTORY_PAGE,
-            rawLoaded = page.returned, draft = "", attachments = emptyList()) }
+    /**
+     * Shows [session] from its newest page. A read that lands after another conversation was
+     * selected is dropped. The unsent draft is kept per conversation (the one switched away from
+     * is stashed, the one opened gets its own back).
+     */
+    fun open(session: OwnedSession) {
+        val generation = selection.incrementAndGet()
+        launchGuarded { wiring ->
+            val page = wiring.core.sessions.history(session.storedSessionId, limit = HISTORY_PAGE)
+            if (selection.get() != generation) return@launchGuarded
+            // On the main thread, like every draft edit: the stash is never touched inside a retried update.
+            val current = _state.value
+            val (draft, attachments) = if (current.selected?.storedSessionId == session.storedSessionId) current.draft to current.attachments
+            else {
+                current.selected?.let { drafts[it.storedSessionId] = current.draft to current.attachments }
+                drafts.remove(session.storedSessionId) ?: ("" to emptyList())
+            }
+            _state.update {
+                it.copy(selected = session, history = page.messages, hasOlder = page.returned >= HISTORY_PAGE,
+                    rawLoaded = page.returned, draft = draft, attachments = attachments)
+            }
+            // With routing off, a voice request made with the app closed goes to the conversation open here.
+            app.selectedConversationId = session.storedSessionId
+        }
     }
 
-    fun loadOlder() = launchGuarded { wiring ->
-        val selected = _state.value.selected ?: return@launchGuarded
-        val page = wiring.core.sessions.history(selected.storedSessionId, limit = HISTORY_PAGE, offset = _state.value.rawLoaded)
-        _state.update { current ->
-            // New rows may have landed since the first page; de-duplicate by row id.
-            val known = current.history.map { it.rowId }.toSet()
-            current.copy(history = page.messages.filter { it.rowId !in known } + current.history,
-                hasOlder = page.returned >= HISTORY_PAGE, rawLoaded = current.rawLoaded + page.returned)
+    /**
+     * Re-reads the newest page of the conversation on screen (after a send or a voice turn): new
+     * and grown rows replace theirs, older rows already loaded stay, and the draft is untouched.
+     * Dropped if another conversation was selected meanwhile.
+     */
+    private fun reloadSelected() {
+        val session = _state.value.selected ?: return
+        val generation = selection.get()
+        launchGuarded { wiring ->
+            val page = wiring.core.sessions.history(session.storedSessionId, limit = HISTORY_PAGE)
+            _state.update { current ->
+                if (selection.get() != generation || current.selected?.storedSessionId != session.storedSessionId) return@update current
+                val merged = HistoryPages.refreshLatest(current.history, page.messages)
+                val keptOlder = merged.size > page.messages.size
+                current.copy(history = merged,
+                    hasOlder = if (keptOlder) current.hasOlder else page.returned >= HISTORY_PAGE,
+                    rawLoaded = if (keptOlder) maxOf(current.rawLoaded, page.returned) else page.returned)
+            }
         }
+    }
+
+    fun loadOlder() {
+        val generation = selection.get()
+        launchGuarded { wiring ->
+            val selected = _state.value.selected ?: return@launchGuarded
+            val page = wiring.core.sessions.history(selected.storedSessionId, limit = HISTORY_PAGE, offset = _state.value.rawLoaded)
+            _state.update { current ->
+                if (selection.get() != generation || current.selected?.storedSessionId != selected.storedSessionId) return@update current
+                // New rows may have landed since the first page; de-duplicate by row id.
+                val known = current.history.map { it.rowId }.toSet()
+                current.copy(history = page.messages.filter { it.rowId !in known } + current.history,
+                    hasOlder = page.returned >= HISTORY_PAGE, rawLoaded = current.rawLoaded + page.returned)
+            }
+        }
+    }
+
+    /** The user opened a conversation or changed screens: a routed turn accepted earlier no longer moves the screen. */
+    fun onUserNavigated() = app.routedNavigation.onManualNavigation()
+
+    /** A routed turn's conversation, opened because "Open the routed conversation" is on (see [PhoneApp.routedNavigation]). */
+    private fun openRouted(storedSessionId: String) {
+        if (!_state.value.signedIn) return
+        val wiring = wiringOrStatus() ?: return
+        val owned = wiring.core.sessions.activeConversation(storedSessionId) ?: return
+        Log.i(TAG, "routed conversation opened alias=${owned.alias}")
+        if (_state.value.selected?.storedSessionId != storedSessionId) open(owned)
+        _state.update { it.copy(chatOpenRequest = it.chatOpenRequest + 1) }
     }
 
     // ── text chat & attachments ──────────────────────────────────────────────────────────────
@@ -293,9 +400,13 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
                     is ChatSendResult.Failed -> result.reason.also { if (result.authRequired) _state.update { s -> s.copy(signedIn = false) } }
                 }
                 val delivered = result !is ChatSendResult.Failed || result.reason.startsWith("sent,")
-                _state.update { it.copy(status = status, draft = if (delivered) "" else it.draft,
-                    attachments = if (delivered) emptyList() else it.attachments) }
-                if (delivered) open(selected)
+                _state.update {
+                    // Only the conversation the message went to loses its draft (the user may have switched meanwhile).
+                    if (it.selected?.storedSessionId != selected.storedSessionId) it.copy(status = status)
+                    else it.copy(status = status, draft = if (delivered) "" else it.draft,
+                        attachments = if (delivered) emptyList() else it.attachments)
+                }
+                if (delivered) reloadSelected()
             } finally {
                 _state.update { it.copy(sending = false) }
             }
@@ -307,20 +418,42 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
     fun toggleRecording() {
         // Tapping during a hands-free request sends it now (it was listening for the user anyway).
         if (captures.tap()) return
+        if (pushToTalkOpening) return
         if (!recorder.isRecording) {
-            runCatching { recorder.start() }
-                .onSuccess { _state.update { it.copy(recording = true, voiceStatus = "Listening… tap to send") } }
-                .onFailure { error -> _state.update { it.copy(voiceStatus = error.message ?: "Microphone unavailable") } }
+            // Claimed BEFORE the microphone opens: no later reply starts on this Phone any more, and one
+            // playing now is stopped; the recorder opens only once it has really stopped.
+            val microphone = app.audio.claimMicrophone(VoiceOrigin.PHONE)
+            pushToTalkOpening = true
+            microphone.whenSpeakerStopped(viewModelScope) { stopped ->
+                pushToTalkOpening = false
+                if (!stopped) {
+                    _state.update { it.copy(voiceStatus = "Microphone busy. Tap Talk again") }
+                    return@whenSpeakerStopped
+                }
+                runCatching { recorder.start() }
+                    .onSuccess {
+                        pushToTalkMicrophone = microphone
+                        _state.update { it.copy(recording = true, voiceStatus = "Listening… tap to send") }
+                    }
+                    .onFailure { error ->
+                        microphone.release()
+                        _state.update { it.copy(voiceStatus = error.message ?: "Microphone unavailable") }
+                    }
+            }
             return
         }
         val wav = recorder.stop()
+        val microphone = pushToTalkMicrophone
+        pushToTalkMicrophone = null
         _state.update { it.copy(recording = false) }
         if (wav == null) {
+            microphone?.release()
             _state.update { it.copy(voiceStatus = "Too short") }
             return
         }
         Log.i(TAG, "phone mic captured bytes=${wav.size} peak=${WavRecorder.peak(wav)}")
-        submitVoice(wav)
+        // The claim goes with the request: later replies keep waiting until it has been answered.
+        submitVoice(wav, microphone = microphone)
     }
 
     /**
@@ -332,35 +465,45 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         submitVoice(wav)
     }
 
-    private fun submitVoice(wav: ByteArray, wakeTurn: Boolean = false, wakeClaimId: String? = null) =
-        runPhoneTurn(UUID.randomUUID().toString()) { turnId ->
-            VoiceTurnRequest(turnId, VoiceOrigin.PHONE, wav, "audio/wav", PhoneSpeakerSink(getApplication()),
-                wakeTurn = wakeTurn, wakeClaimId = wakeClaimId)
-        }
+    /** The routing switch and the conversation on this Phone, frozen now for the turn about to start. */
+    private fun routingNow(): TurnRouting = TurnRouting.of(app.settings.routingEnabled, _state.value.selected?.storedSessionId)
 
-    /** The wake claim of the recognized request being sent; read once by [submitRecognized]. */
+    private fun submitVoice(wav: ByteArray, wakeTurn: Boolean = false, wakeClaimId: String? = null, microphone: MicrophoneClaim? = null) {
+        val routing = routingNow()
+        runPhoneTurn(UUID.randomUUID().toString(), microphone) { turnId ->
+            VoiceTurnRequest(turnId, VoiceOrigin.PHONE, wav, "audio/wav", PhoneSpeakerSink(getApplication()),
+                wakeTurn = wakeTurn, wakeClaimId = wakeClaimId, routing = routing, microphone = microphone)
+        }
+    }
+
+    /** The wake claim and microphone claim of the recognized request being sent; read once by [submitRecognized]. */
     private var recognizedClaimId: String? = null
+    private var recognizedMicrophone: MicrophoneClaim? = null
 
     /** A request the Phone's recognizer heard in full after the wake phrase: routed like speech, as text. */
-    private fun submitRecognized(turnId: String, text: String, claimId: String?) = runPhoneTurn(turnId) { id ->
-        VoiceTurnRequest(id, VoiceOrigin.PHONE, ByteArray(0), "text/plain", PhoneSpeakerSink(getApplication()), recognizedText = text,
-            wakeTurn = true, wakeClaimId = claimId)
+    private fun submitRecognized(turnId: String, text: String, claimId: String?, microphone: MicrophoneClaim?) {
+        val routing = routingNow()
+        runPhoneTurn(turnId, microphone) { id ->
+            VoiceTurnRequest(id, VoiceOrigin.PHONE, ByteArray(0), "text/plain", PhoneSpeakerSink(getApplication()), recognizedText = text,
+                wakeTurn = true, wakeClaimId = claimId, routing = routing, microphone = microphone)
+        }
     }
 
     /**
      * Runs one Phone voice turn; [PhoneUiState.voiceBusy] holds while it is sent, answered and
      * played. The turn belongs to the application ([PhoneApp.launchTurn]), not to this screen:
-     * leaving or recreating the screen does not end it.
+     * leaving or recreating the screen does not end it. The orchestrator takes [microphone] over
+     * when it starts the turn; a turn that never ran gives it back when its job ends.
      */
-    private fun runPhoneTurn(turnId: String, request: (String) -> VoiceTurnRequest) {
-        val wiring = wiringOrStatus() ?: return
+    private fun runPhoneTurn(turnId: String, microphone: MicrophoneClaim? = null, request: (String) -> VoiceTurnRequest) {
+        val wiring = wiringOrStatus() ?: return run { microphone?.release() }
         _state.update { it.copy(voiceBusy = true, voiceStatus = "Sending…") }
-        app.launchTurn(turnId, phoneOrigin = true) {
+        app.launchTurn(turnId, phoneOrigin = true, microphone) {
             try {
                 val outcome = wiring.core.orchestrator.run(request(turnId))
                 Log.i(TAG, "phone turn ${turnId.take(12)} outcome=${outcome.javaClass.simpleName}")
                 _state.update { it.copy(voiceStatus = VoiceOutcomeText.describe(outcome)) }
-                _state.value.selected?.let { open(it) }
+                reloadSelected()
             } catch (error: HermesAuthRequiredException) {
                 _state.update { it.copy(signedIn = false, status = "Sign in to Hermes (${error.message})") }
             } catch (error: kotlinx.coroutines.CancellationException) {
@@ -376,16 +519,28 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
     // ── phone hands-free (wake phrase) ───────────────────────────────────────────────────────
 
     /** Nothing on the Phone owns the microphone or speaker: the wake phrase may listen. */
-    fun voiceIdle(): Boolean = !recorder.isRecording && captures.activeId == null && !_state.value.voiceBusy && app.phoneTurns.value == 0
+    fun voiceIdle(): Boolean = captureIdle() &&
+        // A later reply holding this Phone's speaker: no wake window over it.
+        !app.speakingLater.value
+
+    /**
+     * Nothing else records or sends on the Phone: an accepted wake phrase may record or send its
+     * request. A later reply does not count: the episode owns the microphone, so that reply was stopped.
+     */
+    fun captureIdle(): Boolean = !recorder.isRecording && !pushToTalkOpening && captures.activeId == null &&
+        !_state.value.voiceBusy && app.phoneTurns.value == 0
 
     /** A hands-free request is being recorded (a tap on Talk sends it). */
     fun handsFreeCapturing(): Boolean = captures.activeId != null
 
-    fun setWakeListening(open: Boolean) = _state.update {
-        when {
-            open -> it.copy(handsFree = HandsFree.LISTENING)
-            it.handsFree == HandsFree.LISTENING -> it.copy(handsFree = HandsFree.IDLE)
-            else -> it
+    fun setWakeListening(open: Boolean) {
+        app.foregroundWakeListening = open
+        _state.update {
+            when {
+                open -> it.copy(handsFree = HandsFree.LISTENING)
+                it.handsFree == HandsFree.LISTENING -> it.copy(handsFree = HandsFree.IDLE)
+                else -> it
+            }
         }
     }
 
@@ -394,11 +549,20 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
      * trailing silence (the setting now; a later change applies to the next request), on no
      * speech, or on a tap; a pause or opt-out cancels it unsent ([cancelHandsFree]).
      */
-    fun startHandsFree(silenceMs: Long, claimId: String? = null): Boolean {
-        if (recorder.isRecording || _state.value.voiceBusy || app.phoneTurns.value > 0) return false
+    fun startHandsFree(silenceMs: Long, claimId: String? = null, held: MicrophoneClaim? = null): Boolean {
+        if (recorder.isRecording || pushToTalkOpening || _state.value.voiceBusy || app.phoneTurns.value > 0) {
+            held?.release()
+            return false
+        }
         handsFreeClaimId = claimId
         val id = UUID.randomUUID().toString()
-        if (!captures.begin(id, TurnTrigger.WAKE_PHRASE)) return false
+        if (!captures.begin(id, TurnTrigger.WAKE_PHRASE)) {
+            held?.release()
+            return false
+        }
+        // The wake episode's claim (taken when the phrase was heard), or a new one: BEFORE the microphone opens.
+        val microphone = held ?: app.audio.claimMicrophone(VoiceOrigin.PHONE)
+        handsFreeMicrophone = microphone
         val capture = PhoneCapture(id, SilenceEndpoint(sampleRate = PhoneCapture.SAMPLE_RATE, silenceMs = silenceMs),
             object : PcmCaptureLoop.Listener {
                 override fun onLive() = Unit
@@ -407,7 +571,14 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
             })
         handsFreeRecorder = capture
         Log.i(TAG, "phone hands-free capture turn=${id.take(12)} vad_silence_ms=$silenceMs")
-        if (!capture.start()) {
+        // Opened only once a later reply it stopped has stopped; null: that happens in a moment (or it ends as START_FAILED).
+        return microphone.whenSpeakerStopped(viewModelScope) { stopped -> openHandsFree(id, capture, stopped) } ?: true
+    }
+
+    private fun openHandsFree(id: String, capture: PhoneCapture, stopped: Boolean): Boolean {
+        // Cancelled meanwhile (pause, opt-out, a tap): nothing to open.
+        if (captures.activeId != id || handsFreeRecorder !== capture) return false
+        if (!stopped || !capture.start()) {
             captures.stop(id, CaptureStop.START_FAILED)
             return false
         }
@@ -423,14 +594,17 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** The recognizer heard the whole request with the wake phrase: one end pulse, then send it as text. */
-    fun sendRecognizedRequest(text: String, claimId: String? = null) {
-        if (!voiceIdle()) {
-            // Something else took the microphone or speaker in the meantime: say so instead of dropping it silently.
+    fun sendRecognizedRequest(text: String, claimId: String? = null, held: MicrophoneClaim? = null) {
+        if (!captureIdle()) {
+            // Something else took the microphone in the meantime: say so instead of dropping it silently.
             Log.i(TAG, "phone recognized request not sent: busy (retry notice)")
+            held?.release()
             claimId?.let { id -> runCatching { app.wiring().core.wakeAdmission.release(id, VoiceOrigin.PHONE, "") } }
             return onWakeClosed("unfinished_request")
         }
         recognizedClaimId = claimId
+        // The episode's microphone claim goes with the request (later replies wait until it is answered).
+        recognizedMicrophone = held
         captures.sendRecognized(UUID.randomUUID().toString(), text)
     }
 
@@ -460,6 +634,36 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(playMiddle = value) }
     }
 
+    /** Phone-owned and durable; applies to voice requests started from now on (a turn in flight keeps its own). */
+    fun setRoutingEnabled(on: Boolean) {
+        app.settings.routingEnabled = on
+        _state.update { it.copy(routingEnabled = on) }
+    }
+
+    /** The user's switch for background listening, from the visible app only (refused otherwise). Off ends everything now. */
+    fun setPhoneBackgroundWake(on: Boolean) {
+        val status = if (on) app.phoneWake.start() else app.phoneWake.stop()
+        Log.i(TAG, "phone background listening ${if (on) "start" else "stop"} requested notice=${status.notice}")
+    }
+
+    /** A permission answer came back: background listening re-checks the platform's state. */
+    fun onPermissionsChanged() = app.phoneWake.onEligibilityChanged()
+
+    /**
+     * The informed opt-in to speak later replies (off by default). Off also ends every follow and any
+     * later reply waiting or playing now.
+     */
+    fun setSpeakLaterReplies(on: Boolean) {
+        app.laterConsent.enabled = on
+        if (!on) app.stopLaterReplies()
+        _state.update { it.copy(speakLater = on) }
+    }
+
+    fun setAutoNavigate(on: Boolean) {
+        app.settings.autoNavigateToRouted = on
+        _state.update { it.copy(autoNavigate = on) }
+    }
+
     fun setThemeMode(mode: ThemeMode) {
         app.settings.themeMode = mode
         _state.update { it.copy(themeMode = mode) }
@@ -476,6 +680,8 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
     fun updateWatch(settings: WatchSettings) {
         val saved = app.settings.saveWatchSettings(settings)
         _state.update { it.copy(watch = saved) }
+        // The wake location may now exclude (or include) this Phone: background listening follows at once.
+        app.phoneWake.onEligibilityChanged()
         viewModelScope.launch {
             val result = runCatching { WatchSettingsSync.publish(getApplication(), saved) }
             Log.i(TAG, "voice settings saved+published revision=${saved.revision} wake_location=${saved.wakeLocation} " +
@@ -508,7 +714,12 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         recorder.stop()
+        pushToTalkMicrophone?.release()
+        pushToTalkMicrophone = null
+        app.foregroundWakeListening = false
         cancelHandsFree("cleared")
+        recognizedMicrophone?.release()
+        recognizedMicrophone = null
     }
 
     companion object {

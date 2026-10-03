@@ -103,7 +103,13 @@ class WavRecorder(private val maxSeconds: Int = 120) {
  * playback error; losing it ends the utterance the same way. Volume and Do Not Disturb are the system's.
  */
 class PhoneSpeakerSink(private val context: Context) : PlaybackSink {
-    override suspend fun play(audio: SpokenAudio, cue: PlaybackCue) {
+    override suspend fun play(audio: SpokenAudio, cue: PlaybackCue) = playConfirmed(audio, cue) {}
+
+    /**
+     * [finished] runs from the player's own completion callback (main thread), only while this call
+     * is still waiting for it, and before this call resumes: never after a stop, an error or a lost focus.
+     */
+    override suspend fun playConfirmed(audio: SpokenAudio, cue: PlaybackCue, finished: () -> Unit) {
         val extension = when {
             audio.mimeType.contains("ogg") -> "ogg"
             audio.mimeType.contains("wav") -> "wav"
@@ -143,7 +149,10 @@ class PhoneSpeakerSink(private val context: Context) : PlaybackSink {
                     player.setWakeMode(context.applicationContext, PowerManager.PARTIAL_WAKE_LOCK)
                     player.setOnCompletionListener {
                         it.release()
-                        if (continuation.isActive) continuation.resume(Unit)
+                        if (continuation.isActive) {
+                            finished()
+                            continuation.resume(Unit)
+                        }
                     }
                     player.setOnErrorListener { mp, what, extra ->
                         mp.release()

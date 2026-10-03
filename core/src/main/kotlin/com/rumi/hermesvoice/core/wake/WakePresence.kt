@@ -174,6 +174,9 @@ class WakePresence(private val wake: WakeDeviceController, private val port: Wak
 
     fun onBusy() = wake.onBusy()
 
+    /** A later reply holds this device's speaker: the open window stops listening; an episode under way goes on. */
+    fun onPlaybackBusy() = wake.onPlaybackBusy()
+
     fun onIdle() {
         if (armed) rearm("idle") else wake.onIdle()
     }

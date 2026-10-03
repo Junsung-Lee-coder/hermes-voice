@@ -1,11 +1,13 @@
 package com.rumi.hermesvoice.core.watchlink
 
+import com.rumi.hermesvoice.core.HermesPlaybackBusyException
 import com.rumi.hermesvoice.core.HermesPlaybackException
 import com.rumi.hermesvoice.core.SpokenAudio
 import com.rumi.hermesvoice.core.VoiceOrigin
 import com.rumi.hermesvoice.core.voice.AssembledRoute
 import com.rumi.hermesvoice.core.voice.PlaybackCue
 import com.rumi.hermesvoice.core.voice.PlaybackSink
+import com.rumi.hermesvoice.core.voice.TurnRouting
 import com.rumi.hermesvoice.core.voice.VoiceTurnListener
 import com.rumi.hermesvoice.core.voice.VoiceTurnOrchestrator
 import com.rumi.hermesvoice.core.voice.VoiceTurnOutcome
@@ -35,12 +37,13 @@ interface WatchTransport {
  * sent to. Handing audio to the Data Layer is not playback: only the Watch's ACK completes a wait.
  */
 class WatchAckRegistry {
-    private class Waiter(val nodeId: String, val ack: CompletableDeferred<PlayedAck>)
+    private class Waiter(val nodeId: String, val ack: CompletableDeferred<PlayedAck>, val played: (() -> Unit)?)
 
     private val waiting = ConcurrentHashMap<String, Waiter>()
 
-    fun expect(turnId: String, sequence: Int, nodeId: String): CompletableDeferred<PlayedAck> =
-        CompletableDeferred<PlayedAck>().also { waiting[key(turnId, sequence)] = Waiter(nodeId, it) }
+    /** [played] runs for the accepted successful ack only, before the waiting caller is resumed. */
+    fun expect(turnId: String, sequence: Int, nodeId: String, played: (() -> Unit)? = null): CompletableDeferred<PlayedAck> =
+        CompletableDeferred<PlayedAck>().also { waiting[key(turnId, sequence)] = Waiter(nodeId, it, played) }
 
     fun forget(turnId: String, sequence: Int) {
         waiting.remove(key(turnId, sequence))
@@ -54,7 +57,10 @@ class WatchAckRegistry {
         val ack = PlayedAck.decode(bytes) ?: return false
         val key = key(ack.turnId, ack.sequence)
         val waiter = waiting[key]?.takeIf { it.nodeId == sourceNodeId } ?: return false
-        return waiting.remove(key, waiter) && waiter.ack.complete(ack)
+        if (!waiting.remove(key, waiter)) return false
+        // The Watch played it to the end: recorded here, on the delivering thread, before the waiter resumes.
+        if (ack.ok) runCatching { waiter.played?.invoke() }
+        return waiter.ack.complete(ack)
     }
 
     private fun key(turnId: String, sequence: Int) = "$turnId#$sequence"
@@ -69,12 +75,15 @@ class WatchPlaybackSink(
     private val acks: WatchAckRegistry,
     private val ackTimeoutMs: (SpokenAudio) -> Long = { audio -> 30_000L + audio.bytes.size / 4 },
 ) : PlaybackSink {
-    override suspend fun play(audio: SpokenAudio, cue: PlaybackCue) {
-        val waiter = acks.expect(cue.turnId, cue.sequence, transport.nodeId)
+    override suspend fun play(audio: SpokenAudio, cue: PlaybackCue) = playConfirmed(audio, cue) {}
+
+    /** [finished] runs when the registry accepts this exact node's successful PLAYED ack, before this call resumes. */
+    override suspend fun playConfirmed(audio: SpokenAudio, cue: PlaybackCue, finished: () -> Unit) {
+        val waiter = acks.expect(cue.turnId, cue.sequence, transport.nodeId, played = finished)
         try {
             try {
                 transport.sendChannel(WatchLinkPaths.playPath(cue.turnId, cue.sequence),
-                    PlayRequest(cue.turnId, cue.sequence, cue.role.name, audio.mimeType, audio.bytes).toFrame().encode())
+                    PlayRequest(cue.turnId, cue.sequence, cue.role.name, audio.mimeType, audio.bytes, later = cue.later).toFrame().encode())
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
@@ -86,6 +95,7 @@ class WatchPlaybackSink(
             } catch (timeout: TimeoutCancellationException) {
                 throw HermesPlaybackException("watch did not confirm playback of ${cue.role.name.lowercase()}")
             }
+            if (!ack.ok && ack.error == PlayedAck.BUSY_RECORDING) throw HermesPlaybackBusyException("watch is recording")
             if (!ack.ok) throw HermesPlaybackException("watch playback failed: ${ack.error.ifBlank { "unknown" }}")
         } catch (cancelled: CancellationException) {
             withContext(NonCancellable) {
@@ -106,6 +116,8 @@ class WatchPlaybackSink(
 class WatchTurnIntake(
     private val orchestrator: VoiceTurnOrchestrator,
     private val acks: WatchAckRegistry,
+    /** The Phone's routing switch for an upload, read when it arrives (routing off uses the Watch's selection). */
+    private val routing: (WatchTurnUpload) -> TurnRouting = { TurnRouting.Model },
 ) {
     /**
      * [bytes] is the channel content, or null when it could not be read or exceeded the frame
@@ -159,7 +171,7 @@ class WatchTurnIntake(
                 orchestrator.run(VoiceTurnRequest(upload.turnId, VoiceOrigin.WATCH, upload.audio, upload.mimeType,
                     WatchPlaybackSink(transport, acks), listener, recognizedText = upload.recognizedText,
                     wakeTurn = upload.trigger == TurnTrigger.WAKE_PHRASE, wakeClaimId = upload.wakeClaimId,
-                    originNodeId = transport.nodeId))
+                    originNodeId = transport.nodeId, routing = routing(upload)))
             } finally {
                 states.close()
             }
@@ -187,12 +199,17 @@ object VoiceOutcomeText {
         is VoiceTurnOutcome.DeliveredResponseFailed ->
             "Delivered to ${outcome.route.destination.alias}; reply playback failed"
         is VoiceTurnOutcome.RoutingRejected -> "Not delivered: routing rejected (${outcome.reason})"
-        is VoiceTurnOutcome.NotDelivered ->
-            if (outcome.authRequired) "Not delivered: sign in on the phone" else "Not delivered: ${outcome.reason.take(120)}"
+        is VoiceTurnOutcome.NotDelivered -> when {
+            outcome.authRequired -> "Not delivered: sign in on the phone"
+            outcome.reason == TurnRouting.TARGET_UNAVAILABLE ->
+                "Not sent: routing is off and the selected conversation isn't available. Select another"
+            else -> "Not delivered: ${outcome.reason.take(120)}"
+        }
         VoiceTurnOutcome.NoSpeech -> "No speech detected"
         is VoiceTurnOutcome.Duplicate -> "Duplicate turn ignored"
         is VoiceTurnOutcome.NotAdmitted ->
-            if (outcome.reason == "wake_claim_missing") "Not sent: the wake settings changed while you spoke. Say it again"
+            if (outcome.reason == TurnRouting.NO_TARGET) "Not sent: routing is off. Open a conversation first"
+            else if (outcome.reason == "wake_claim_missing") "Not sent: the wake settings changed while you spoke. Say it again"
             else if (outcome.reason.startsWith("wake_claim")) "Not sent: the wake phrase was answered elsewhere or timed out. Say it again"
             else "Not sent: ${outcome.reason.take(120)}"
     }

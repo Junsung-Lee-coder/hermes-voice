@@ -1,5 +1,6 @@
 package com.rumi.hermesvoice.core.watchlink
 
+import com.rumi.hermesvoice.core.voice.DestinationAllowlist
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.io.InputStream
@@ -13,6 +14,7 @@ import org.json.JSONObject
  * captured audio to the Phone and plays what the Phone sends back.
  *
  * - `/hv/v1/turn/<turnId>`       channel, Watch → Phone: [LinkFrame] {turn header} + WAV bytes
+ *                                (the header may name the Watch's selected conversation, [WatchTurnUpload.target])
  * - `/hv/v1/state`               message, Phone → Watch: [TurnStateMessage]
  * - `/hv/v1/play/<turnId>/<seq>` channel, Phone → Watch: [LinkFrame] {play header} + audio bytes
  * - `/hv/v1/played`              message, Watch → Phone: [PlayedAck] (sent when playback ends)
@@ -137,12 +139,21 @@ class WatchTurnUpload(
     val audio: ByteArray,
     /** The wake claim this wake-phrase turn was made under when both devices listen; else null. */
     val wakeClaimId: String? = null,
+    /**
+     * The conversation selected on the Watch when it sent this turn (a stored session id the
+     * Phone's reader gave it), or null. Used only while the Phone's routing is off, and only if it
+     * is one of the Phone's active conversations; optional, so older Phones simply ignore it.
+     */
+    val target: String? = null,
 ) {
     val recognizedText: String? get() = if (mimeType == MIME_TEXT) String(audio, StandardCharsets.UTF_8).trim() else null
 
     fun toFrame(): LinkFrame = LinkFrame(
         JSONObject().put("v", 1).put("turn_id", turnId).put("trigger", trigger.name).put("mime", mimeType).put("bytes", audio.size)
-            .apply { if (wakeClaimId != null) put("claim", wakeClaimId) },
+            .apply {
+                if (wakeClaimId != null) put("claim", wakeClaimId)
+                if (target != null) put("target", target)
+            },
         audio,
     )
 
@@ -151,8 +162,8 @@ class WatchTurnUpload(
         const val MIME_TEXT = "text/plain; charset=utf-8"
         const val MAX_RECOGNIZED_CHARS = com.rumi.hermesvoice.core.wake.WakeContract.MAX_REQUEST_CHARS
 
-        fun recognized(turnId: String, text: String, wakeClaimId: String? = null): WatchTurnUpload =
-            WatchTurnUpload(turnId, TurnTrigger.WAKE_PHRASE, MIME_TEXT, text.trim().toByteArray(StandardCharsets.UTF_8), wakeClaimId)
+        fun recognized(turnId: String, text: String, wakeClaimId: String? = null, target: String? = null): WatchTurnUpload =
+            WatchTurnUpload(turnId, TurnTrigger.WAKE_PHRASE, MIME_TEXT, text.trim().toByteArray(StandardCharsets.UTF_8), wakeClaimId, target)
 
         /** Validates the frame against the channel path it arrived on; anything off is rejected. */
         fun fromFrame(path: String, frame: LinkFrame): WatchTurnUpload {
@@ -171,7 +182,12 @@ class WatchTurnUpload(
                     ?: throw LinkProtocolException("bad wake claim")
                 else -> throw LinkProtocolException("bad wake claim")
             }
-            val upload = WatchTurnUpload(pathTurnId, trigger, mime, frame.payload, claim)
+            val target = when (val raw = header.opt("target")) {
+                null -> null
+                is String -> raw.takeIf(DestinationAllowlist::isValidSessionId) ?: throw LinkProtocolException("bad target")
+                else -> throw LinkProtocolException("bad target")
+            }
+            val upload = WatchTurnUpload(pathTurnId, trigger, mime, frame.payload, claim, target)
             if (mime == MIME_WAV) {
                 if (frame.payload.size <= WAV_HEADER_BYTES) throw LinkProtocolException("turn audio is empty")
             } else {
@@ -205,10 +221,22 @@ data class TurnStateMessage(val turnId: String, val stage: String, val detail: S
 }
 
 /** One utterance for the Watch speaker. */
-class PlayRequest(val turnId: String, val sequence: Int, val role: String, val mimeType: String, val audio: ByteArray) {
+class PlayRequest(
+    val turnId: String,
+    val sequence: Int,
+    val role: String,
+    val mimeType: String,
+    val audio: ByteArray,
+    /**
+     * A LATER reply (one that arrived after its turn was answered): a Watch that is recording refuses
+     * it with [PlayedAck.BUSY_RECORDING] instead of playing it over the recording. Optional header
+     * field; an older Watch ignores it.
+     */
+    val later: Boolean = false,
+) {
     fun toFrame(): LinkFrame = LinkFrame(
         JSONObject().put("v", 1).put("turn_id", turnId).put("seq", sequence).put("role", role).put("mime", mimeType)
-            .put("bytes", audio.size),
+            .put("bytes", audio.size).apply { if (later) put("later", true) },
         audio,
     )
 
@@ -223,7 +251,7 @@ class PlayRequest(val turnId: String, val sequence: Int, val role: String, val m
                 throw LinkProtocolException("play audio length mismatch")
             }
             return PlayRequest(turnId, header.optInt("seq", -1).also { if (it < 0) throw LinkProtocolException("bad seq") },
-                header.optString("role"), mime, frame.payload)
+                header.optString("role"), mime, frame.payload, later = header.optBoolean("later", false))
         }
     }
 }
@@ -234,6 +262,12 @@ data class PlayedAck(val turnId: String, val sequence: Int, val ok: Boolean, val
         .toString().toByteArray(StandardCharsets.UTF_8)
 
     companion object {
+        /**
+         * The [error] of a later reply the Watch did not play because it is recording (refused at
+         * once, or stopped when a recording started). Not played and not failed: the Phone tries again.
+         */
+        const val BUSY_RECORDING = "busy_recording"
+
         fun decode(bytes: ByteArray): PlayedAck? = runCatching {
             val json = JSONObject(String(bytes, StandardCharsets.UTF_8))
             PlayedAck(json.getString("turn_id"), json.getInt("seq"), json.getBoolean("ok"), json.optString("error"))

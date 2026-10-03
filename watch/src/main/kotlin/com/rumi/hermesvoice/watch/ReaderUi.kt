@@ -2,7 +2,6 @@ package com.rumi.hermesvoice.watch
 
 import android.os.SystemClock
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -15,7 +14,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
@@ -23,6 +21,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -31,27 +30,30 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.rotary.onPreRotaryScrollEvent
 import androidx.compose.ui.input.rotary.onRotaryScrollEvent
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.wear.compose.material.Button
-import androidx.wear.compose.material.ButtonDefaults
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.wear.compose.material.Chip
 import androidx.wear.compose.material.ChipDefaults
 import androidx.wear.compose.material.CompactChip
 import androidx.wear.compose.material.MaterialTheme
 import androidx.wear.compose.material.Text
-import com.rumi.hermesvoice.core.background.BackgroundText
-import com.rumi.hermesvoice.core.background.WatchVoiceStatus
 import com.rumi.hermesvoice.core.watchlink.LoadStatus
+import com.rumi.hermesvoice.core.watchlink.HoldToggleTracker
 import com.rumi.hermesvoice.core.watchlink.ReaderError
 import com.rumi.hermesvoice.core.watchlink.ReaderHistory
 import com.rumi.hermesvoice.core.watchlink.ReaderMessageRow
@@ -89,6 +91,99 @@ fun Modifier.readerSwipe(onSwipe: (SwipeDirection) -> Unit): Modifier = pointerI
             if (claimed) change.consume()
         }
     }
+}
+
+/** Bezel turns, the screen changing or the app leaving it: each one cancels a press that is still being held. */
+class HoldInterrupts {
+    @Volatile var epoch = 0L
+        private set
+
+    fun interrupt() {
+        epoch += 1
+    }
+}
+
+/**
+ * The talk gesture on the whole main screen: a stationary press of [HoldToggleTracker.HOLD_MS]
+ * anywhere, over text, blank space or a list, calls [onHold] once (the same toggle the Talk button
+ * was: start, and a new press to stop and send). It never plays a haptic itself: recording
+ * start and end buzz from the recorder, as before.
+ *
+ * It watches the Initial pass, before lists and chips: a press that moves past the touch slop
+ * (also out and back), whose movement a list used (checked again on the Final pass), a second
+ * finger, releasing early, a bezel turn, [enabled] being false when the second is up (the app is
+ * not resumed, or a request is being sent), or the screen changing ([key]) cancels it with no
+ * action. Once it fired, the rest of that press is consumed before anything below sees it, so
+ * releasing is not also a tap (a chip, a session), a scroll or a swipe.
+ */
+fun Modifier.holdToTalk(key: Any?, interrupts: HoldInterrupts, enabled: () -> Boolean, onHold: () -> Unit): Modifier =
+    onPreRotaryScrollEvent {
+        interrupts.interrupt()
+        false
+    }.pointerInput(key) {
+        awaitEachGesture {
+            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+            val hold = HoldToggleTracker(viewConfiguration.touchSlop)
+            val epoch = interrupts.epoch
+            // Null when the second elapsed with the finger still down.
+            val released: Boolean? = withTimeoutOrNull(HoldToggleTracker.HOLD_MS) {
+                while (true) {
+                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                    if (event.changes.any { it.id != down.id && it.pressed }) hold.onOtherPointer()
+                    val change = event.changes.firstOrNull { it.id == down.id }
+                    if (change == null || !change.pressed) break
+                    // The same event after the lists and chips had it: did one of them use this movement?
+                    val handled = awaitPointerEvent(PointerEventPass.Final).changes.firstOrNull { it.id == down.id }
+                    val travel = change.position - down.position
+                    hold.onMove(travel.x, travel.y, consumedByOther = handled?.isConsumed == true)
+                }
+                hold.onUp()
+                true
+            }
+            if (released != null) return@awaitEachGesture
+            if (interrupts.epoch != epoch || !enabled()) hold.onInterrupted()
+            if (!hold.onHoldElapsed()) return@awaitEachGesture
+            onHold()
+            while (true) {
+                val event = awaitPointerEvent(PointerEventPass.Initial)
+                event.changes.forEach { it.consume() }
+                if (event.changes.none { it.pressed }) break
+            }
+            hold.onUp()
+        }
+    }
+
+/**
+ * The Watch's main screen: [content] (browser, chat or home) with the talk gesture over all of
+ * it ([holdToTalk]) and, for accessibility services, the same start/stop as an action, so it
+ * needs no on-screen button. [modifier] carries the activity's swipe handling.
+ */
+@Composable
+fun ReaderRoot(
+    modifier: Modifier,
+    surfaceKey: Any,
+    recording: Boolean,
+    enabled: () -> Boolean,
+    onHoldToggle: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    val interrupts = remember { HoldInterrupts() }
+    // Changing screens (browser, chat, another conversation) ends a press still being held.
+    LaunchedEffect(surfaceKey) { interrupts.interrupt() }
+    // So does the app leaving the screen, even if it is back before the second is up.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event -> if (event == Lifecycle.Event.ON_PAUSE) interrupts.interrupt() }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val actionLabel = if (recording) "Stop recording and send" else "Start recording"
+    Box(
+        modifier.fillMaxSize().background(MaterialTheme.colors.background)
+            .holdToTalk(surfaceKey, interrupts, enabled, onHoldToggle)
+            .semantics { customActions = listOf(CustomAccessibilityAction(actionLabel) { if (enabled()) onHoldToggle(); true }) }
+            .testTag("reader_root"),
+    ) { content() }
 }
 
 /**
@@ -147,7 +242,7 @@ private fun StatusText(text: String, error: Boolean = false) {
         style = MaterialTheme.typography.caption3)
 }
 
-/** The selected conversation: history bubbles, "load older" at the top, Talk controls overlaid at the bottom. */
+/** The selected conversation: history bubbles, "load older" at the top, the talk status in one line at the bottom. */
 @Composable
 fun ChatSurface(
     title: String,
@@ -156,7 +251,7 @@ fun ChatSurface(
     onOlder: () -> Unit,
     onRetry: () -> Unit,
     onScrollStep: () -> Unit,
-    talkControls: @Composable () -> Unit,
+    talkStatus: @Composable () -> Unit,
 ) {
     val listState = rememberLazyListState()
     val ids = history.messages.map { it.rowId }
@@ -171,7 +266,7 @@ fun ChatSurface(
         LazyColumn(
             Modifier.fillMaxSize().rotaryScroll(listState, focusRequester, onScrollStep).testTag("chat_list"),
             state = listState,
-            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 26.dp, bottom = 70.dp),
+            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 26.dp, bottom = 36.dp),
             verticalArrangement = Arrangement.spacedBy(5.dp),
         ) {
             item(key = "header") {
@@ -199,7 +294,7 @@ fun ChatSurface(
                 }
             }
         }
-        Box(Modifier.align(Alignment.BottomCenter).padding(bottom = 6.dp)) { talkControls() }
+        Box(Modifier.align(Alignment.BottomCenter).padding(bottom = 8.dp, start = 28.dp, end = 28.dp)) { talkStatus() }
     }
 }
 
@@ -247,12 +342,19 @@ fun SessionsSurface(
     }
 }
 
-/** Big Talk/Send button used when no conversation is open. */
+/** What a press does now, or what the voice request is doing: recording, sending, waiting, the wake phrase. */
+fun talkHint(talk: WatchTalkState, wakeListening: Boolean): String = when {
+    talk.phase == WatchPhase.RECORDING -> "● Recording · hold 1 s to send"
+    talk.line.isNotBlank() -> talk.line
+    wakeListening -> "Listening for the wake phrase…"
+    else -> "Hold 1 s to talk"
+}
+
+/** The home screen when no conversation is open: status lines only; the talk gesture covers the whole screen. */
 @Composable
-fun TalkHome(phone: Boolean?, talk: WatchTalkState, wakeEnabled: Boolean, wakeListening: Boolean, wakeUnavailable: Boolean,
-             background: WatchVoiceStatus, onTalk: () -> Unit, onBackground: () -> Unit) {
+fun TalkHome(phone: Boolean?, talk: WatchTalkState, wakeEnabled: Boolean, wakeListening: Boolean, wakeUnavailable: Boolean) {
     Column(Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 14.dp),
-        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterVertically)) {
         Text(
             when (phone) {
                 true -> "Phone connected"
@@ -262,51 +364,29 @@ fun TalkHome(phone: Boolean?, talk: WatchTalkState, wakeEnabled: Boolean, wakeLi
             color = if (phone == false) MaterialTheme.colors.error else MaterialTheme.colors.onSurfaceVariant,
             style = MaterialTheme.typography.caption2, textAlign = TextAlign.Center,
         )
-        TalkButton(talk, size = 88, onTalk)
+        val recording = talk.phase == WatchPhase.RECORDING
         Text(
-            talk.line.ifBlank {
-                when {
-                    wakeListening -> "Listening for the wake phrase…"
-                    wakeEnabled && wakeUnavailable -> "Wake phrase unavailable on this watch. Tap to talk"
-                    wakeEnabled -> "Say the wake phrase or tap"
-                    else -> "Tap to talk"
-                }
+            when {
+                recording || talk.line.isNotBlank() || wakeListening -> talkHint(talk, wakeListening)
+                wakeEnabled && wakeUnavailable -> "Wake phrase unavailable on this watch. Hold 1 s to talk"
+                wakeEnabled -> "Say the wake phrase, or hold 1 s to talk"
+                else -> "Hold anywhere 1 s to talk"
             },
-            color = MaterialTheme.colors.onBackground, style = MaterialTheme.typography.body2,
-            textAlign = TextAlign.Center, maxLines = 3,
+            Modifier.testTag("talk_status"),
+            color = if (recording) MaterialTheme.colors.error else MaterialTheme.colors.onBackground,
+            style = MaterialTheme.typography.body2, textAlign = TextAlign.Center, maxLines = 3,
         )
-        // The background session: what it really does now, and what a tap does. Started and stopped only here (or Stop in its notification).
-        Text("${BackgroundText.watchLabel(background.session, background.loop)}\n${BackgroundText.watchAction(background.session, background.notification)}",
-            Modifier.padding(top = 2.dp).clip(RoundedCornerShape(10.dp)).background(MaterialTheme.colors.surface)
-                .clickable(onClick = onBackground).padding(horizontal = 8.dp, vertical = 2.dp).testTag("background"),
-            color = if (background.session.running) MaterialTheme.colors.secondary else MaterialTheme.colors.onSurfaceVariant,
-            style = MaterialTheme.typography.caption3, textAlign = TextAlign.Center, maxLines = 3)
         Text("Swipe left for conversations", color = MaterialTheme.colors.onSurfaceVariant,
             style = MaterialTheme.typography.caption3, textAlign = TextAlign.Center)
     }
 }
 
-/** Compact Talk/Send with the talk status line, overlaid on the chat. */
+/** One compact line over the bottom of the chat: recording, the request's progress, or the hold hint. */
 @Composable
-fun CompactTalk(talk: WatchTalkState, wakeListening: Boolean, onTalk: () -> Unit) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        val line = talk.line.ifBlank { if (wakeListening) "Listening for the wake phrase…" else "" }
-        if (line.isNotBlank()) {
-            Text(line, Modifier.background(Color(0xCC000000), RoundedCornerShape(8.dp)).padding(horizontal = 6.dp, vertical = 2.dp),
-                color = MaterialTheme.colors.onBackground, style = MaterialTheme.typography.caption3, maxLines = 2,
-                textAlign = TextAlign.Center)
-        }
-        TalkButton(talk, size = 46, onTalk)
-    }
-}
-
-@Composable
-private fun TalkButton(talk: WatchTalkState, size: Int, onTalk: () -> Unit) {
+fun TalkStatusLine(talk: WatchTalkState, wakeListening: Boolean) {
     val recording = talk.phase == WatchPhase.RECORDING
-    Button(onClick = onTalk, modifier = Modifier.padding(vertical = 4.dp).size(size.dp).testTag("talk"),
-        enabled = talk.phase != WatchPhase.SENDING,
-        colors = ButtonDefaults.buttonColors(
-            backgroundColor = if (recording) MaterialTheme.colors.error else MaterialTheme.colors.primary)) {
-        Text(if (recording) "Send" else "Talk", style = if (size > 60) MaterialTheme.typography.title3 else MaterialTheme.typography.caption1)
-    }
+    Text(talkHint(talk, wakeListening),
+        Modifier.background(Color(0xCC000000), RoundedCornerShape(8.dp)).padding(horizontal = 6.dp, vertical = 2.dp).testTag("talk_status"),
+        color = if (recording) MaterialTheme.colors.error else MaterialTheme.colors.onSurfaceVariant,
+        style = MaterialTheme.typography.caption3, maxLines = 2, textAlign = TextAlign.Center)
 }
