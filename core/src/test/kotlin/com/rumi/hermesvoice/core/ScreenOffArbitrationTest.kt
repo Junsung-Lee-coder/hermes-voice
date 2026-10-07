@@ -18,7 +18,7 @@ import org.junit.Test
  */
 class ScreenOffArbitrationTest {
     private fun watchHidden(watchPref: Boolean, phonePref: Boolean) =
-        ComposedWatch(WakeLocation.OFF, arbitrated = true, watchStandby = true, phoneStandby = true, watchScreenOff = watchPref, phoneScreenOff = phonePref)
+        ComposedWatch(WakeLocation.BOTH, arbitrated = true, watchStandby = true, phoneStandby = true, watchScreenOff = watchPref, phoneScreenOff = phonePref)
             .apply { show(); start(); hide(); screenOff() }
 
     private fun phoneHidden(w: ComposedWatch): ScreenOffPhoneTest.Rig {
@@ -101,7 +101,7 @@ class ScreenOffArbitrationTest {
 
     @Test
     fun `an episode waiting for its claim is dropped when the screen turns off, and a late grant records nothing`() {
-        val watch = ComposedWatch(WakeLocation.OFF, arbitrated = true, watchStandby = true, phoneStandby = true, watchScreenOff = false)
+        val watch = ComposedWatch(WakeLocation.BOTH, arbitrated = true, watchStandby = true, phoneStandby = true, watchScreenOff = false)
             .apply { show(); start(); hide() }
         watch.heard("루미")
         assertEquals(listOf("claim:claim-1"), watch.claimsSent)

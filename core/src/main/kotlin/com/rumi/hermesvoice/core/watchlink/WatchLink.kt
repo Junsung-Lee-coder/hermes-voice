@@ -26,6 +26,8 @@ import org.json.JSONObject
  *                                bounded, closed schema, answered once per request, never polled
  * - `/hv/v1/navigate`            message, Phone → Watch: a Watch-originated routed request was DELIVERED to this conversation
  *                                ([WatchNavigation]); the Watch may select it, guarded by [WatchNavigationGuard]
+ * - `/hv/v1/reply`               message, Phone → Watch: an unspoken final answer for the Watch arrived ([ReplyAlertMessage]); the
+ *                                Watch shows (and owns) the arrival alert, the Phone then shows none
  * - `/hv/v1/settings`            data item, Phone → Watch: [com.rumi.hermesvoice.core.settings.WatchSettings] JSON
  * - `/hv/v1/reader/request`      message, Watch → Phone, and `/hv/v1/reader/response`, Phone → Watch:
  *                                the conversation reader ([ReaderRequest], [ReaderResponse])
@@ -46,6 +48,9 @@ object WatchLinkPaths {
     const val DIAG_REQUEST = "/hv/v1/diag/request"
     const val DIAG_RESPONSE = "/hv/v1/diag/response"
     const val NAVIGATE = "/hv/v1/navigate"
+
+    /** Phone → Watch: a final answer for this Watch arrived without audio; the Watch shows its own alert ([ReplyAlertMessage]). */
+    const val REPLY = "/hv/v1/reply"
     const val SETTINGS = "/hv/v1/settings"
     const val READER_REQUEST = "/hv/v1/reader/request"
     const val READER_RESPONSE = "/hv/v1/reader/response"
@@ -424,6 +429,23 @@ data class PlayProgress(val turnId: String, val sequence: Int, val positionMs: L
             if (!WatchLinkPaths.isValidTurnId(turnId)) return null
             val progress = PlayProgress(turnId, json.getInt("seq"), json.getLong("pos"), json.getLong("dur"))
             progress.takeIf { it.sequence >= 0 && it.durationMs in 1..MAX_DURATION_MS && it.positionMs in 0..it.durationMs }
+        }.getOrNull()
+    }
+}
+
+/** Phone → Watch: identity and conversation of an unspoken final answer, for the Watch's own arrival alert. Strict like [WatchNavigation]; no reply text. */
+data class ReplyAlertMessage(val identity: String, val sessionId: String) {
+    init {
+        require(com.rumi.hermesvoice.core.notify.ReplyAlert.isValidIdentity(identity) && DestinationAllowlist.isValidSessionId(sessionId)) { "invalid reply alert" }
+    }
+
+    fun encode(): ByteArray = JSONObject().put("v", 1).put("identity", identity).put("session_id", sessionId).toString().toByteArray(StandardCharsets.UTF_8)
+
+    companion object {
+        fun decode(bytes: ByteArray): ReplyAlertMessage? = runCatching {
+            val json = JSONObject(String(bytes, StandardCharsets.UTF_8))
+            if (json.opt("v") != 1) return@runCatching null
+            ReplyAlertMessage(json.opt("identity") as? String ?: return@runCatching null, json.opt("session_id") as? String ?: return@runCatching null)
         }.getOrNull()
     }
 }

@@ -18,22 +18,29 @@ import org.junit.Test
 /**
  * The Watch's background standby switch, through the real coordinator, wake flow, presence, session and
  * holds with only the platform faked (see [ComposedWatch]). The switch decides whether a HIDDEN Watch may
- * wait for the wake phrase; it is not the session's Stop and not the foreground wake location.
+ * wait for the wake phrase; it is not the session's Stop, and it never selects a device: "Listen on" does.
  */
 class BackgroundStandbyLifecycleTest {
-    private fun hiddenStandby(location: WakeLocation = WakeLocation.OFF) = ComposedWatch(location, watchStandby = true).apply {
+    private fun hiddenStandby(location: WakeLocation = WakeLocation.WATCH) = ComposedWatch(location, watchStandby = true).apply {
         show(); start(); hide()
     }
 
     // ── what the switch means ────────────────────────────────────────────────────────────────
 
     @Test
-    fun `standby on listens hidden even though the foreground location is off`() {
-        val w = hiddenStandby(WakeLocation.OFF)
+    fun `standby on listens hidden when Listen on selects the Watch, and never when it does not`() {
+        val w = hiddenStandby()
         assertEquals(BackgroundNotice.LISTENING, w.notice)
         assertTrue(w.windowOpen)
         assertTrue(HoldReason.LISTEN in w.held())
         assertEquals(WakeContract.BACKGROUND_WINDOW_MS, w.wake.windowMs)
+        for (location in listOf(WakeLocation.OFF, WakeLocation.PHONE)) {
+            val excluded = hiddenStandby(location)
+            assertFalse("$location: Listen on leaves the Watch out, standby adds nothing", excluded.windowOpen)
+            assertTrue("$location: no hold", excluded.held().isEmpty())
+            assertNull("$location: no timer", excluded.rearmIn)
+            assertEquals("$location: no window was ever opened", 0, excluded.listens())
+        }
     }
 
     @Test
@@ -98,10 +105,10 @@ class BackgroundStandbyLifecycleTest {
         w.show()
         assertEquals(BackgroundNotice.LISTENING, w.notice)
         assertTrue("the visit arms the legal service", w.coordinator.presence.armed)
-        // r1 migration: the old union opened a foreground window here (location OFF, standby ON); the location alone decides on screen now.
-        assertFalse("location OFF: nothing listens while the app is on screen", w.windowOpen)
+        // Migration: Listen on selects the Watch, so the visit listens on screen and hidden standby keeps listening.
+        assertTrue("selected: the visit listens while the app is on screen", w.windowOpen)
         w.hide()
-        assertTrue("hidden: the standby alone listens, whatever the location", w.windowOpen)
+        assertTrue("hidden: the standby listens for the selected Watch", w.windowOpen)
         w.standbyChange(watch = false)
         assertTrue(w.held().isEmpty())
         assertFalse(w.windowOpen)
@@ -197,8 +204,8 @@ class BackgroundStandbyLifecycleTest {
     // ── Both and arbitration ─────────────────────────────────────────────────────────────────
 
     @Test
-    fun `when both devices may listen through their standby switches a wake episode is claimed even with the location off`() {
-        val w = ComposedWatch(WakeLocation.OFF, arbitrated = true, watchStandby = true, phoneStandby = true)
+    fun `when both devices may listen through their standby switches a wake episode is claimed when Listen on is Both`() {
+        val w = ComposedWatch(WakeLocation.BOTH, arbitrated = true, watchStandby = true, phoneStandby = true)
         w.show(); w.start(); w.hide()
         w.heard("루미")
         assertEquals(listOf("claim:claim-1"), w.claimsSent)
@@ -209,7 +216,7 @@ class BackgroundStandbyLifecycleTest {
 
     @Test
     fun `a lone listener needs no claim, so its request is never delayed by a Phone that is not listening`() {
-        val w = ComposedWatch(WakeLocation.OFF, arbitrated = true, watchStandby = true, phoneStandby = false)
+        val w = ComposedWatch(WakeLocation.WATCH, arbitrated = true, watchStandby = true, phoneStandby = false)
         w.show(); w.start(); w.hide()
         w.heard("루미")
         assertTrue(w.claimsSent.isEmpty())
@@ -218,7 +225,7 @@ class BackgroundStandbyLifecycleTest {
 
     @Test
     fun `turning the Phone standby on or off while the Watch holds a claim renews or fails it, never sends twice`() {
-        val w = ComposedWatch(WakeLocation.OFF, arbitrated = true, watchStandby = true, phoneStandby = true)
+        val w = ComposedWatch(WakeLocation.BOTH, arbitrated = true, watchStandby = true, phoneStandby = true)
         w.show(); w.start(); w.hide()
         w.heard("루미")
         assertEquals(listOf("claim:claim-1"), w.claimsSent)
@@ -249,7 +256,7 @@ class BackgroundStandbyLifecycleTest {
 
     @Test
     fun `an unreachable Phone is retried with a doubling bounded wait and the window opens at once when it returns`() {
-        val w = hiddenStandby(WakeLocation.OFF)
+        val w = hiddenStandby()
         w.reachable = false
         w.windowTimeout(); w.rearmDue()
         assertTrue(w.log.last().endsWith(":PHONE_UNREACHABLE"))
@@ -275,7 +282,7 @@ class BackgroundStandbyLifecycleTest {
 
     @Test
     fun `reachability events while nothing waits for them schedule and open nothing`() {
-        val w = hiddenStandby(WakeLocation.OFF)
+        val w = hiddenStandby()
         val listens = w.listens()
         repeat(20) { w.reachabilityChanged(true) }
         assertEquals(listens, w.listens())
@@ -288,7 +295,7 @@ class BackgroundStandbyLifecycleTest {
 
     @Test
     fun `busy and standby off schedule no retry, and the first blocked retry delay is the documented base`() {
-        val w = hiddenStandby(WakeLocation.OFF)
+        val w = hiddenStandby()
         w.busy = true
         w.coordinator.onBusy(); w.drain()
         assertNull("busy waits for idle, it does not poll", w.rearmIn)

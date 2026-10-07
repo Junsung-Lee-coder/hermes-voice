@@ -1,0 +1,379 @@
+diff --git a/phone/build.gradle.kts b/phone/build.gradle.kts
+index 4c11ddc..7e2c932 100644
+--- a/phone/build.gradle.kts
++++ b/phone/build.gradle.kts
+@@ -70,3 +70,29 @@ dependencies {
+     androidTestImplementation("androidx.test:runner:1.6.2")
+     if (uiFixture) debugImplementation("androidx.compose.ui:ui-test-manifest")
+ }
++
++// ── SCRATCH HARNESS ONLY (appended in a throwaway staging copy; never part of the app or its source zip): host tests that run the
++// actual Phone classes under Robolectric. Runtime jars are fetched into the work slot (user.home). ──
++android {
++    testOptions {
++        unitTests {
++            isIncludeAndroidResources = true
++            all {
++                it.systemProperty("user.home", rootProject.layout.projectDirectory.dir("../robo-home").asFile.absolutePath)
++                it.maxHeapSize = "1g"
++                it.testLogging {
++                    events("passed", "failed", "skipped")
++                    exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
++                }
++            }
++        }
++    }
++}
++
++dependencies {
++    testImplementation("junit:junit:4.13.2")
++    testImplementation("org.robolectric:robolectric:4.14.1")
++    testImplementation("io.mockk:mockk:1.13.10")
++    testImplementation("androidx.test:core:1.6.1")
++    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
++}
+diff --git a/b/phone/src/test/kotlin/com/rumi/hermesvoice/phone/FakeAndroidKeyStore.kt b/b/phone/src/test/kotlin/com/rumi/hermesvoice/phone/FakeAndroidKeyStore.kt
+new file mode 100644
+index 0000000..6c0c2e6
+--- /dev/null
++++ b/phone/src/test/kotlin/com/rumi/hermesvoice/phone/FakeAndroidKeyStore.kt
+@@ -0,0 +1,70 @@
++package com.rumi.hermesvoice.phone
++
++import android.security.keystore.KeyGenParameterSpec
++import java.io.InputStream
++import java.io.OutputStream
++import java.security.Key
++import java.security.KeyStoreSpi
++import java.security.Provider
++import java.security.SecureRandom
++import java.security.Security
++import java.security.cert.Certificate
++import java.security.spec.AlgorithmParameterSpec
++import java.util.Collections
++import java.util.Date
++import java.util.Enumeration
++import java.util.concurrent.ConcurrentHashMap
++import javax.crypto.KeyGenerator
++import javax.crypto.KeyGeneratorSpi
++import javax.crypto.SecretKey
++
++/**
++ * SCRATCH HARNESS (never packaged): the host JVM has no "AndroidKeyStore", so the production [KeystoreTokenStore] is exercised against
++ * an in-memory AES key provider of the same name. It proves the app's sign-in/token handling runs; it is not the hardware keystore.
++ */
++object FakeAndroidKeyStore {
++    private val keys = ConcurrentHashMap<String, SecretKey>()
++
++    class Store : KeyStoreSpi() {
++        override fun engineGetKey(alias: String?, password: CharArray?): Key? = alias?.let { keys[it] }
++        override fun engineGetCertificateChain(alias: String?): Array<Certificate>? = null
++        override fun engineGetCertificate(alias: String?): Certificate? = null
++        override fun engineGetCreationDate(alias: String?): Date? = null
++        override fun engineSetKeyEntry(alias: String?, key: Key?, password: CharArray?, chain: Array<out Certificate>?) {}
++        override fun engineSetKeyEntry(alias: String?, key: ByteArray?, chain: Array<out Certificate>?) {}
++        override fun engineSetCertificateEntry(alias: String?, cert: Certificate?) {}
++        override fun engineDeleteEntry(alias: String?) { alias?.let { keys.remove(it) } }
++        override fun engineAliases(): Enumeration<String> = Collections.enumeration(keys.keys.toList())
++        override fun engineContainsAlias(alias: String?): Boolean = alias != null && keys.containsKey(alias)
++        override fun engineSize(): Int = keys.size
++        override fun engineIsKeyEntry(alias: String?): Boolean = alias != null && keys.containsKey(alias)
++        override fun engineIsCertificateEntry(alias: String?): Boolean = false
++        override fun engineGetCertificateAlias(cert: Certificate?): String? = null
++        override fun engineStore(stream: OutputStream?, password: CharArray?) {}
++        override fun engineLoad(stream: InputStream?, password: CharArray?) {}
++    }
++
++    class Generator : KeyGeneratorSpi() {
++        private var alias = ""
++        override fun engineInit(random: SecureRandom?) { throw UnsupportedOperationException("a key spec is required") }
++        override fun engineInit(params: AlgorithmParameterSpec?, random: SecureRandom?) {
++            alias = (params as KeyGenParameterSpec).keystoreAlias
++        }
++        override fun engineInit(keysize: Int, random: SecureRandom?) { throw UnsupportedOperationException("a key spec is required") }
++        override fun engineGenerateKey(): SecretKey {
++            val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
++            keys[alias] = key
++            return key
++        }
++    }
++
++    fun install() {
++        Security.removeProvider("AndroidKeyStore")
++        Security.addProvider(object : Provider("AndroidKeyStore", 1.0, "scratch harness keystore") {
++            init {
++                put("KeyStore.AndroidKeyStore", Store::class.java.name)
++                put("KeyGenerator.AES", Generator::class.java.name)
++            }
++        })
++    }
++}
+diff --git a/b/phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneReplyAlertRoboTest.kt b/b/phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneReplyAlertRoboTest.kt
+new file mode 100644
+index 0000000..5767c78
+--- /dev/null
++++ b/phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneReplyAlertRoboTest.kt
+@@ -0,0 +1,263 @@
++package com.rumi.hermesvoice.phone
++
++import android.Manifest
++import android.app.Notification
++import android.app.NotificationManager
++import android.app.PendingIntent
++import android.content.Context
++import android.content.Intent
++import android.os.Looper
++import android.service.notification.StatusBarNotification
++import androidx.lifecycle.ViewModelProvider
++import com.google.android.gms.tasks.Tasks
++import com.google.android.gms.wearable.CapabilityClient
++import com.google.android.gms.wearable.CapabilityInfo
++import com.google.android.gms.wearable.ChannelClient
++import com.google.android.gms.wearable.DataClient
++import com.google.android.gms.wearable.MessageClient
++import com.google.android.gms.wearable.Wearable
++import com.rumi.hermesvoice.core.ChatSendResult
++import com.rumi.hermesvoice.core.FakeHermesDashboard
++import com.rumi.hermesvoice.core.auth.HermesBearerSession
++import io.mockk.every
++import io.mockk.mockk
++import io.mockk.mockkStatic
++import io.mockk.unmockkAll
++import java.time.Duration
++import kotlinx.coroutines.runBlocking
++import org.junit.After
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Before
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.Robolectric
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.RuntimeEnvironment
++import org.robolectric.Shadows.shadowOf
++import org.robolectric.android.controller.ActivityController
++import org.robolectric.annotation.Config
++import org.robolectric.annotation.LooperMode
++import org.robolectric.shadows.ShadowLog
++
++/**
++ * SCRATCH HARNESS (never packaged). The Phone's arrival alert for a text reply, through the REAL PhoneApp wiring (the production
++ * HermesVoiceCore against the contract double of the Hermes dashboard, a signed-in session), ChatService, the app's alert decision and
++ * notifier and the platform NotificationManager (Robolectric's), and the tap through the REAL MainActivity and PhoneViewModel (cold
++ * launch and a warm onNewIntent). It uses only names that exist without the feature (platform APIs and wire literals), so the same
++ * file runs on the immutable repair baseline. Simulated: the Data Layer (mockk), the hardware keystore (in-memory AES, see
++ * [FakeAndroidKeyStore]) and the system notification policy; no device, no Do Not Disturb, no vibration or sound is exercised.
++ */
++@RunWith(RobolectricTestRunner::class)
++@LooperMode(LooperMode.Mode.PAUSED)
++@Config(sdk = [34])
++class PhoneReplyAlertRoboTest {
++    private object Wire {
++        const val CHANNEL_ID = "reply_arrival"
++        const val TITLE = "New reply"
++        const val BODY = "A new reply is ready"
++        const val PUBLIC_TITLE = "Hermes Voice"
++        const val PUBLIC_BODY = "New reply"
++        const val ACTION_OPEN_REPLY = "com.rumi.hermesvoice.action.OPEN_REPLY"
++        const val EXTRA_SESSION_ID = "hv_reply_session"
++    }
++
++    private lateinit var app: PhoneApp
++    private lateinit var manager: NotificationManager
++    private lateinit var fake: FakeHermesDashboard
++    private var controller: ActivityController<MainActivity>? = null
++
++    private fun stubWearable() {
++        mockkStatic(Wearable::class)
++        val info = mockk<CapabilityInfo>()
++        every { info.nodes } returns emptySet()
++        every { info.name } returns "hermes_voice_watch"
++        val capability = mockk<CapabilityClient>()
++        every { capability.getCapability(any(), any()) } returns Tasks.forResult(info)
++        val messages = mockk<MessageClient>()
++        every { messages.sendMessage(any(), any(), any()) } returns Tasks.forResult(1)
++        val channels = mockk<ChannelClient>(relaxed = true)
++        val data = mockk<DataClient>(relaxed = true)
++        every { Wearable.getCapabilityClient(any<Context>()) } returns capability
++        every { Wearable.getMessageClient(any<Context>()) } returns messages
++        every { Wearable.getChannelClient(any<Context>()) } returns channels
++        every { Wearable.getDataClient(any<Context>()) } returns data
++        every { Wearable.getDataClient(any<android.app.Activity>()) } returns data
++    }
++
++    private fun idle(ms: Long = 50) = shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(ms))
++
++    /** Polls (bounded) until [done], letting the main looper and the app's own background work run; false if it never became true. */
++    private fun await(timeoutMs: Long = 8_000, done: () -> Boolean): Boolean {
++        val end = System.nanoTime() + timeoutMs * 1_000_000
++        while (true) {
++            idle(50)
++            if (done()) return true
++            if (System.nanoTime() > end) return false
++            Thread.sleep(25)
++        }
++    }
++
++    /** Failure context only: the screen's own state and its latest app log lines (counts and tags, no reply text exists in them). */
++    private fun why(): String {
++        val ui = runCatching { model().state.value }.getOrNull()
++        val logs = ShadowLog.getLogs().filter { it.type >= android.util.Log.INFO && it.tag.startsWith("HermesVoice") || it.type >= android.util.Log.WARN }
++            .takeLast(25).joinToString(" | ") { "${it.tag}:${it.msg.take(140)}${it.throwable?.let { t -> " [" + t.javaClass.simpleName + ": " + t.message?.take(120) + "]" } ?: ""}" }
++        return "selected=${ui?.selected?.storedSessionId} signedIn=${ui?.signedIn} conversations=${ui?.conversations?.size} status='${ui?.status}' pending=${runCatching { (app.javaClass.getMethod("getPendingOpen").invoke(app) as kotlinx.coroutines.flow.StateFlow<*>).value }.getOrNull()} logs=[$logs]"
++    }
++
++    private fun settle() = repeat(8) { idle(50); Thread.sleep(25) }
++
++    private fun alerts(): List<StatusBarNotification> = manager.activeNotifications.filter { it.notification.channelId == Wire.CHANNEL_ID }
++
++    @Before
++    fun setUp() {
++        // lifecycle keeps the first Application in a static default ViewModel factory; every test has its own Application.
++        ViewModelProvider.AndroidViewModelFactory::class.java.declaredFields
++            .filter { java.lang.reflect.Modifier.isStatic(it.modifiers) && it.type == ViewModelProvider.AndroidViewModelFactory::class.java }
++            .forEach { it.isAccessible = true; it.set(null, null) }
++        FakeAndroidKeyStore.install()
++        app = RuntimeEnvironment.getApplication() as PhoneApp
++        manager = app.getSystemService(NotificationManager::class.java)
++        shadowOf(app).grantPermissions(Manifest.permission.POST_NOTIFICATIONS)
++        stubWearable()
++        fake = FakeHermesDashboard()
++        app.settings.dashboardUrl = fake.baseUrl
++        app.tokens.save(HermesBearerSession(fake.accessToken, fake.refreshToken, null, "basic", "jun"))
++    }
++
++    @After
++    fun tearDown() {
++        runCatching { controller?.destroy() }
++        runCatching { fake.close() }
++        unmockkAll()
++    }
++
++    private fun conversation(alias: String, reply: String = "Done."): String {
++        val owned = runBlocking { app.wiring().core.sessions.createConversation(alias.replaceFirstChar { it.uppercase() }, alias, "$alias things") }
++        fake.scripts[owned.storedSessionId] = { listOf(FakeHermesDashboard.complete(reply)) }
++        return owned.storedSessionId
++    }
++
++    private fun chat(session: String, text: String) {
++        assertTrue(runBlocking { app.wiring().core.chat.send(session, text) } is ChatSendResult.Replied)
++    }
++
++    private fun open(intent: Intent? = null) {
++        controller = Robolectric.buildActivity(MainActivity::class.java, intent ?: Intent(app, MainActivity::class.java)).create()
++        idle(300)
++    }
++
++    private fun model() = ViewModelProvider(controller!!.get())[PhoneViewModel::class.java]
++
++    private fun selected() = model().state.value.selected?.storedSessionId
++
++    private fun tapIntent(n: Notification): Intent = shadowOf(n.contentIntent).savedIntent
++
++    private fun literalTap(session: String, identity: String = "chat-x#reply") = Intent(app, MainActivity::class.java)
++        .setAction(Wire.ACTION_OPEN_REPLY).putExtra(Wire.EXTRA_SESSION_ID, session)
++        .setData(android.net.Uri.parse("hermesvoice://reply/$session?r=$identity"))
++
++    @Test fun P01_theAppCreatesTheReplyChannelWithTheSystemsDefaultAlertAndAPrivateLockScreen() {
++        val channel = manager.getNotificationChannel(Wire.CHANNEL_ID)
++        assertNotNull("the reply channel exists", channel)
++        assertEquals(NotificationManager.IMPORTANCE_DEFAULT, channel.importance)
++        assertEquals(Notification.VISIBILITY_PRIVATE, channel.lockscreenVisibility)
++    }
++
++    @Test fun P02_aTextReplyThroughTheRealPhoneWiringShowsOneGenericPrivateAlert() {
++        val work = conversation("work")
++        chat(work, "hello")
++        assertTrue("the alert arrived", await { alerts().isNotEmpty() })
++        settle()
++        val shown = alerts().single()
++        assertTrue(shown.tag, shown.tag.startsWith("chat-") && shown.tag.endsWith("#reply"))
++        val n = shown.notification
++        assertEquals(Wire.TITLE, n.extras.getString(Notification.EXTRA_TITLE))
++        assertEquals(Wire.BODY, n.extras.getCharSequence(Notification.EXTRA_TEXT)?.toString())
++        assertTrue("dismissed on tap", n.flags and Notification.FLAG_AUTO_CANCEL != 0)
++        assertEquals("not local-only: the paired system may bridge it", 0, n.flags and Notification.FLAG_LOCAL_ONLY)
++        assertEquals(Notification.VISIBILITY_PRIVATE, n.visibility)
++        assertEquals(Wire.PUBLIC_TITLE, n.publicVersion.extras.getString(Notification.EXTRA_TITLE))
++        assertEquals(Wire.PUBLIC_BODY, n.publicVersion.extras.getCharSequence(Notification.EXTRA_TEXT)?.toString())
++        assertTrue("no reply text on the lock screen or in the alert", !n.extras.toString().contains("Done."))
++        assertTrue(shadowOf(n.contentIntent).isActivity)
++        assertTrue(shadowOf(n.contentIntent).flags and PendingIntent.FLAG_IMMUTABLE != 0)
++        val intent = tapIntent(n)
++        assertEquals(Wire.ACTION_OPEN_REPLY, intent.action)
++        assertEquals(MainActivity::class.java.name, intent.component?.className)
++        assertEquals(work, intent.getStringExtra(Wire.EXTRA_SESSION_ID))
++    }
++
++    @Test fun P03_twoRepliesWithIdenticalTextAreTwoAlerts_andLoadingHistoryNeverAlerts() {
++        val work = conversation("work", "Same text.")
++        runBlocking { app.wiring().core.sessions.history(work) }
++        settle()
++        assertTrue("old history is not an arrival", alerts().isEmpty())
++        chat(work, "hello")
++        chat(work, "hello again")
++        assertTrue("two alerts", await { alerts().size >= 2 })
++        settle()
++        assertEquals(2, alerts().map { it.tag }.toSet().size)
++    }
++
++    @Test fun P04_aFailedTextSendNeverAlerts() {
++        val work = conversation("work")
++        fake.scripts[work] = { listOf(FakeHermesDashboard.complete("partial", "interrupted")) }
++        runBlocking { app.wiring().core.chat.send(work, "hello") }
++        settle()
++        assertTrue(alerts().isEmpty())
++    }
++
++    @Test fun P05_theTapFromTheShownAlertOpensItsConversationInTheRealScreen() {
++        val work = conversation("work")
++        chat(work, "hello")
++        assertTrue("the alert arrived", await { alerts().isNotEmpty() })
++        val intent = tapIntent(alerts().single().notification)
++        val autoNavigate = app.settings.autoNavigateToRouted
++        val routing = app.settings.routingEnabled
++        open(intent)
++        assertTrue("the conversation is open ${why()}", await { selected() == work })
++        assertEquals("the optional auto-switch preference is untouched", autoNavigate, app.settings.autoNavigateToRouted)
++        assertEquals(routing, app.settings.routingEnabled)
++    }
++
++    @Test fun P06_aColdTapNamingAnOwnedConversationOpensIt() {
++        val first = conversation("work")
++        val second = conversation("home")
++        open(literalTap(second))
++        assertTrue("the named conversation is open, not another ${why()}", await { selected() == second })
++    }
++
++    @Test fun P07_aWarmTapSwitchesTheRunningScreenToTheNamedConversation() {
++        val first = conversation("work")
++        val second = conversation("home")
++        open(literalTap(first))
++        assertTrue("the cold tap opened the first ${why()}", await { selected() == first })
++        val autoNavigate = app.settings.autoNavigateToRouted
++        val warm = literalTap(second, "chat-y#reply")
++        controller!!.newIntent(warm)
++        assertTrue("the running screen shows the other conversation ${why()}", await { selected() == second })
++        assertEquals(autoNavigate, app.settings.autoNavigateToRouted)
++        assertNull("the tapped intent is spent", warm.action)
++    }
++
++    @Test fun P08_aTamperedOrForeignTapOpensNothing() {
++        val work = conversation("work")
++        open()
++        assertTrue(await { model().state.value.signedIn })
++        val tampered = listOf(
++            literalTap(work).setAction("android.intent.action.VIEW"),
++            literalTap("../../x"),
++            literalTap("20260101_130000_ghost000"),
++            Intent(app, MainActivity::class.java).setAction(Wire.ACTION_OPEN_REPLY),
++        )
++        for (intent in tampered) {
++            controller!!.newIntent(intent)
++            settle()
++            assertNull(selected())
++        }
++    }
++}

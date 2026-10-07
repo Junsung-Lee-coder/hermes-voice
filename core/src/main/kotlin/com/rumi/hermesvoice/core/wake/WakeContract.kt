@@ -38,6 +38,12 @@ object WakeContract {
      */
     const val BACKGROUND_WINDOW_MS = 30_000L
 
+    /**
+     * How long a standby wake whose device may not listen with the screen off (its own screen-off preference is off) waits
+     * for the phrase after one screen activation, in all: see [ScreenActivationBudget].
+     */
+    const val SCREEN_ON_BUDGET_MS = 5_000L
+
     /** Quiet time after the last change of a pending partial before the window gives up. */
     const val PENDING_INACTIVITY_MS = 8_000L
 
@@ -52,6 +58,12 @@ object WakeContract {
 
     /** How long a wake claim lasts without renewal (see [WakeAdmission]). */
     const val CLAIM_TTL_MS = 10_000L
+
+    /**
+     * How long after "Listen on" starts selecting both devices the Phone still admits ONE claimless wake turn from a device that had
+     * accepted it alone, before (see [WakeAdmission.settingsChanged]): recording, upload and queueing of one request.
+     */
+    const val ACCEPTED_ALONE_GRACE_MS = 300_000L
 
     /** How often the holder renews its claim while it listens, hands off, records and (Watch) waits for the Phone's answer. */
     const val CLAIM_RENEW_MS = 3_000L
@@ -148,6 +160,18 @@ class WakeSession(
     @Synchronized
     fun deadline(): Long = deadlineMs
 
+    /** A leading wake phrase was heard in a partial result: the window is waiting for its final. */
+    @Synchronized
+    fun hasPending(): Boolean = generation != null && pending != null
+
+    /** Pulls an idle window's deadline in to [limitMs] (never one that heard a leading phrase); true when it moved. */
+    @Synchronized
+    fun clipDeadline(limitMs: Long): Boolean {
+        if (generation == null || pending != null || deadlineMs <= limitMs) return false
+        deadlineMs = limitMs
+        return true
+    }
+
     /** No final result: a phrase-only partial may still cue a second utterance; words are never sent. */
     private fun expire(reason: String): WakeOutcome = when {
         pending == null -> close(WakeOutcome.Closed(reason))
@@ -162,7 +186,7 @@ class WakeSession(
     }
 }
 
-enum class WakeBlock { DISABLED, NOT_FOREGROUND, PERMISSION, MICROPHONE_MUTED, BUSY, PHONE_UNREACHABLE, COOLDOWN, ALREADY_ARMED, UNAVAILABLE }
+enum class WakeBlock { DISABLED, NOT_FOREGROUND, PERMISSION, MICROPHONE_MUTED, BUSY, PHONE_UNREACHABLE, COOLDOWN, SCREEN_BUDGET, ALREADY_ARMED, UNAVAILABLE }
 
 data class WakeArmInputs(
     val enabled: Boolean,
@@ -178,6 +202,8 @@ data class WakeArmInputs(
     val cooldownUntilMs: Long,
     val generation: Long,
     val lastArmedGeneration: Long?,
+    /** The screen activation's budget is spent: a standby that may not listen with the screen off opens nothing more until the next activation. */
+    val screenBudgetExhausted: Boolean = false,
 )
 
 /** Whether a wake window may open now; the first failing gate, or null when it may. */
@@ -190,6 +216,7 @@ object WakeArmGate {
         !inputs.talkIdle -> WakeBlock.BUSY
         inputs.phoneReachable == false -> WakeBlock.PHONE_UNREACHABLE
         inputs.nowMs < inputs.cooldownUntilMs -> WakeBlock.COOLDOWN
+        inputs.screenBudgetExhausted -> WakeBlock.SCREEN_BUDGET
         inputs.lastArmedGeneration == inputs.generation -> WakeBlock.ALREADY_ARMED
         else -> null
     }
@@ -279,6 +306,14 @@ class WakeWindowCoordinator(
 
     /** The open window's deadline (see [WakeSession.deadline]). */
     fun deadline(): Long = session.deadline()
+
+    /** The open window heard a leading wake phrase and waits for its final. */
+    val hasPending: Boolean get() = session.hasPending()
+
+    /** Pulls the open window's deadline in to [limitMs] unless it heard a leading phrase, and re-times it. */
+    fun clipIdle(limitMs: Long) {
+        if (session.clipDeadline(limitMs)) timer.schedule((session.deadline() - clock()).coerceAtLeast(0L))
+    }
 
     private fun resolve(outcome: WakeOutcome) {
         when (outcome) {

@@ -164,6 +164,8 @@ class WatchVoiceCoordinator(
     fun attach(controller: WakeDeviceController) {
         wake = controller
         presence = WakePresence(controller, presencePort, followsVisibility = true)
+        // First sighting of the device's own screen: the budget of an already interactive screen starts here.
+        presence.observeScreen()
         publish()
     }
 

@@ -39,6 +39,9 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -178,6 +181,11 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { app.playbackDevice.collect { device -> _state.update { it.copy(playbackDevice = device) } } }
         // "Open the routed conversation": only requests made while this screen exists (never a replayed old one).
         viewModelScope.launch { app.routedOpen.collect { storedSessionId -> openRouted(storedSessionId) } }
+        // A tapped arrival alert: open exactly that conversation once this screen is signed in (kept until then; not the routed preference).
+        viewModelScope.launch {
+            combine(app.pendingOpen, _state.map { it.signedIn }.distinctUntilChanged()) { id, signedIn -> id.takeIf { signedIn } }
+                .collect { id -> if (id != null) openFromReplyAlert(id) }
+        }
         // A voice turn (from the Phone or the Watch) created a conversation: show it.
         viewModelScope.launch { app.conversationsCreated.collect { count -> if (count > 0 && _state.value.signedIn) refresh() } }
         viewModelScope.launch { app.relayStatus.collect { relay -> _state.update { it.copy(relay = relay) } } }
@@ -363,6 +371,16 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         val owned = wiring.core.sessions.activeConversation(storedSessionId) ?: return
         Log.i(TAG, "routed conversation opened alias=${owned.alias}")
         if (_state.value.selected?.storedSessionId != storedSessionId) open(owned)
+        _state.update { it.copy(chatOpenRequest = it.chatOpenRequest + 1) }
+    }
+
+    /** A tapped arrival alert's conversation: opened if it is one of this app's own (anything else is dropped), then forgotten. */
+    private fun openFromReplyAlert(storedSessionId: String) {
+        val wiring = wiringOrStatus() ?: return
+        app.consumePendingOpen(storedSessionId)
+        val owned = wiring.core.sessions.activeConversation(storedSessionId) ?: return
+        Log.i(TAG, "reply alert conversation opened alias=${owned.alias}")
+        if (_state.value.selected?.storedSessionId != storedSessionId) open(owned) else reloadSelected()
         _state.update { it.copy(chatOpenRequest = it.chatOpenRequest + 1) }
     }
 

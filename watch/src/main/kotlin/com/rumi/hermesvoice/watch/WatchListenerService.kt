@@ -71,6 +71,10 @@ class WatchListenerService : WearableListenerService() {
                 val data = event.data
                 app.scope.launch { app.onNavigation(source, data) }
             }
+            WatchLinkPaths.REPLY -> {
+                val data = event.data
+                app.scope.launch { app.onReplyAlert(data) }
+            }
             WatchLinkPaths.READER_RESPONSE -> {
                 val source = event.sourceNodeId
                 val data = event.data

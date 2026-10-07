@@ -1,6 +1,7 @@
 package com.rumi.hermesvoice.phone
 
 import android.Manifest
+import com.rumi.hermesvoice.core.notify.ReplyAlertContent
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
@@ -301,6 +302,8 @@ class MainActivity : ComponentActivity() {
             }
         }
         if (model.state.value.signedIn) model.refresh()
+        // A tapped arrival alert starts the app (cold or from the task): only a fresh launch intent counts, never a restored one.
+        if (savedInstanceState == null) handleReplyAlertIntent(intent)
         handleQaIntent(intent, restored = savedInstanceState != null)
     }
 
@@ -352,7 +355,16 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        handleReplyAlertIntent(intent)
         handleQaIntent(intent, restored = false)
+    }
+
+    /** A tapped arrival alert names one conversation; the screen opens it (see [PhoneApp.pendingOpen]). Not the routed preference. */
+    private fun handleReplyAlertIntent(intent: Intent?) {
+        val session = ReplyAlertContent.sessionOf(intent?.action, intent?.getStringExtra(ReplyAlertContent.EXTRA_SESSION_ID)) ?: return
+        PhoneApp.from(this).requestOpenConversation(session)
+        // Consumed: a recreation of this activity must not open it again.
+        intent?.action = null
     }
 
     private fun hasMic() = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
@@ -721,6 +733,9 @@ private fun ChatTab(state: PhoneUiState, model: PhoneViewModel) {
         return
     }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let(model::addAttachment) }
+    val appContext = androidx.compose.ui.platform.LocalContext.current
+    // The first text send asks, visibly, whether a reply that is not spoken may alert; the message is sent whatever the answer.
+    val replyAlertPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { model.send() }
     ChatPane(
         sessionKey = selected.storedSessionId,
         history = state.history,
@@ -730,7 +745,9 @@ private fun ChatTab(state: PhoneUiState, model: PhoneViewModel) {
         sending = state.sending,
         onLoadOlder = model::loadOlder,
         onDraft = model::setDraft,
-        onSend = model::send,
+        onSend = {
+            if (PhoneApp.from(appContext).askReplyAlertsOnce()) replyAlertPermission.launch(Manifest.permission.POST_NOTIFICATIONS) else model.send()
+        },
         onAttach = { picker.launch(arrayOf("*/*")) },
         onRemoveAttachment = model::removeAttachment,
     )
@@ -899,10 +916,6 @@ internal fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerA
         SwitchRow("Watch haptics", state.watch.hapticsEnabled) { model.updateWatch(state.watch.copy(hapticsEnabled = it)) }
 
         HorizontalDivider()
-        SectionTitle("Waiting for replies", SettingsHelp.waiting())
-        Text("You can speak a new request while earlier ones wait. Stop ends only the request it belongs to.", style = MaterialTheme.typography.bodyMedium)
-
-        HorizontalDivider()
         DiagnosticsRow()
 
         HorizontalDivider()
@@ -934,12 +947,12 @@ internal fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerA
                     label = { Text(location.label) }, modifier = Modifier.testTag("wake_${location.name.lowercase()}"))
             }
         }
-        // On-screen listening follows "Listen on" alone; a device's standby switch only governs it with its app hidden (see PhoneBackgroundWakeRow).
+        // "Listen on" selects the device in the foreground and the background; a standby switch is an extra condition with the app hidden (see PhoneBackgroundWakeRow).
         val phoneListens = state.watch.listensIn(VoiceOrigin.PHONE, WakeGate.FOREGROUND)
         val watchListens = state.watch.listensIn(VoiceOrigin.WATCH, WakeGate.FOREGROUND)
         Text(
             when {
-                !phoneListens -> "Phone: not listening while the app is open" + if (state.watch.phoneBackgroundWakeEnabled) " (background standby below is on)" else ""
+                !phoneListens -> "Phone: not listening (not selected in Listen on)" + if (state.watch.phoneBackgroundWakeEnabled) "; its background standby below has no effect" else ""
                 !recognizerAvailable -> "Phone: unavailable, this phone has no speech recognizer"
                 !micGranted -> "Phone: needs the microphone permission (tap Talk once to grant it)"
                 !state.signedIn -> "Phone: sign in to Hermes first"
@@ -951,7 +964,7 @@ internal fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerA
         )
         Text(
             when {
-                !watchListens -> "Watch: not listening while its app is open" + if (state.watch.watchBackgroundWakeEnabled) " (background standby below is on)" else ""
+                !watchListens -> "Watch: not listening (not selected in Listen on)" + if (state.watch.watchBackgroundWakeEnabled) "; its background standby below has no effect" else ""
                 state.watchReachable == false -> "Watch: app not reachable; it applies this when it syncs"
                 else -> "Watch: listens for ${WakeContract.WINDOW_MS / 1000} s each time the Watch app opens; the Watch shows if it has no recognizer"
             },
@@ -1123,8 +1136,8 @@ private fun ScreenOffRow(label: String, checked: Boolean, masterOn: Boolean, dev
     Text(
         when {
             !masterOn -> "$device standby is off: no effect now. Your choice (${if (checked) "on" else "off"}) is kept."
-            checked -> "$device recognition may continue with its screen off (requested only)."
-            else -> "$device pauses listening while its own screen is off."
+            checked -> "$device recognition continues, also with its screen off (requested only)."
+            else -> "$device listens for the wake phrase for 5 seconds after its own screen turns on."
         },
         style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = Modifier.testTag(tag + "_note"),

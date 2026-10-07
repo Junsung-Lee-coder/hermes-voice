@@ -171,24 +171,24 @@ data class WatchSettings(
     }
 
     /**
-     * Whether [device] waits for the wake phrase hidden (background): its standby switch, and while ITS OWN screen is not
-     * interactive also its screen-off preference. [screenInteractive] is that device's own screen only.
+     * Whether [device] waits for the wake phrase hidden (background): "Listen on" selects it, its standby switch is on, and while
+     * ITS OWN screen is not interactive also its screen-off preference. [screenInteractive] is that device's own screen only.
      */
     fun standbyListens(device: VoiceOrigin, screenInteractive: Boolean): Boolean =
-        backgroundWakeEnabled(device) && (screenInteractive || backgroundScreenOffEnabled(device))
+        wakeLocation.listensOn(device) && backgroundWakeEnabled(device) && (screenInteractive || backgroundScreenOffEnabled(device))
 
-    /** Whether [device] waits for the wake phrase under [gate]: the foreground location alone, or its own standby switch alone. */
+    /** Whether [device] waits for the wake phrase under [gate]: "Listen on" selects it, and in the standby its own standby switch is on too. */
     fun listensIn(device: VoiceOrigin, gate: WakeGate): Boolean = when (gate) {
         WakeGate.FOREGROUND -> wakeLocation.listensOn(device)
-        WakeGate.STANDBY -> backgroundWakeEnabled(device)
+        WakeGate.STANDBY -> wakeLocation.listensOn(device) && backgroundWakeEnabled(device)
     }
 
     /**
-     * Whether [device] may wait for the wake phrase in EITHER mode (on screen under [wakeLocation], or hidden under its
-     * standby switch). Only for deciding whether two devices could hear one phrase, so a claim is needed (arbitration);
-     * it is never the gate that opens a window (that is [listensIn] for the device's current mode).
+     * Whether [device] may wait for the wake phrase at all: "Listen on" ([wakeLocation]) selects it, the master gate in the
+     * foreground and in the background alike. Only for deciding whether two devices could hear one phrase, so a claim is needed
+     * (arbitration); it is never the gate that opens a window (that is [listensIn] for the device's current mode).
      */
-    fun mayListen(device: VoiceOrigin): Boolean = wakeLocation.listensOn(device) || backgroundWakeEnabled(device)
+    fun mayListen(device: VoiceOrigin): Boolean = wakeLocation.listensOn(device)
 
     /** Both devices may hear one spoken phrase, so a wake episode must be admitted from one of them (see WakeAdmission). */
     val arbitrationRequired: Boolean get() = mayListen(VoiceOrigin.PHONE) && mayListen(VoiceOrigin.WATCH)
@@ -398,6 +398,7 @@ class AppSettings(private val store: KeyValueStore) {
     /** Saves all shared voice settings as one snapshot with a strictly increasing revision, and returns it. */
     @Synchronized
     fun saveWatchSettings(settings: WatchSettings, nowMs: Long = System.currentTimeMillis()): WatchSettings {
+        val before = watchSettings()
         wakeLocation = settings.wakeLocation
         watchWakePatterns = settings.wakePatterns
         watchHapticsEnabled = settings.hapticsEnabled
@@ -415,8 +416,11 @@ class AppSettings(private val store: KeyValueStore) {
             ).toJson(),
         )
         store.putString(KEY_WATCH_REVISION, revision.toString())
-        return watchSettings()
+        return watchSettings().also { onWatchSettingsSaved(before, it) }
     }
+
+    /** Told after every [saveWatchSettings] with the snapshot it replaced and the one it saved (the Phone's wake arbitration reads the change). */
+    @Volatile var onWatchSettingsSaved: (before: WatchSettings, after: WatchSettings) -> Unit = { _, _ -> }
 
     /** Phone appearance; DARK unless the user picks another mode. Unknown stored values read as DARK. */
     var themeMode: ThemeMode
