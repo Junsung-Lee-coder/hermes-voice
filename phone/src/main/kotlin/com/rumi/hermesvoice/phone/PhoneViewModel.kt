@@ -69,8 +69,10 @@ data class PhoneUiState(
     val playbackDevice: VoiceOrigin? = null,
     /** Whether the Watch app is reachable over the Data Layer; null until checked. */
     val watchReachable: Boolean? = null,
-    /** A Phone voice turn is being sent, answered or played. */
+    /** A Phone voice turn is being SENT (recorded audio on its way, its acknowledgement); waiting for a reply is [pending], not busy. */
     val voiceBusy: Boolean = false,
+    /** The accepted voice requests (either device) that are not finished: sending, queued, waiting for a reply or speaking it. */
+    val pending: List<com.rumi.hermesvoice.core.voice.PendingTurn> = emptyList(),
     /** The Phone's hands-free state: listening for the wake phrase, or recording the request after it. */
     val handsFree: HandsFree = HandsFree.IDLE,
     /** Bumped for each recording start/end haptic of a hands-free request (the activity plays it). */
@@ -85,6 +87,10 @@ data class PhoneUiState(
     val chatOpenRequest: Long = 0,
     /** Speak later replies (Settings; informed opt-in, off by default). */
     val speakLater: Boolean = false,
+    /** How long a delivered turn keeps being followed for later replies (Settings; Phone-owned minutes, 1–4320, default 30). */
+    val laterReplyWindowMinutes: Int = com.rumi.hermesvoice.core.settings.LaterReplyWindow.DEFAULT_MINUTES,
+    /** Why the last typed later-reply duration was refused (null when it was accepted or nothing was typed). */
+    val laterReplyWindowError: String? = null,
     /** The opt-in background listening for the wake phrase as it really is now (see [PhoneBackgroundRuntime]). */
     val phoneWake: com.rumi.hermesvoice.core.background.PhoneWakeStatus? = null,
 )
@@ -175,13 +181,14 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         // A voice turn (from the Phone or the Watch) created a conversation: show it.
         viewModelScope.launch { app.conversationsCreated.collect { count -> if (count > 0 && _state.value.signedIn) refresh() } }
         viewModelScope.launch { app.relayStatus.collect { relay -> _state.update { it.copy(relay = relay) } } }
-        viewModelScope.launch { app.phoneWake.status.collect { wake -> _state.update { it.copy(phoneWake = wake) } } }
+        viewModelScope.launch { app.phoneWake.status.collect { wake -> _state.update { it.copy(phoneWake = wake, watch = app.settings.watchSettings()) } } }
         // A request heard with the app closed: its result shows here when the app is opened.
         viewModelScope.launch { app.phoneWake.notice.collect { line -> if (line != null) _state.update { it.copy(voiceStatus = line) } } }
         // A later reply of a delivered request (a background completion) was spoken, or couldn't be.
         viewModelScope.launch { app.laterReplies.collect { line -> if (line != null) _state.update { it.copy(voiceStatus = line) } } }
         // Phone voice turns run in the application, so one started before this screen was (re)created still counts as busy.
         viewModelScope.launch { app.phoneTurns.collect { running -> _state.update { it.copy(voiceBusy = running > 0) } } }
+        viewModelScope.launch { app.pendingTurns.collect { list -> _state.update { it.copy(pending = list) } } }
         refreshWatchStatus()
     }
 
@@ -196,6 +203,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         routingEnabled = app.settings.routingEnabled,
         autoNavigate = app.settings.autoNavigateToRouted,
         speakLater = app.laterConsent.enabled,
+        laterReplyWindowMinutes = app.settings.laterReplyWindowMinutes,
     )
 
     private fun wiringOrStatus(): PhoneApp.Wiring? = try {
@@ -490,8 +498,8 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Runs one Phone voice turn; [PhoneUiState.voiceBusy] holds while it is sent, answered and
-     * played. The turn belongs to the application ([PhoneApp.launchTurn]), not to this screen:
+     * Runs one Phone voice turn; [PhoneUiState.voiceBusy] holds while it is sent (not while it waits for its reply: the
+     * request then shows in [PhoneUiState.pending] and a new one may start). The turn belongs to the application ([PhoneApp.launchTurn]), not to this screen:
      * leaving or recreating the screen does not end it. The orchestrator takes [microphone] over
      * when it starts the turn; a turn that never ran gives it back when its job ends.
      */
@@ -517,6 +525,11 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // ── phone hands-free (wake phrase) ───────────────────────────────────────────────────────
+
+    /** Stops ONE pending request (the pending list's Stop); the global Stop (relay, later replies) is separate and unchanged. */
+    fun stopPending(turnId: String) {
+        if (!app.stopPendingTurn(turnId)) _state.update { it.copy(voiceStatus = "That request already ended") }
+    }
 
     /** Nothing on the Phone owns the microphone or speaker: the wake phrase may listen. */
     fun voiceIdle(): Boolean = captureIdle() &&
@@ -640,10 +653,37 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(routingEnabled = on) }
     }
 
-    /** The user's switch for background listening, from the visible app only (refused otherwise). Off ends everything now. */
+    /**
+     * The Phone's background wake standby switch. The request is saved first (and sent to the Watch as part of the shared
+     * settings), then the session follows from this visible screen. Off ends the standby session and its scheduled work; it
+     * does not cut a recording, an upload, a transfer or playback.
+     */
     fun setPhoneBackgroundWake(on: Boolean) {
-        val status = if (on) app.phoneWake.start() else app.phoneWake.stop()
-        Log.i(TAG, "phone background listening ${if (on) "start" else "stop"} requested notice=${status.notice}")
+        val current = _state.value.watch
+        if (current.phoneBackgroundWakeEnabled != on) updateWatch(current.copy(phoneBackgroundWakeEnabled = on))
+        val status = if (on) app.phoneWake.start() else app.phoneWake.standbyOff()
+        Log.i(TAG, "phone background wake standby ${if (on) "on" else "off"} requested notice=${status.notice}")
+    }
+
+    /** The Watch's background wake standby switch: saved on the Phone and sent to the Watch (which only mirrors it). */
+    fun setWatchBackgroundWake(on: Boolean) {
+        val current = _state.value.watch
+        if (current.watchBackgroundWakeEnabled != on) updateWatch(current.copy(watchBackgroundWakeEnabled = on))
+    }
+
+    /**
+     * The Phone's "background wake recognition with screen off" preference: saved with the other settings as one snapshot and
+     * sent to the Watch (a mirror). It never turns the standby on, and is kept while the standby is off.
+     */
+    fun setPhoneBackgroundWakeScreenOff(on: Boolean) {
+        val current = _state.value.watch
+        if (current.phoneBackgroundWakeScreenOffEnabled != on) updateWatch(current.copy(phoneBackgroundWakeScreenOffEnabled = on))
+    }
+
+    /** The Watch's "background wake recognition with screen off" preference: saved on the Phone and sent to the Watch (which only mirrors it). */
+    fun setWatchBackgroundWakeScreenOff(on: Boolean) {
+        val current = _state.value.watch
+        if (current.watchBackgroundWakeScreenOffEnabled != on) updateWatch(current.copy(watchBackgroundWakeScreenOffEnabled = on))
     }
 
     /** A permission answer came back: background listening re-checks the platform's state. */
@@ -657,6 +697,37 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         app.laterConsent.enabled = on
         if (!on) app.stopLaterReplies()
         _state.update { it.copy(speakLater = on) }
+    }
+
+    /**
+     * Commits a typed later-reply duration (on Done or when the field loses focus). A refused entry is not saved and is explained;
+     * the stored value is unchanged. Never touches the later-reply opt-in: the duration is not consent.
+     */
+    fun commitLaterReplyWindow(text: String, unit: com.rumi.hermesvoice.core.settings.LaterReplyWindow.Unit): Boolean =
+        when (val entry = com.rumi.hermesvoice.core.settings.LaterReplyWindow.fromEntry(text, unit)) {
+            is com.rumi.hermesvoice.core.settings.LaterReplyWindow.Entry.Valid -> {
+                setLaterReplyWindowMinutes(entry.minutes)
+                true
+            }
+            is com.rumi.hermesvoice.core.settings.LaterReplyWindow.Entry.Invalid -> {
+                _state.update { it.copy(laterReplyWindowError = entry.reason) }
+                false
+            }
+        }
+
+    /** A preset or a committed value; only a valid minute count is stored. It applies to turns delivered afterwards. */
+    fun setLaterReplyWindowMinutes(minutes: Int) {
+        val valid = com.rumi.hermesvoice.core.settings.LaterReplyWindow.validOrNull(minutes) ?: return
+        if (valid != app.settings.laterReplyWindowMinutes) app.settings.laterReplyWindowMinutes = valid
+        _state.update { it.copy(laterReplyWindowMinutes = valid, laterReplyWindowError = null) }
+    }
+
+    fun clearLaterReplyWindowError() = _state.update { it.copy(laterReplyWindowError = null) }
+
+    /** Whether a delivered Watch-originated routed request moves the Watch's selection: Phone-owned, saved and sent with the other Watch settings. */
+    fun setWatchAutoNavigate(on: Boolean) {
+        val current = _state.value.watch
+        if (current.watchAutoNavigateToRouted != on) updateWatch(current.copy(watchAutoNavigateToRouted = on))
     }
 
     fun setAutoNavigate(on: Boolean) {

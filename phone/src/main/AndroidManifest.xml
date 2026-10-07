@@ -69,6 +69,24 @@
             android:exported="false"
             android:foregroundServiceType="microphone|mediaPlayback" />
 
+        <!-- Not exported: brings the next wake window of the hidden background listening after a gap that holds no wake
+             lock (one non-exact alarm; no exact-alarm permission). -->
+        <receiver
+            android:name=".StandbyAlarmReceiver"
+            android:exported="false" />
+
+        <!-- Not exported: hands the user-started diagnostics report (a file in this app's cache "diag/" folder) to the
+             share sheet the user picks, as a one-time read-only grant for that one file. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.diagshare"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/diag_share_paths" />
+        </provider>
+
         <service
             android:name=".PhoneWatchListenerService"
             android:exported="true">
@@ -82,11 +100,23 @@
             </intent-filter>
             <intent-filter>
                 <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
+                <data android:scheme="wear" android:host="*" android:path="/hv/v1/play_progress" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
                 <data android:scheme="wear" android:host="*" android:path="/hv/v1/reader/request" />
             </intent-filter>
             <intent-filter>
                 <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
                 <data android:scheme="wear" android:host="*" android:path="/hv/v1/wake/claim" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
+                <data android:scheme="wear" android:host="*" android:path="/hv/v1/cancel" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
+                <data android:scheme="wear" android:host="*" android:path="/hv/v1/diag/response" />
             </intent-filter>
         </service>
     </application>

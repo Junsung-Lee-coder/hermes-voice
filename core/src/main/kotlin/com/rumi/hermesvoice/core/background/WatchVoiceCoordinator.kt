@@ -42,7 +42,11 @@ interface WatchVoiceHost {
     /** The Phone-owned settings as the Watch holds them now. */
     fun settings(): WatchSettings
 
-    /** Runs [WatchVoiceCoordinator.onRearmTimer] after [delayMs], replacing any earlier one. */
+    /**
+     * Runs [WatchVoiceCoordinator.onRearmDue] after [delayMs], replacing any earlier one. The gap holds no wake lock, so the
+     * host must back the wait with something that survives a sleeping CPU (the Watch: a non-exact alarm), and must run
+     * [WatchVoiceCoordinator.onRearmDue] at most once per scheduled gap.
+     */
     fun scheduleRearm(delayMs: Long)
     fun cancelRearm()
 
@@ -54,6 +58,9 @@ interface WatchVoiceHost {
 
     fun statusChanged(status: WatchVoiceStatus)
     fun log(line: String) {}
+
+    /** A recording (push-to-talk or a hands-free request) is under way now. */
+    fun recordingActive(): Boolean = false
 }
 
 /**
@@ -72,11 +79,21 @@ interface WatchVoiceHost {
  *   new show's read is pending.
  * - A session never says it listens while its loop can't: a microphone the platform grants to a
  *   hidden app is dropped again, and a loop that stops (no recognizer) narrows the session to replies.
- * - While armed, some finite hold covers every step that can be under way with the screen off:
- *   the open window up to its deadline, the gap from the recognizer's release to the recorder
- *   (handoff pause, claim answer), and the gap between windows including the reachability check.
- *   A new hold is taken before the one it replaces is let go. The recorder, the transfer and
- *   playback take their own holds.
+ * - While armed, a finite hold covers each step that is under way with the screen off: the open
+ *   window up to its deadline, and the gap from the recognizer's release to the recorder (handoff
+ *   pause, claim answer). The idle gap between two windows holds nothing: the host's timer (an
+ *   alarm) brings the next window, which is a lower duty cycle than a held CPU. A new hold is
+ *   taken before the one it replaces is let go. The recorder, the transfer and playback take their own holds.
+ * - Standby is the Phone-owned switch [WatchSettings.watchBackgroundWakeEnabled]: it alone decides whether the
+ *   session may arm its microphone. Turned off, the idle listening ends at once (window, timers, holds, a wake
+ *   phrase not yet accepted for recording) while the session itself keeps running for replies; a recording
+ *   under way (push-to-talk or hands-free) is never cut: the microphone is given back when it ends ([onIdle]).
+ *   Turned on while hidden it is only requested: the microphone arms at the next real visit. The standby is background
+ *   only ([WakePresence] moves the wake flow between its two gates): with the app shown and the screen on, the Phone's wake
+ *   location alone decides whether the Watch listens (an armed session whose location excludes the Watch listens only once the
+ *   app is hidden or the screen goes off), and the standby never opens a foreground window the location excludes.
+ * - The Phone's reachability is a cached fact the host reports as an event ([onReachabilityChanged]); a window
+ *   blocked by an unreachable Phone is retried with a doubling bounded wait and opened at once when it returns.
  * - Background operation is on by default ([ensureDefault]): every real open of the app starts it
  *   once, from the visible app; the user's Stop holds until the next real open ([onUserOpened]).
  *   A start is only a request ([BackgroundPort.confirmsEntry]): the microphone is armed, and the
@@ -126,6 +143,9 @@ class WatchVoiceCoordinator(
     private var triedThisOpen = false
     private var last: WatchVoiceStatus? = null
 
+    /** Standby was turned off with the app hidden while a recording is under way: the microphone is given back when it ends. */
+    private var disarmPending = false
+
     private val presencePort = object : WakePresencePort {
         override fun scheduleRearm(delayMs: Long) {
             host.scheduleRearm(delayMs)
@@ -143,7 +163,7 @@ class WatchVoiceCoordinator(
     /** Binds the wake flow; call once, before any event reaches it. */
     fun attach(controller: WakeDeviceController) {
         wake = controller
-        presence = WakePresence(controller, presencePort)
+        presence = WakePresence(controller, presencePort, followsVisibility = true)
         publish()
     }
 
@@ -177,15 +197,19 @@ class WatchVoiceCoordinator(
             inner.closed(reason)
             presence.onWindowClosed(reason)
             // No recognizer: the loop has stopped, so the session keeps only playback (no microphone kept for status).
-            if (reason == "unavailable" && session.status.microphone) session.onMicrophoneBlock(MicBlock.NO_RECOGNIZER, presence.visible)
+            if (reason == "unavailable" && session.status.microphone) applyBlock(MicBlock.NO_RECOGNIZER)
             sync()
         }
 
         /** Present while the app is visible or a session is armed; the screen state is waived only for an armed session. */
         override fun armInputs(): WakeArmInputs {
             val platform = inner.armInputs()
-            return platform.copy(resumed = !stoppedThisOpen && presence.present, interactive = presence.armed || platform.interactive)
+            // An armed session waives the screen (and ambient/AOD) here; whether the screen is allowed is the preference's decision (WakeDeviceController.enabledHere).
+            return platform.copy(resumed = !stoppedThisOpen && presence.present, interactive = presence.armed || platform.interactive,
+                ambient = platform.ambient && !presence.armed)
         }
+
+        override fun screenInteractive(): Boolean = inner.screenInteractive()
 
         override fun armBlocked(source: String, block: WakeBlock) {
             inner.armBlocked(source, block)
@@ -193,7 +217,7 @@ class WatchVoiceCoordinator(
             presence.onArmBlocked(block, (inputs.cooldownUntilMs - inputs.nowMs).coerceAtLeast(0L))
             if (presence.armed) when (block) {
                 // Nothing can listen: say so instead of claiming to.
-                WakeBlock.PERMISSION -> session.onMicrophoneBlock(MicBlock.PERMISSION, presence.visible)
+                WakeBlock.PERMISSION -> applyBlock(MicBlock.PERMISSION)
                 WakeBlock.NOT_FOREGROUND -> session.onMicrophoneStalled(session.generation)
                 // Armed, included by the settings, yet the flow can't open a window: a stall, never a silent no-op.
                 WakeBlock.DISABLED -> if (wake.enabledHere) session.onMicrophoneStalled(session.generation)
@@ -210,7 +234,7 @@ class WatchVoiceCoordinator(
      * hidden visibility itself keeps a new arming out.
      */
     fun block(): MicBlock? = when {
-        !host.settings().watchWakeEnabled -> MicBlock.NOT_WANTED
+        !host.settings().watchBackgroundWakeEnabled -> MicBlock.NOT_WANTED
         !host.microphonePermission() -> MicBlock.PERMISSION
         !host.recognizerAvailable() -> MicBlock.NO_RECOGNIZER
         !host.notifications().shown -> MicBlock.NOTIFICATIONS
@@ -328,24 +352,33 @@ class WatchVoiceCoordinator(
      * notifications switched on or off). Blocked: disarm now. Unblocked: arm only while visible.
      */
     fun onEligibilityChanged() {
+        // The device's own screen first, so settings are applied against what the screen really is.
+        if (::presence.isInitialized) presence.reconcile()
+        val wasEnabled = wake.enabledHere
         wake.onSettings(host.settings())
-        session.onMicrophoneBlock(block(), presence.visible)
+        if (::presence.isInitialized) presence.settingsApplied(wasEnabled)
+        applyBlock(block())
         sync()
+    }
+
+    /**
+     * Gives the session's microphone back for [blocked] (or re-allows it). Hidden, a standby switched off never cuts a
+     * recording under way: the idle listening is already revoked by the wake flow, and the microphone type stays until
+     * the recording ends ([onIdle]).
+     */
+    private fun applyBlock(blocked: MicBlock?) {
+        val defer = blocked == MicBlock.NOT_WANTED && presence.armed && !presence.visible && host.recordingActive()
+        disarmPending = defer
+        if (defer) presence.dropPendingRetry() else session.onMicrophoneBlock(blocked, presence.visible)
     }
 
     // ── the loop ─────────────────────────────────────────────────────────────────────────────
 
-    /**
-     * The gap before the next window is over. Returns whether to go on (the runtime then checks
-     * reachability, bounded by [REACHABILITY_TIMEOUT_MS], and calls [onRearmDue]); the gap stays
-     * held until then.
-     */
-    fun onRearmTimer(): Boolean = presence.armed
-
+    /** The gap before the next window is over (the host's timer or alarm fired, once per scheduled gap). */
     fun onRearmDue() {
-        // Checked at every window: a permission or notification lost meanwhile disarms (it can never arm here).
+        // Checked at every window: a permission, notification or standby lost meanwhile disarms (it can never arm here).
         val blocked = block()
-        if (blocked != null && session.status.microphone) session.onMicrophoneBlock(blocked, presence.visible)
+        if (blocked != null && session.status.microphone) applyBlock(blocked)
         presence.onRearmDue()
         sync()
     }
@@ -353,12 +386,22 @@ class WatchVoiceCoordinator(
     /** The recognizer reported something: a pending partial may have moved the window's deadline. */
     fun onRecognizerActivity() = sync()
 
+    /** The cached Phone reachability changed (a Data Layer event, never a poll): a window waiting for the Phone opens now. */
+    fun onReachabilityChanged() {
+        presence.onConditionChanged()
+        sync()
+    }
+
     fun onBusy() {
         presence.onBusy()
         sync()
     }
 
     fun onIdle() {
+        if (disarmPending && !host.recordingActive()) {
+            disarmPending = false
+            session.onMicrophoneBlock(block(), presence.visible)
+        }
         presence.onIdle()
         sync()
     }
@@ -404,7 +447,6 @@ class WatchVoiceCoordinator(
             val now = clock()
             if (wake.listening) needed[HoldReason.LISTEN] = (wake.windowDeadlineMs() - now).coerceAtLeast(0L) + HOLD_MARGIN_MS
             if (wake.episodePending) needed[HoldReason.HANDOFF] = WakeContract.CLAIM_TIMEOUT_MS + WakeContract.MIC_HANDOFF_MS + HOLD_MARGIN_MS
-            presence.pendingRearm?.let { needed[HoldReason.REARM] = it.delayMs + REACHABILITY_TIMEOUT_MS + HOLD_MARGIN_MS }
         }
         holds.reconcile(MANAGED, needed)
         publish()
@@ -419,10 +461,7 @@ class WatchVoiceCoordinator(
 
     companion object {
         /** The holds this coordinator decides; the recorder, transfer and playback manage their own. */
-        val MANAGED: Set<HoldReason> = setOf(HoldReason.LISTEN, HoldReason.HANDOFF, HoldReason.REARM)
+        val MANAGED: Set<HoldReason> = setOf(HoldReason.LISTEN, HoldReason.HANDOFF)
         const val HOLD_MARGIN_MS = 5_000L
-
-        /** The longest the reachability check before a window may take; the window follows either way. */
-        const val REACHABILITY_TIMEOUT_MS = 5_000L
     }
 }

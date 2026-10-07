@@ -19,6 +19,13 @@ import org.json.JSONObject
  * - `/hv/v1/play/<turnId>/<seq>` channel, Phone → Watch: [LinkFrame] {play header} + audio bytes
  * - `/hv/v1/played`              message, Watch → Phone: [PlayedAck] (sent when playback ends)
  * - `/hv/v1/stop`                message, Phone → Watch: stop playing this turn now (interruption)
+ * - `/hv/v1/cancel`             message, Watch → Phone: the Watch's Stop: stop this Watch's own request ([TurnStateMessage]
+ *                                with the turn id) wherever it is (queued, awaiting its reply, speaking); one message per request
+ * - `/hv/v1/diag/request`        message, Phone → Watch, and `/hv/v1/diag/response`, Watch → Phone: ONE user-started diagnostics
+ *                                export asks the Watch for its typed event metadata ([com.rumi.hermesvoice.core.diag.DiagWire]);
+ *                                bounded, closed schema, answered once per request, never polled
+ * - `/hv/v1/navigate`            message, Phone → Watch: a Watch-originated routed request was DELIVERED to this conversation
+ *                                ([WatchNavigation]); the Watch may select it, guarded by [WatchNavigationGuard]
  * - `/hv/v1/settings`            data item, Phone → Watch: [com.rumi.hermesvoice.core.settings.WatchSettings] JSON
  * - `/hv/v1/reader/request`      message, Watch → Phone, and `/hv/v1/reader/response`, Phone → Watch:
  *                                the conversation reader ([ReaderRequest], [ReaderResponse])
@@ -31,7 +38,14 @@ object WatchLinkPaths {
     const val STATE = "/hv/v1/state"
     const val PLAY_PREFIX = "/hv/v1/play/"
     const val PLAYED = "/hv/v1/played"
+
+    /** Watch → Phone: the player's real position while one clip plays ([PlayProgress]). Optional: an older Watch never sends it. */
+    const val PLAY_PROGRESS = "/hv/v1/play_progress"
     const val STOP = "/hv/v1/stop"
+    const val CANCEL = "/hv/v1/cancel"
+    const val DIAG_REQUEST = "/hv/v1/diag/request"
+    const val DIAG_RESPONSE = "/hv/v1/diag/response"
+    const val NAVIGATE = "/hv/v1/navigate"
     const val SETTINGS = "/hv/v1/settings"
     const val READER_REQUEST = "/hv/v1/reader/request"
     const val READER_RESPONSE = "/hv/v1/reader/response"
@@ -145,6 +159,12 @@ class WatchTurnUpload(
      * is one of the Phone's active conversations; optional, so older Phones simply ignore it.
      */
     val target: String? = null,
+    /**
+     * The Watch's conversation-selection generation when this request began (see [WatchNavigationGuard]); the Phone echoes it in
+     * [WatchNavigation] so the Watch can tell that the user has navigated since. Optional: an older Watch sends none and then
+     * never receives a navigation.
+     */
+    val selectionGeneration: Long? = null,
 ) {
     val recognizedText: String? get() = if (mimeType == MIME_TEXT) String(audio, StandardCharsets.UTF_8).trim() else null
 
@@ -153,6 +173,7 @@ class WatchTurnUpload(
             .apply {
                 if (wakeClaimId != null) put("claim", wakeClaimId)
                 if (target != null) put("target", target)
+                if (selectionGeneration != null) put("sel_gen", selectionGeneration)
             },
         audio,
     )
@@ -162,8 +183,10 @@ class WatchTurnUpload(
         const val MIME_TEXT = "text/plain; charset=utf-8"
         const val MAX_RECOGNIZED_CHARS = com.rumi.hermesvoice.core.wake.WakeContract.MAX_REQUEST_CHARS
 
-        fun recognized(turnId: String, text: String, wakeClaimId: String? = null, target: String? = null): WatchTurnUpload =
-            WatchTurnUpload(turnId, TurnTrigger.WAKE_PHRASE, MIME_TEXT, text.trim().toByteArray(StandardCharsets.UTF_8), wakeClaimId, target)
+        fun recognized(turnId: String, text: String, wakeClaimId: String? = null, target: String? = null,
+                       selectionGeneration: Long? = null): WatchTurnUpload =
+            WatchTurnUpload(turnId, TurnTrigger.WAKE_PHRASE, MIME_TEXT, text.trim().toByteArray(StandardCharsets.UTF_8), wakeClaimId, target,
+                selectionGeneration)
 
         /** Validates the frame against the channel path it arrived on; anything off is rejected. */
         fun fromFrame(path: String, frame: LinkFrame): WatchTurnUpload {
@@ -187,7 +210,12 @@ class WatchTurnUpload(
                 is String -> raw.takeIf(DestinationAllowlist::isValidSessionId) ?: throw LinkProtocolException("bad target")
                 else -> throw LinkProtocolException("bad target")
             }
-            val upload = WatchTurnUpload(pathTurnId, trigger, mime, frame.payload, claim, target)
+            val selectionGeneration = when (val raw = header.opt("sel_gen")) {
+                null -> null
+                is Int, is Long -> (raw as Number).toLong().takeIf { it >= 0 } ?: throw LinkProtocolException("bad selection generation")
+                else -> throw LinkProtocolException("bad selection generation")
+            }
+            val upload = WatchTurnUpload(pathTurnId, trigger, mime, frame.payload, claim, target, selectionGeneration)
             if (mime == MIME_WAV) {
                 if (frame.payload.size <= WAV_HEADER_BYTES) throw LinkProtocolException("turn audio is empty")
             } else {
@@ -220,6 +248,95 @@ data class TurnStateMessage(val turnId: String, val stage: String, val detail: S
     }
 }
 
+/**
+ * Phone → Watch, after a Watch-originated routed request was DELIVERED (the destination accepted the transcript; a router
+ * decision, an acknowledgement or a failed delivery never sends one): select [sessionId] for the next visit.
+ * `{"v":1,"turn_id":…,"session_id":…,"gen":<selection generation the upload carried>,"created":<new conversation>}`.
+ * Strict: a wrong type, an invalid turn or session id or a negative generation decodes to null; unknown fields are ignored.
+ */
+data class WatchNavigation(val turnId: String, val sessionId: String, val generation: Long, val created: Boolean = false) {
+    init {
+        require(WatchLinkPaths.isValidTurnId(turnId) && DestinationAllowlist.isValidSessionId(sessionId) && generation >= 0) { "invalid navigation" }
+    }
+
+    fun encode(): ByteArray = JSONObject().put("v", 1).put("turn_id", turnId).put("session_id", sessionId).put("gen", generation)
+        .put("created", created).toString().toByteArray(StandardCharsets.UTF_8)
+
+    companion object {
+        fun decode(bytes: ByteArray): WatchNavigation? = runCatching {
+            val json = JSONObject(String(bytes, StandardCharsets.UTF_8))
+            if (json.opt("v") != 1) return@runCatching null
+            val turnId = json.opt("turn_id") as? String ?: return@runCatching null
+            val sessionId = json.opt("session_id") as? String ?: return@runCatching null
+            val generation = when (val raw = json.opt("gen")) { is Int, is Long -> (raw as Number).toLong(); else -> return@runCatching null }
+            val created = when (val raw = json.opt("created")) { null -> false; is Boolean -> raw; else -> return@runCatching null }
+            if (!WatchLinkPaths.isValidTurnId(turnId) || !DestinationAllowlist.isValidSessionId(sessionId) || generation < 0) return@runCatching null
+            WatchNavigation(turnId, sessionId, generation, created)
+        }.getOrNull()
+    }
+}
+
+/**
+ * The Watch's guard for a [WatchNavigation]: it applies only to a turn THIS Watch started (a Phone-origin or unknown turn never
+ * moves it), only once, only from the node the request went to, only for the newest request, and only while the user has not
+ * navigated (opened a conversation or changed screen) since that request began (the selection generation it carried).
+ * A Stop forgets every pending request. In memory only: a Watch process restart forgets pending requests, so a navigation
+ * that arrives afterwards is ignored.
+ */
+class WatchNavigationGuard(private val maxTracked: Int = 8) {
+    enum class Verdict { APPLY, UNKNOWN_TURN, DUPLICATE, WRONG_NODE, SUPERSEDED_TURN, STALE_SELECTION }
+
+    private class Pending(val generation: Long, var nodeId: String? = null)
+
+    private val pending = LinkedHashMap<String, Pending>()
+    private val decided = LinkedHashSet<String>()
+    private var generation = 0L
+    private var newest: String? = null
+
+    /** The generation a request that begins now carries; the user's navigation counter. */
+    @Synchronized fun generation(): Long = generation
+
+    /** A local request began (recording started); it becomes the newest, and returns the generation it carries. */
+    @Synchronized fun onTurnStarted(turnId: String): Long {
+        pending.getOrPut(turnId) { Pending(generation) }
+        newest = turnId
+        while (pending.size > maxTracked) pending.remove(pending.keys.first())
+        return pending.getValue(turnId).generation
+    }
+
+    /** The generation [turnId] carries (registering it as the newest request now if it was not started through [onTurnStarted]). */
+    @Synchronized fun generationFor(turnId: String): Long = pending[turnId]?.generation ?: onTurnStarted(turnId)
+
+    /** The Phone node [turnId] was uploaded to. */
+    @Synchronized fun onUploadNode(turnId: String, nodeId: String) { pending[turnId]?.nodeId = nodeId }
+
+    /** The user opened a conversation or changed screens: every older request stops moving the selection. */
+    @Synchronized fun onUserNavigation() { generation += 1 }
+
+    /** A Watch Stop: nothing pending may move the selection afterwards. */
+    @Synchronized fun onStopped() { pending.clear(); newest = null }
+
+    @Synchronized fun accept(navigation: WatchNavigation, sourceNodeId: String): Verdict {
+        if (navigation.turnId in decided) return Verdict.DUPLICATE
+        val request = pending[navigation.turnId] ?: return Verdict.UNKNOWN_TURN
+        if (request.nodeId != null && request.nodeId != sourceNodeId) return Verdict.WRONG_NODE
+        val verdict = when {
+            navigation.generation != request.generation -> Verdict.STALE_SELECTION
+            newest != navigation.turnId -> Verdict.SUPERSEDED_TURN
+            request.generation != generation -> Verdict.STALE_SELECTION
+            else -> Verdict.APPLY
+        }
+        pending.remove(navigation.turnId)
+        decided += navigation.turnId
+        while (decided.size > MAX_DECIDED) decided.remove(decided.first())
+        return verdict
+    }
+
+    private companion object {
+        const val MAX_DECIDED = 64
+    }
+}
+
 /** One utterance for the Watch speaker. */
 class PlayRequest(
     val turnId: String,
@@ -233,10 +350,19 @@ class PlayRequest(
      * field; an older Watch ignores it.
      */
     val later: Boolean = false,
+    /**
+     * The request's OWN reply, which may arrive while the Watch records another request (a new request is accepted while an
+     * earlier one waits): it is refused like a later reply while recording, but it is not a later reply. Optional header
+     * field "defer"; an older Watch ignores it.
+     */
+    val deferrable: Boolean = false,
 ) {
+    /** A recording Watch refuses this utterance instead of playing it over the recording. */
+    val refusedWhileRecording: Boolean get() = later || deferrable
+
     fun toFrame(): LinkFrame = LinkFrame(
         JSONObject().put("v", 1).put("turn_id", turnId).put("seq", sequence).put("role", role).put("mime", mimeType)
-            .put("bytes", audio.size).apply { if (later) put("later", true) },
+            .put("bytes", audio.size).apply { if (later) put("later", true); if (deferrable) put("defer", true) },
         audio,
     )
 
@@ -251,7 +377,8 @@ class PlayRequest(
                 throw LinkProtocolException("play audio length mismatch")
             }
             return PlayRequest(turnId, header.optInt("seq", -1).also { if (it < 0) throw LinkProtocolException("bad seq") },
-                header.optString("role"), mime, frame.payload, later = header.optBoolean("later", false))
+                header.optString("role"), mime, frame.payload, later = header.optBoolean("later", false),
+                deferrable = header.optBoolean("defer", false))
         }
     }
 }
@@ -271,6 +398,32 @@ data class PlayedAck(val turnId: String, val sequence: Int, val ok: Boolean, val
         fun decode(bytes: ByteArray): PlayedAck? = runCatching {
             val json = JSONObject(String(bytes, StandardCharsets.UTF_8))
             PlayedAck(json.getString("turn_id"), json.getInt("seq"), json.getBoolean("ok"), json.optString("error"))
+        }.getOrNull()
+    }
+}
+
+/**
+ * Watch → Phone: where the Watch's player really is in clip ([turnId], [sequence]): [positionMs] of [durationMs], both
+ * read from the player (never estimated). The Phone counts one only when it is for the exact clip it waits for, from the
+ * node it sent it to, with a duration that never changes and a position that is strictly further than any it accepted
+ * before; anything else (a repeat, an older position, another clip or node, a position beyond the duration) is ignored,
+ * so a heartbeat of a stalled or dead player never extends the wait.
+ */
+data class PlayProgress(val turnId: String, val sequence: Int, val positionMs: Long, val durationMs: Long) {
+    fun encode(): ByteArray = JSONObject().put("turn_id", turnId).put("seq", sequence).put("pos", positionMs).put("dur", durationMs)
+        .toString().toByteArray(StandardCharsets.UTF_8)
+
+    companion object {
+        /** The longest clip duration a Watch may report (six hours); a larger value is not a real clip. */
+        const val MAX_DURATION_MS = 6 * 60 * 60_000L
+
+        fun decode(bytes: ByteArray): PlayProgress? = runCatching {
+            if (bytes.size > 512) return null
+            val json = JSONObject(String(bytes, StandardCharsets.UTF_8))
+            val turnId = json.getString("turn_id")
+            if (!WatchLinkPaths.isValidTurnId(turnId)) return null
+            val progress = PlayProgress(turnId, json.getInt("seq"), json.getLong("pos"), json.getLong("dur"))
+            progress.takeIf { it.sequence >= 0 && it.durationMs in 1..MAX_DURATION_MS && it.positionMs in 0..it.durationMs }
         }.getOrNull()
     }
 }

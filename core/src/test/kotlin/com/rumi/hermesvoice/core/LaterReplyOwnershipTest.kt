@@ -169,9 +169,11 @@ class LaterReplyOwnershipTest {
 
     @Test
     fun `P1 inverted - a recording starting at any point of a later reply's admission or playback never records it`() {
-        // Each race point a recording can start at (on another thread): synthesis, the wake-window check right after
-        // admission, the instant playback starts, mid-utterance.
-        for (point in listOf("synthesis", "admitted", "start", "middle")) {
+        // Each race point a recording can start at (on another thread): while the server generates the speech, the first
+        // CPU-holding unit (handoff and playback), the wake-window check right after admission, the instant playback
+        // starts, mid-utterance. v19 self-check R1: "synthesis" now fires while a real /api/audio/speak request is in flight
+        // (the CPU-holding unit no longer covers synthesis); "handoff" keeps the former trigger at the unit's entry.
+        for (point in listOf("synthesis", "handoff", "admitted", "start", "middle")) {
             later.clear()
             harness().use { h ->
                 val work = existing(h, "work", "Started.")
@@ -182,13 +184,19 @@ class LaterReplyOwnershipTest {
                 val once = AtomicBoolean(false)
                 val start = { if (once.compareAndSet(false, true)) h.ownership.claimMicrophone(VoiceOrigin.PHONE).also { claims += it; s.openRecorder(it) } }
                 when (point) {
-                    "synthesis" -> inWork = { start() }
+                    "synthesis" -> {
+                        val seen = h.fake.speakRequests.get()
+                        h.fake.speakDelayMs = 1_000
+                        scope.launch { while (h.fake.speakRequests.get() == seen) delay(5); start() }
+                    }
+                    "handoff" -> inWork = { start() }
                     "admitted" -> windowHook = { start() }
                     "start" -> s.atStart = { start() }
                     "middle" -> scope.launch { while (s.audible == null) delay(5); delay(100); start() }
                 }
                 h.fake.pushLaterTurn(work, FakeHermesDashboard.complete("Never recorded."))
                 waitFor("the recording started ($point)") { claims.isNotEmpty() }
+                h.fake.speakDelayMs = 0
                 settle(1_200)
                 assertTrue("$point: nothing reported while it records", later.isEmpty())
                 inWork = null
@@ -463,7 +471,8 @@ class LaterReplyOwnershipTest {
             waitFor("played on the Watch") { later.isNotEmpty() }
             assertEquals(listOf("o-n4-0001:played:watch"), later.toList())
             assertEquals(0, phoneSpeakerOn.get())
-            assertEquals("three admitted attempts on the Watch, each let go", 6, watchSpeaker.get())
+            // v19: the turn's own reply (deferrable) signals the Watch speaker too, so 4 admitted attempts (own + 3 later) x on/off.
+            assertEquals("four admitted attempts on the Watch (the own reply and three later ones), each let go", 8, watchSpeaker.get())
         }
     }
 
@@ -475,12 +484,14 @@ class LaterReplyOwnershipTest {
             routeTo(h, "work")
             val s = Speaker(h)
             phoneTurn(h, s, "o-n4-0002")
+            // v19: the turn's own reply signals the Phone speaker too; only signals after this point are the later reply's.
+            val speakerAfterOwnReply = phoneSpeakerOn.get()
             // The phrase is heard: the episode holds the microphone (before the accepted cue), across the 300 ms handoff.
             val episode = EpisodeMicrophone(h.ownership, VoiceOrigin.PHONE)
             episode.hold(true)
             h.fake.pushLaterTurn(work, FakeHermesDashboard.complete("Waited for the request."))
             settle(800)
-            assertEquals("never admitted to the Phone during the handoff", 0, phoneSpeakerOn.get())
+            assertEquals("never admitted to the Phone during the handoff", speakerAfterOwnReply, phoneSpeakerOn.get())
             // The recording takes the hold over, then the request; giving the episode's hold back is a no-op.
             val recording = episode.take()!!
             episode.hold(false)
@@ -489,7 +500,11 @@ class LaterReplyOwnershipTest {
             phoneTurn(h, s, "o-n4-0003", microphone = recording)
             waitFor("the later reply after the request") { later.isNotEmpty() }
             assertEquals(listOf("o-n4-0002:played:phone"), later.toList())
-            assertTrue(s.played.indexOf("FINAL:Waited for the request.") > s.played.indexOf("FINAL:Sure."))
+            // v19: the older reply plays once the capture and sending are over; it may precede the new request's own
+            // answer. Each is spoken exactly once, and the reply was held back through the handoff (asserted above).
+            waitFor("the new request's own answer") { s.played.contains("FINAL:Sure.") }
+            assertEquals(s.played.toString(), 1, s.played.count { it == "FINAL:Waited for the request." })
+            assertEquals(s.played.toString(), 1, s.played.count { it == "FINAL:Sure." })
         }
     }
 
@@ -514,8 +529,14 @@ class LaterReplyOwnershipTest {
             assertFalse("not in the transcription gap", s.played.contains("FINAL:Work report."))
             runBlocking { turn.await() }
             waitFor("played after the answer") { later.isNotEmpty() }
-            val final = s.played.indexOf("FINAL:Sure.")
-            assertTrue("after the request's own answer: ${s.played}", final >= 0 && s.played.indexOf("FINAL:Work report.") > final)
+            // v19: the older reply may play as soon as the request's transcription, routing and sending end, so it can
+            // come before that request's own answer; what matters is that each plays exactly once.
+            waitFor("both replies played") { s.played.contains("FINAL:Sure.") }
+            assertEquals("nothing of the older reply played before the new request's ACK (the recording/transcription/routing gap)",
+                listOf("ACK:Sending to work.", "FINAL:Started.", "ACK:Sending to home."), s.played.take(3))
+            assertEquals(s.played.toString(), 1, s.played.count { it == "FINAL:Work report." })
+            assertEquals(s.played.toString(), 1, s.played.count { it == "FINAL:Sure." })
+            assertEquals("exactly five utterances, none repeated", 5, s.played.size)
             assertEquals(listOf("o-n5-0001:played:phone"), later.toList())
             assertFalse(h.ownership.microphoneClaimed(VoiceOrigin.PHONE))
         }

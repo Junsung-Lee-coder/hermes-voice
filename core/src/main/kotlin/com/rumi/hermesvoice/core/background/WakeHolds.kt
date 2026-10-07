@@ -14,12 +14,6 @@ enum class HoldReason(val maxMs: Long) {
      */
     HANDOFF(10_000L),
 
-    /**
-     * Between two windows of an armed session: the pause, a back-off, a retry while the Phone is
-     * unreachable or the playback cooldown, plus the bounded reachability check before the next window.
-     */
-    REARM(90_000L),
-
     /** One recording: above the recorder's storage bound (about 13 minutes), which ends it first. */
     CAPTURE(14 * 60_000L),
 

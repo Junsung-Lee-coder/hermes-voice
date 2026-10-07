@@ -31,6 +31,13 @@ class FakeHermesDashboard : AutoCloseable {
     val server = MockWebServer()
     val timeline: MutableList<String> = Collections.synchronizedList(mutableListOf())
     val prompts: MutableList<Pair<String, String>> = Collections.synchronizedList(mutableListOf())
+
+    /**
+     * Every prompt exactly as the model would see it (stored id → text). [prompts] holds the same turns with a leading
+     * voice marker ([VOICE_MARK]) taken off, so inherited assertions on the user's words stay exact; the marker itself
+     * is asserted through this list.
+     */
+    val rawPrompts: MutableList<Pair<String, String>> = Collections.synchronizedList(mutableListOf())
     val wsProtocolHeaders: MutableList<String> = Collections.synchronizedList(mutableListOf())
     val wsPaths: MutableList<String> = Collections.synchronizedList(mutableListOf())
 
@@ -39,6 +46,19 @@ class FakeHermesDashboard : AutoCloseable {
     @Volatile var transcript = "move my 2pm meeting to 3"
 
     /** How long transcription takes (a slow speech-to-text: the gap before a request's acknowledgement). */
+    /** How long `/api/audio/speak` takes to answer (a long synthesis). */
+    @Volatile var speakDelayMs = 0L
+
+    /** Every `/api/audio/speak` request received so far, counted on arrival (before its [speakDelayMs]). */
+    val speakRequests = java.util.concurrent.atomic.AtomicInteger()
+
+    /** `/api/audio/speak` body progress: each [speakThrottleBytes] bytes of the response body arrive [speakThrottleMs] apart (0: all at once). */
+    @Volatile var speakThrottleBytes = 0L
+    @Volatile var speakThrottleMs = 0L
+
+    /** `/api/audio/speak` cuts the connection after a part of its body (a true disconnect). */
+    @Volatile var speakDisconnectMidBody = false
+    @Volatile var speakPadding = 0
     @Volatile var transcribeDelayMs = 0L
     @Volatile var rejectAccessTokens: Set<String> = emptySet()
     @Volatile var refreshAccepted = true
@@ -255,10 +275,15 @@ class FakeHermesDashboard : AutoCloseable {
             }
             "/api/audio/speak" -> if (!authorized(request)) unauthorized() else {
                 val text = body.optString("text")
+                speakRequests.incrementAndGet()
+                if (speakDelayMs > 0) Thread.sleep(speakDelayMs)
                 timeline += "speak:$text"
                 val audio = Base64.getEncoder().encodeToString("AUDIO:$text".toByteArray())
-                json(200, JSONObject().put("ok", true).put("data_url", "data:audio/mpeg;base64,$audio")
-                    .put("mime_type", "audio/mpeg").put("provider", "fake"))
+                val response = json(200, JSONObject().put("ok", true).put("data_url", "data:audio/mpeg;base64,$audio")
+                    .put("mime_type", "audio/mpeg").put("provider", "fake").put("pad", "x".repeat(speakPadding)))
+                if (speakThrottleBytes > 0) response.throttleBody(speakThrottleBytes, speakThrottleMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+                if (speakDisconnectMidBody) response.setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY)
+                response
             }
             "/api/ws" -> {
                 wsPaths += request.requestUrl.toString()
@@ -324,6 +349,9 @@ class FakeHermesDashboard : AutoCloseable {
     private fun rowJson(row: Row) = JSONObject().put("id", row.id).put("source", row.source).put("title", row.title)
         .put("archived", row.archived).put("started_at", 1_700_000_000.0).put("last_active", 1_700_000_100.0)
         .put("message_count", row.messages.size).put("preview", row.messages.lastOrNull()?.optString("content").orEmpty())
+
+    /** A transcript row written by something other than this app (another client, the dashboard): stored verbatim like any row. */
+    fun injectRow(stored: String, role: String, content: Any, hiddenKind: Boolean = false) = addMessage(stored, role, content, hiddenKind)
 
     private fun addMessage(stored: String, role: String, content: Any, hiddenKind: Boolean = false) {
         val row = rows[stored] ?: return
@@ -553,11 +581,13 @@ class FakeHermesDashboard : AutoCloseable {
                 "prompt.submit" -> {
                     val runtime = params.getString("session_id")
                     val stored = runtimeIds.entries.first { it.value == runtime }.key
-                    val prompt = params.getString("text")
+                    val rawPrompt = params.getString("text")
+                    val prompt = voiceWords(rawPrompt)
                     require(params.optBoolean("queued")) { "voice client must submit with queued=true" }
+                    rawPrompts += stored to rawPrompt
                     prompts += stored to prompt
                     consumedImages += stored to (queuedImages.remove(runtime) ?: mutableListOf())
-                    addMessage(stored, "user", prompt)
+                    addMessage(stored, "user", rawPrompt)
                     timeline += "submit:$stored"
                     turnModels += stored to (runtimes[stored] ?: profileDefault)
                     val behavior = turnBehavior(stored)

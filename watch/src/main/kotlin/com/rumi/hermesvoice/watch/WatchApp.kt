@@ -35,6 +35,7 @@ import com.rumi.hermesvoice.core.settings.WatchSettingsReplica
 import com.rumi.hermesvoice.core.watchlink.HapticEvent
 import com.rumi.hermesvoice.core.watchlink.HapticUsage
 import com.rumi.hermesvoice.core.watchlink.LaterPlaybackGuard
+import com.rumi.hermesvoice.core.watchlink.PlayProgress
 import com.rumi.hermesvoice.core.watchlink.PlayRequest
 import com.rumi.hermesvoice.core.watchlink.PlayedAck
 import com.rumi.hermesvoice.core.watchlink.ReaderKind
@@ -43,10 +44,17 @@ import com.rumi.hermesvoice.core.watchlink.ReaderRequest
 import com.rumi.hermesvoice.core.watchlink.ReaderResponse
 import com.rumi.hermesvoice.core.watchlink.ReaderSessionRow
 import com.rumi.hermesvoice.core.watchlink.ReaderSurface
+import com.rumi.hermesvoice.core.diag.DiagCode
+import com.rumi.hermesvoice.core.diag.DiagFail
+import com.rumi.hermesvoice.core.diag.DiagLog
+import com.rumi.hermesvoice.core.diag.DiagOrigin
+import com.rumi.hermesvoice.core.diag.DiagWire
 import com.rumi.hermesvoice.core.watchlink.TurnStateMessage
 import com.rumi.hermesvoice.core.watchlink.TurnTrigger
 import com.rumi.hermesvoice.core.watchlink.WatchHapticPolicy
 import com.rumi.hermesvoice.core.watchlink.WatchLinkPaths
+import com.rumi.hermesvoice.core.watchlink.WatchNavigation
+import com.rumi.hermesvoice.core.watchlink.WatchNavigationGuard
 import com.rumi.hermesvoice.core.watchlink.WatchReaderLimits
 import com.rumi.hermesvoice.core.watchlink.WatchReaderState
 import com.rumi.hermesvoice.core.watchlink.WatchPhase
@@ -80,6 +88,8 @@ import kotlinx.coroutines.withTimeoutOrNull
  */
 class WatchApp : Application() {
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    /** Typed diagnostic events (bounded ring buffer): sent to the Phone only inside one user-started export. */
+    val diag = DiagLog(clock = SystemClock::elapsedRealtime)
     private val _talk = MutableStateFlow(WatchTalkState())
     val talk: StateFlow<WatchTalkState> = _talk
     private val _settings = MutableStateFlow(WatchSettings())
@@ -92,9 +102,16 @@ class WatchApp : Application() {
     /** The Phone node each pending reader request went to; a response from any other node is ignored. */
     private val readerTargets = ConcurrentHashMap<String, String>()
 
+    /**
+     * Phone-told conversation moves ([onNavigation]) are applied only for a request this Watch started and only while the user has
+     * not navigated since. In memory only, like the selection itself.
+     */
+    internal val navigationGuard = WatchNavigationGuard()
+
     @Volatile private var player: MediaPlayer? = null
     private var playing: PlayRequest? = null
     private var playingNode: String? = null
+    private var progressJob: Job? = null
 
     // ACK transport owns separate, bounded CPU holds, never the current speaker's hold.
     // Tokens (not turn IDs) keep concurrent/duplicate acknowledgements independently owned.
@@ -131,6 +148,13 @@ class WatchApp : Application() {
         _settings.value = replica.current
         WatchVoiceService.createChannel(this)
         voice = WatchVoiceRuntime(this)
+        // The Phone's reachability is kept current by the platform's own capability events (no polling before a window).
+        runCatching {
+            Wearable.getCapabilityClient(this).addListener(
+                CapabilityClient.OnCapabilityChangedListener { info -> _phoneReachable.value = info.nodes.any { it.isNearby } },
+                WatchLinkPaths.CAPABILITY_PHONE,
+            )
+        }.onFailure { Log.w(TAG, "capability listener unavailable: ${it.javaClass.simpleName}") }
     }
 
     /**
@@ -145,7 +169,9 @@ class WatchApp : Application() {
             _settings.value = current
         }
         Log.i(TAG, "settings $result revision=${current.revision} wake_location=${current.wakeLocation} " +
-            "watch_listens=${current.watchWakeEnabled} vad_silence_s=${current.vadSilenceSeconds} haptics=${current.hapticsEnabled}")
+            "watch_listens=${current.watchWakeEnabled} phone_standby=${current.phoneBackgroundWakeEnabled} " +
+            "watch_standby=${current.watchBackgroundWakeEnabled} phone_screen_off=${current.phoneBackgroundWakeScreenOffEnabled} " +
+            "watch_screen_off=${current.watchBackgroundWakeScreenOffEnabled} watch_auto_navigate=${current.watchAutoNavigateToRouted} vad_silence_s=${current.vadSilenceSeconds} haptics=${current.hapticsEnabled}")
     }
 
     private val _phoneReachable = MutableStateFlow<Boolean?>(null)
@@ -164,9 +190,16 @@ class WatchApp : Application() {
 
     fun newTurn(trigger: TurnTrigger): String? {
         val turnId = UUID.randomUUID().toString()
-        return runCatching { _talk.update { it.startRecording(turnId, trigger) } }.map { turnId }.getOrNull()
+        val started = runCatching { _talk.update { it.startRecording(turnId, trigger) } }.map { turnId }.getOrNull()
+        if (started == null && _talk.value.phase == WatchPhase.WAITING && _talk.value.earlier.size >= WatchTalkState.MAX_EARLIER) {
+            // The bound is reached: said on screen, not dropped silently. Nothing already waiting is touched.
+            _talk.update { it.copy(line = WatchTalkState.TOO_MANY) }
+        }
+        return started
             ?.also {
+                diag.record(DiagCode.WATCH_RECORDING, DiagOrigin.WATCH, it, n = _talk.value.waitingCount)
                 unstoppedLocalTurns += it
+                navigationGuard.onTurnStarted(it)
                 // A later reply playing now stops ("busy", not played): the Phone plays it again after the recording.
                 LaterPlaybackGuard.onRecordingStarted(playing)?.let { busy -> finishPlayback(ok = false, error = busy) }
             }
@@ -191,7 +224,8 @@ class WatchApp : Application() {
         val claimId = wakeClaimId?.takeIf { trigger == TurnTrigger.WAKE_PHRASE }
         // Recording ended, but the claim is this Watch's until the Phone has answered the turn.
         claimId?.let { keepClaimInTransit(it, turnId, wav.size) }
-        send(turnId, WatchTurnUpload(turnId, trigger, WatchTurnUpload.MIME_WAV, wav, claimId, target = selectedTarget()))
+        send(turnId, WatchTurnUpload(turnId, trigger, WatchTurnUpload.MIME_WAV, wav, claimId, target = selectedTarget(),
+            selectionGeneration = navigationGuard.generationFor(turnId)))
     }
 
     /**
@@ -203,7 +237,8 @@ class WatchApp : Application() {
     /** Sends a wake-phrase request the recognizer already heard (no second utterance was recorded). */
     fun uploadRecognized(turnId: String, request: String, wakeClaimId: String? = null) {
         wakeClaimId?.let { keepClaimInTransit(it, turnId, request.length) }
-        send(turnId, WatchTurnUpload.recognized(turnId, request, wakeClaimId, target = selectedTarget()))
+        send(turnId, WatchTurnUpload.recognized(turnId, request, wakeClaimId, target = selectedTarget(),
+            selectionGeneration = navigationGuard.generationFor(turnId)))
     }
 
     // ── wake arbitration ("Both") ────────────────────────────────────────────────────────────
@@ -315,10 +350,12 @@ class WatchApp : Application() {
         // Invalidate in-flight channel reads before any teardown can clear their turn identity.
         playbackStopGeneration++
         val turnId = _talk.value.turnId
-        stoppedTurns += unstoppedLocalTurns + unstoppedResponseTurns + uploads.keys + listOfNotNull(turnId, playing?.turnId)
+        val earlier = _talk.value.earlier
+        stoppedTurns += unstoppedLocalTurns + unstoppedResponseTurns + uploads.keys + listOfNotNull(turnId, playing?.turnId) + earlier
         // Safe to clear only after every identity moved to permanent process-lifetime denial.
         unstoppedLocalTurns.clear()
         unstoppedResponseTurns.clear()
+        navigationGuard.onStopped()
         transit.cancel()
         transitJob?.cancel()
         transitJob = null
@@ -327,8 +364,25 @@ class WatchApp : Application() {
             uploadStops[id] = reason
             job.cancel()
         }
-        _talk.update { if (turnId != null && it.turnId == turnId) it.sendFailed(reason) else it }
-        if (turnId != null) Log.i(TAG, "turn ${turnId.take(12)} stopped on the watch reason=$reason")
+        diag.record(DiagCode.WATCH_STOPPED, DiagOrigin.WATCH, n = earlier.size + (if (turnId != null) 1 else 0))
+        // This Watch's Stop is global for its own requests: the current one and every one still waiting for its reply.
+        _talk.update { it.stopped(reason) }
+        tellPhoneStopped(listOfNotNull(turnId) + earlier)
+        if (turnId != null) Log.i(TAG, "turn ${turnId.take(12)} stopped on the watch reason=$reason waiting_stopped=${earlier.size}")
+    }
+
+    /** Tells the Phone that these requests of this Watch were stopped (best effort): it stops them too, wherever they are. */
+    private fun tellPhoneStopped(turnIds: List<String>) {
+        if (turnIds.isEmpty()) return
+        scope.launch {
+            val node = phoneNode() ?: return@launch
+            turnIds.forEach { id ->
+                runCatching {
+                    Wearable.getMessageClient(this@WatchApp)
+                        .sendMessage(node, WatchLinkPaths.CANCEL, TurnStateMessage(id, "cancel", "", false).encode()).await()
+                }
+            }
+        }
     }
 
     private fun send(turnId: String, upload: WatchTurnUpload) {
@@ -342,12 +396,15 @@ class WatchApp : Application() {
                     delay(qaUploadDelayMs)
                 }
                 val phone = phoneNode() ?: error("Phone not reachable")
+                navigationGuard.onUploadNode(turnId, phone)
                 val channels = Wearable.getChannelClient(this@WatchApp)
                 val channel = channels.openChannel(phone, WatchLinkPaths.turnPath(turnId)).await()
                 val output = channels.getOutputStream(channel).await()
                 val frame = upload.toFrame().encode()
                 withContext(Dispatchers.IO) { output.use { it.write(frame); it.flush() } }
             }.exceptionOrNull()
+            diag.record(if (failure == null) DiagCode.WATCH_SENT else DiagCode.REQUEST_FAILED, DiagOrigin.WATCH, turnId,
+                fail = failure?.let { DiagFail.of(it) })
             if (failure == null) {
                 Log.i(TAG, "upload sent turn=${turnId.take(12)} trigger=${upload.trigger} kind=" +
                     (if (upload.recognizedText != null) "recognized_request" else "wav") + " bytes=${upload.audio.size}")
@@ -364,9 +421,22 @@ class WatchApp : Application() {
         job.start()
     }
 
+    /** One user-started diagnostics export on the Phone asks for this Watch's events: answered to that node only, once, bounded. */
+    fun onDiagRequest(sourceNodeId: String, data: ByteArray) {
+        val salt = DiagWire.decodeRequest(data) ?: return
+        val response = DiagWire.encodeResponse(salt, diag.snapshot(), diag.dropped(), diag.now())
+        scope.launch {
+            runCatching {
+                withTimeoutOrNull(DIAG_SEND_MS) {
+                    Wearable.getMessageClient(this@WatchApp).sendMessage(sourceNodeId, WatchLinkPaths.DIAG_RESPONSE, response).await()
+                }
+            }
+        }
+    }
+
     fun onPhoneState(message: TurnStateMessage) {
         Log.i(TAG, "phone state turn=${message.turnId.take(12)} stage=${message.stage} terminal=${message.terminal}")
-        val ownTurn = message.turnId == _talk.value.turnId
+        val ownTurn = message.turnId == _talk.value.turnId || message.turnId in _talk.value.earlier
         // The Phone answered this turn: its wake claim was used up (or, if the turn ended there, is given back).
         transit.onPhoneState(message.turnId, message.terminal)?.let { claimId ->
             val granted = grantedEpochs.remove(claimId)
@@ -434,9 +504,31 @@ class WatchApp : Application() {
      * router; with it off, they go to the conversation selected here ([selectedTarget]).
      */
     fun selectSession(sessionId: String) {
+        navigationGuard.onUserNavigation()
+        openConversation(sessionId)
+    }
+
+    private fun openConversation(sessionId: String) {
         val reqId = newRequestId()
         _reader.update { it.select(sessionId, reqId) }
         dispatch(ReaderRequest(reqId, ReaderKind.HISTORY, sessionId))
+    }
+
+    /**
+     * The Phone says a request this Watch spoke was DELIVERED to a conversation ([WatchNavigation]). With the Phone-owned option on
+     * and the guard satisfied (own newest request, once, from the node it went to, no user navigation since) the conversation is
+     * selected and its history requested, for the next visit: nothing is launched and the screen is not woken. A newly created
+     * conversation is also fetched into the list. Returns what was decided (null: not a valid message, or the option is off).
+     */
+    fun onNavigation(sourceNodeId: String, bytes: ByteArray): WatchNavigationGuard.Verdict? {
+        val navigation = WatchNavigation.decode(bytes) ?: return null
+        if (!_settings.value.watchAutoNavigateToRouted) return null
+        val verdict = navigationGuard.accept(navigation, sourceNodeId)
+        Log.i(TAG, "navigation turn=${navigation.turnId.take(12)} verdict=$verdict created=${navigation.created}")
+        if (verdict != WatchNavigationGuard.Verdict.APPLY) return verdict
+        openConversation(navigation.sessionId)
+        if (navigation.created) loadSessions()
+        return verdict
     }
 
     fun refreshSelected() {
@@ -463,6 +555,7 @@ class WatchApp : Application() {
     }
 
     fun toggleReaderSurface() {
+        navigationGuard.onUserNavigation()
         _reader.update { it.toggleSurface() }
         if (_reader.value.surface == ReaderSurface.SESSIONS) loadSessions()
     }
@@ -552,6 +645,7 @@ class WatchApp : Application() {
         // Invalid receive generations and cancelled/busy frames never enter this live ledger.
         unstoppedResponseTurns += request.turnId
         stopPlayback("superseded")
+        diag.record(DiagCode.WATCH_PLAY_RECEIVED, DiagOrigin.WATCH, request.turnId, n = request.sequence, ms = null)
         Log.i(TAG, "play received turn=${request.turnId.take(12)} seq=${request.sequence} role=${request.role} " +
             "bytes=${request.audio.size} from=${nodeId.take(8)} own_turn=${request.turnId == _talk.value.turnId}")
         // Audio focus, as any player: not granted (a call, or a policy that silences this app) means not played.
@@ -579,6 +673,7 @@ class WatchApp : Application() {
                 if (player === it) {
                     it.start()
                     Log.i(TAG, "playback started turn=${request.turnId.take(12)} seq=${request.sequence}")
+                    reportProgress(it, request, nodeId)
                 }
             }
             mp.prepareAsync()
@@ -594,8 +689,37 @@ class WatchApp : Application() {
         finishPlayback(ok = false, error = reason)
     }
 
+    /**
+     * Tells the Phone where this player really is (position and duration read from it, never estimated) every few seconds
+     * while this exact clip plays, so a long clip is not mistaken for a dead one. A stalled player reports the same
+     * position, which the Phone does not count as progress. Ends with the playback.
+     */
+    private fun reportProgress(mp: MediaPlayer, request: PlayRequest, node: String) {
+        progressJob?.cancel()
+        progressJob = scope.launch {
+            while (player === mp && playing === request) {
+                val position = runCatching { mp.currentPosition.toLong() }.getOrNull()
+                val duration = runCatching { mp.duration.toLong() }.getOrNull()
+                if (position != null && duration != null && duration > 0 && position in 0..duration) {
+                    try {
+                        withTimeoutOrNull(PROGRESS_SEND_MS) {
+                            Wearable.getMessageClient(this@WatchApp)
+                                .sendMessage(node, WatchLinkPaths.PLAY_PROGRESS, PlayProgress(request.turnId, request.sequence, position, duration).encode()).await()
+                        }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                    }
+                }
+                delay(PROGRESS_INTERVAL_MS)
+            }
+        }
+    }
+
     private fun finishPlayback(ok: Boolean, error: String) {
         val request = playing ?: return
+        progressJob?.cancel()
+        progressJob = null
         val node = playingNode
         player?.let { runCatching { it.stop() }; it.release() }
         player = null
@@ -614,6 +738,8 @@ class WatchApp : Application() {
     }
 
     private fun sendPlayed(request: PlayRequest, node: String, ok: Boolean, error: String, releasePlaybackHold: Boolean = false) {
+        diag.record(if (ok) DiagCode.PLAYBACK_DONE else DiagCode.PLAYBACK_FAILED, DiagOrigin.WATCH, request.turnId, n = request.sequence,
+            fail = if (ok) null else if (error == PlayedAck.BUSY_RECORDING) DiagFail.BUSY else DiagFail.UNKNOWN)
         val token = Any()
         pendingPlayedAcks += token
         playedAckHolds.acquire(HoldReason.PLAYBACK, ACK_HOLD_MS)
@@ -689,6 +815,9 @@ class WatchApp : Application() {
         private const val PREFS = "hermes_voice_watch"
         private const val KEY_SETTINGS = "settings_json"
         private const val ACK_HOLD_MS = 10_000L
+        private const val PROGRESS_INTERVAL_MS = 5_000L
+        private const val PROGRESS_SEND_MS = 4_000L
+        private const val DIAG_SEND_MS = 5_000L
 
         fun from(context: Context): WatchApp = context.applicationContext as WatchApp
     }

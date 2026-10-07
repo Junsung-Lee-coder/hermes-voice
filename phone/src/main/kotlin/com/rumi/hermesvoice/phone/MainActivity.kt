@@ -51,6 +51,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -80,6 +81,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -96,14 +106,20 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import com.rumi.hermesvoice.core.VoiceOrigin
+import com.rumi.hermesvoice.core.voice.PendingPhase
+import com.rumi.hermesvoice.core.voice.PendingTurn
 import com.rumi.hermesvoice.core.audio.QaAudio
 import com.rumi.hermesvoice.core.audio.QaLaunchGuard
 import com.rumi.hermesvoice.core.background.BackgroundText
 import com.rumi.hermesvoice.core.net.HistoryMessage
 import com.rumi.hermesvoice.core.net.OutgoingAttachment
 import com.rumi.hermesvoice.core.sessions.AppConversation
+import com.rumi.hermesvoice.core.settings.HelpTopic
+import com.rumi.hermesvoice.core.settings.LaterReplyWindow
+import com.rumi.hermesvoice.core.settings.SettingsHelp
 import com.rumi.hermesvoice.core.settings.ThemeMode
 import com.rumi.hermesvoice.core.settings.VadSilence
+import com.rumi.hermesvoice.core.settings.WakeGate
 import com.rumi.hermesvoice.core.settings.WakeLocation
 import com.rumi.hermesvoice.core.voice.EpisodeMicrophone
 import com.rumi.hermesvoice.core.wake.ClaimVerdict
@@ -449,7 +465,7 @@ private fun PhoneScreen(model: PhoneViewModel, recognizerAvailable: Boolean, onT
         },
         statusLines = listOf(state.status, state.voiceStatus),
         talkBar = if (!state.signedIn) null else ({
-            TalkBar(state) {
+            TalkBar(state, onStopPending = model::stopPending) {
                 val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
                     PackageManager.PERMISSION_GRANTED
                 if (granted) onTalk() else micPermission.launch(Manifest.permission.RECORD_AUDIO)
@@ -517,7 +533,7 @@ internal fun PhoneChrome(
 
 /** Full-width push-to-talk, centered within the horizontal safe area, with where replies will play. */
 @Composable
-internal fun TalkBar(state: PhoneUiState, onTalk: () -> Unit) {
+internal fun TalkBar(state: PhoneUiState, onStopPending: (String) -> Unit = {}, onTalk: () -> Unit) {
     Surface(color = MaterialTheme.colorScheme.surfaceContainerLow) {
         Column(
             Modifier.fillMaxWidth()
@@ -534,6 +550,7 @@ internal fun TalkBar(state: PhoneUiState, onTalk: () -> Unit) {
                 style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center, modifier = Modifier.padding(bottom = 6.dp),
             )
+            PendingTurnsList(state.pending, onStopPending)
             if (!state.routingEnabled) {
                 // Routing off: where this phone's voice requests go, or that one has to be chosen first.
                 val target = state.selected
@@ -565,6 +582,35 @@ internal fun TalkBar(state: PhoneUiState, onTalk: () -> Unit) {
                 Text(if (state.recording) "Stop & send" else if (capturing) "Send now" else "Talk", fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
             }
         }
+    }
+}
+
+/**
+ * The voice requests that are not finished, each with its own Stop. A request waiting for its reply holds no microphone,
+ * audio focus or wake lock, and a new one may be started meanwhile; there is no progress to show, so none is invented.
+ */
+@Composable
+internal fun PendingTurnsList(pending: List<PendingTurn>, onStop: (String) -> Unit) {
+    if (pending.isEmpty()) return
+    Column(Modifier.fillMaxWidth().padding(bottom = 6.dp).testTag("pending_requests")) {
+        pending.forEachIndexed { index, turn ->
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(pendingLabel(turn), style = MaterialTheme.typography.labelMedium, modifier = Modifier.weight(1f).testTag("pending_$index"),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                TextButton(onClick = { onStop(turn.turnId) }, modifier = Modifier.testTag("pending_stop_$index")) { Text("Stop") }
+            }
+        }
+    }
+}
+
+internal fun pendingLabel(turn: PendingTurn): String {
+    val to = turn.alias?.let { " to $it" }.orEmpty()
+    val from = if (turn.origin == VoiceOrigin.WATCH) "Watch request" else "Request"
+    return when (turn.phase) {
+        PendingPhase.TRANSMITTING -> "$from$to: sending…"
+        PendingPhase.QUEUED -> "$from$to: queued behind an earlier request to the same conversation"
+        PendingPhase.AWAITING -> "$from$to: waiting for the reply (no limit while it keeps working)"
+        PendingPhase.SPEAKING -> "$from$to: speaking the reply"
     }
 }
 
@@ -820,48 +866,25 @@ internal fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerA
         }
 
         HorizontalDivider()
-        Text("Spoken replies", style = MaterialTheme.typography.titleSmall)
-        Text("The routing acknowledgement and the final reply always play. They play on whichever device, " +
-            "this phone or the Watch, sent the most recent voice request; text messages don't change that.",
-            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        SectionTitle("Spoken replies", SettingsHelp.spokenReplies())
         SwitchRow("Play first response", state.playFirst, onChange = model::setPlayFirst)
         SwitchRow("Play middle responses", state.playMiddle, onChange = model::setPlayMiddle)
-        SwitchRow("Speak later replies (30 minutes)", state.speakLater, tag = "speak_later_replies", onChange = model::setSpeakLaterReplies)
-        Text("Off by default, and this phone's own choice: it isn't restored from a backup or moved to a new phone. When on, " +
-            "after a voice request has been answered, assistant replies that arrive later in that same conversation within " +
-            "30 minutes are spoken too, for example when a task Hermes started finishes. Hermes doesn't mark which request a " +
-            "later reply belongs to, so this can also speak a reply to something you or someone else sent to that conversation " +
-            "from another Hermes app or the dashboard in that time. Nothing else is spoken: other conversations stay silent. A " +
-            "later reply plays on the device of your latest voice request. It waits while a voice request is being answered and " +
-            "while the device it will play on records; a recording started on this phone stops it first (it plays again " +
-            "afterwards). It doesn't wait for the other device: a reply may play on the other device while one records, and " +
-            "nothing keeps the two apart acoustically. This was checked on a computer, not yet on a phone or Watch. Replies " +
-            "arriving after 30 minutes, after the connection to Hermes drops, or after Android closes the app are lost. One that " +
-            "arrived must get a free speaker within 10 minutes of arriving; preparing it can then take up to 2 more minutes, " +
-            "plus up to 3 seconds for a listening window to close. " +
-            "Turning this off, the background relay's Stop, or background listening's Stop ends it and every waiting reply.",
-            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.testTag("speak_later_warning"))
+        SwitchRow("Speak later replies (${LaterReplyWindow.describe(state.laterReplyWindowMinutes)})", state.speakLater,
+            tag = "speak_later_replies", help = SettingsHelp.laterReplies(state.laterReplyWindowMinutes), onChange = model::setSpeakLaterReplies)
+        LaterReplyWindowRow(state, model)
 
         HorizontalDivider()
-        Text("Voice routing", style = MaterialTheme.typography.titleSmall)
+        SectionTitle("Voice routing", SettingsHelp.routing())
         SwitchRow("Route voice requests automatically", state.routingEnabled, tag = "routing_enabled", onChange = model::setRoutingEnabled)
-        Text(
-            if (state.routingEnabled) "On: Hermes picks the conversation for each voice request, or creates one when none fits."
-            else "Off: a voice request goes to the conversation open on the device you spoke to (this phone's Chat, or the " +
-                "conversation open on the Watch). With none open, nothing is sent and you're asked to open one.",
-            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         SwitchRow("Open the routed conversation on this phone", state.autoNavigate, enabled = state.routingEnabled,
-            tag = "auto_navigate", onChange = model::setAutoNavigate)
-        Text(
-            if (state.routingEnabled) "When on, once a voice request has been delivered, this phone shows the conversation it went to " +
-                "(only while this app is open; the Watch keeps its own conversation)."
-            else "Only used while routing is on. Your choice is kept.",
-            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            tag = "auto_navigate", help = SettingsHelp.phoneNavigation(), onChange = model::setAutoNavigate)
+        SwitchRow("Open the routed conversation on Watch", state.watch.watchAutoNavigateToRouted, enabled = state.routingEnabled,
+            tag = "watch_auto_navigate", help = SettingsHelp.watchNavigation(), onChange = model::setWatchAutoNavigate)
 
         HorizontalDivider()
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Watch", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+            InfoHelpButton(SettingsHelp.watch())
             TextButton(onClick = model::refreshWatchStatus) { Text("Check") }
         }
         Text(
@@ -873,12 +896,17 @@ internal fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerA
             color = if (state.watchReachable == false) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.tertiary,
             style = MaterialTheme.typography.bodyMedium,
         )
-        Text("Push-to-talk is always available on the Watch and this phone and records until you tap Send (no time limit).",
-            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         SwitchRow("Watch haptics", state.watch.hapticsEnabled) { model.updateWatch(state.watch.copy(hapticsEnabled = it)) }
 
         HorizontalDivider()
-        Text("Background", style = MaterialTheme.typography.titleSmall)
+        SectionTitle("Waiting for replies", SettingsHelp.waiting())
+        Text("You can speak a new request while earlier ones wait. Stop ends only the request it belongs to.", style = MaterialTheme.typography.bodyMedium)
+
+        HorizontalDivider()
+        DiagnosticsRow()
+
+        HorizontalDivider()
+        SectionTitle("Background", SettingsHelp.backgroundRelay())
         // The first switch-on asks whether the app may show its notification (Android 13+); the relay starts whatever the answer.
         // Whether the relay's notification can really be seen now: the permission, the app's notifications and its channel.
         val notifications = PhoneApp.from(context).relayNotificationCapability().shown
@@ -896,15 +924,9 @@ internal fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerA
         Text(BackgroundText.phoneStatus(state.relay, notifications), style = MaterialTheme.typography.bodyMedium,
             modifier = Modifier.testTag("background_relay_status"),
             color = if (state.relay.wanted && !state.relay.running) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.tertiary)
-        Text("Off by default. While on, Watch requests are transcribed, routed, delivered and answered with this app closed and " +
-            "the screen off, and a notification with Stop stays visible. The relay itself never listens or records: this phone's " +
-            "Talk button works only while the app is open, and its wake phrase too unless you switch on background listening " +
-            "under Wake phrase. It doesn't survive a force stop, a restart of the " +
-            "phone or the system's own Stop; it starts again when you open the app. It uses more battery.",
-            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
 
         HorizontalDivider()
-        Text("Wake phrase", style = MaterialTheme.typography.titleSmall)
+        SectionTitle("Wake phrase", SettingsHelp.wakePhrase())
         Text("Listen on", style = MaterialTheme.typography.bodyMedium)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             WakeLocation.values().forEach { location ->
@@ -912,11 +934,12 @@ internal fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerA
                     label = { Text(location.label) }, modifier = Modifier.testTag("wake_${location.name.lowercase()}"))
             }
         }
-        val phoneListens = state.watch.wakeLocation.listensOn(VoiceOrigin.PHONE)
-        val watchListens = state.watch.wakeLocation.listensOn(VoiceOrigin.WATCH)
+        // On-screen listening follows "Listen on" alone; a device's standby switch only governs it with its app hidden (see PhoneBackgroundWakeRow).
+        val phoneListens = state.watch.listensIn(VoiceOrigin.PHONE, WakeGate.FOREGROUND)
+        val watchListens = state.watch.listensIn(VoiceOrigin.WATCH, WakeGate.FOREGROUND)
         Text(
             when {
-                !phoneListens -> "Phone: off"
+                !phoneListens -> "Phone: not listening while the app is open" + if (state.watch.phoneBackgroundWakeEnabled) " (background standby below is on)" else ""
                 !recognizerAvailable -> "Phone: unavailable, this phone has no speech recognizer"
                 !micGranted -> "Phone: needs the microphone permission (tap Talk once to grant it)"
                 !state.signedIn -> "Phone: sign in to Hermes first"
@@ -928,26 +951,24 @@ internal fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerA
         )
         Text(
             when {
-                !watchListens -> "Watch: off"
+                !watchListens -> "Watch: not listening while its app is open" + if (state.watch.watchBackgroundWakeEnabled) " (background standby below is on)" else ""
                 state.watchReachable == false -> "Watch: app not reachable; it applies this when it syncs"
-                else -> "Watch: listens for ${WakeContract.WINDOW_MS / 1000} s each time the Watch app opens, or continuously while " +
-                    "Background is started on the Watch; the Watch shows if it has no recognizer"
+                else -> "Watch: listens for ${WakeContract.WINDOW_MS / 1000} s each time the Watch app opens; the Watch shows if it has no recognizer"
             },
             style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.tertiary,
         )
         PhoneBackgroundWakeRow(state, model)
-        Text("On this phone while the app is open on screen, and with it closed or the screen off once you switch that on " +
-            "above. On the Watch also with its app closed, once you start " +
-            "Background there. Say the wake phrase, pause for the buzz, " +
-            "then speak: the request is sent when you stop talking (no time limit). Or say the request right after " +
-            "the phrase: it's sent only once the speech recognizer has finished hearing it; if it can't, nothing is " +
-            "sent and you're asked to repeat.",
-            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         OutlinedTextField(patterns, { patterns = it }, label = { Text("Wake phrases for both devices (space-separated, * wildcard)") },
             modifier = Modifier.fillMaxWidth())
-        OutlinedButton(onClick = { model.updateWatch(state.watch.copy(wakePatterns = patterns)) }) { Text("Save wake phrases") }
-        Text("Send after ${VadSilence.label(silence.toDouble())} of silence", style = MaterialTheme.typography.bodyMedium,
-            modifier = Modifier.testTag("vad_silence_label"))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(onClick = { model.updateWatch(state.watch.copy(wakePatterns = patterns)) }) { Text("Save wake phrases") }
+            InfoHelpButton(SettingsHelp.wakePatterns())
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Send after ${VadSilence.label(silence.toDouble())} of silence", style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.weight(1f).testTag("vad_silence_label"))
+            InfoHelpButton(SettingsHelp.vad())
+        }
         Slider(
             value = silence,
             onValueChange = { silence = ((it / VadSilence.STEP_SECONDS).roundToInt() * VadSilence.STEP_SECONDS).toFloat() },
@@ -956,11 +977,75 @@ internal fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerA
             steps = VadSilence.choices.size - 2,
             modifier = Modifier.fillMaxWidth().testTag("vad_silence"),
         )
-        Text("Applies to hands-free requests on both devices, from the next request on. Silence is judged by loudness " +
-            "against the room's background, not by understanding speech: steady noise such as a fan fades into the " +
-            "background, but loud changing sound (music, TV, other voices) can keep a request open until you tap, and " +
-            "very soft speech may count as silence.",
-            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+/**
+ * "Share diagnostics": a user-started, private export. The dialog says what is and is not included and whether the Watch can
+ * be reached now BEFORE anything is prepared; only Share builds the file, and the Android share sheet picks the recipient.
+ */
+@Composable
+private fun DiagnosticsRow() {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val diagnostics = PhoneApp.from(context).diagnostics
+    val scope = rememberCoroutineScope()
+    var asking by remember { mutableStateOf(false) }
+    var watchReachable by remember { mutableStateOf<Boolean?>(null) }
+    var working by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
+    SectionTitle("Share diagnostics", SettingsHelp.diagnostics())
+    Text("Prepares a private file of recent technical events and opens the share sheet. Nothing is sent unless you choose where.",
+        style = MaterialTheme.typography.bodyMedium)
+    OutlinedButton(
+        onClick = { message = null; watchReachable = null; asking = true },
+        enabled = !working,
+        modifier = Modifier.fillMaxWidth().testTag("share_diagnostics"),
+    ) { Text(if (working) "Preparing…" else "Share diagnostics…") }
+    message?.let { Text(it, modifier = Modifier.testTag("diagnostics_message"), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error) }
+    if (asking) {
+        LaunchedEffect(Unit) { watchReachable = diagnostics.watchReachable() }
+        AlertDialog(
+            onDismissRequest = { asking = false },
+            title = { Text("Share diagnostics?") },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState()).testTag("diagnostics_consent"), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Included:", style = MaterialTheme.typography.titleSmall)
+                    com.rumi.hermesvoice.core.diag.DiagReport.CONTENT_LINES.forEach { Text("• $it") }
+                    Text("Not included:", style = MaterialTheme.typography.titleSmall)
+                    com.rumi.hermesvoice.core.diag.DiagReport.EXCLUDED_LINES.forEach { Text("• $it") }
+                    Text(
+                        when (watchReachable) {
+                            true -> "Watch: reachable now, its events will be included."
+                            false -> "Watch: not reachable now, only this phone's events will be shared."
+                            null -> "Watch: checking…"
+                        },
+                        modifier = Modifier.testTag("diagnostics_watch_status"),
+                    )
+                    Text("You choose the recipient in the share sheet. This doesn't interrupt a recording or a reply.")
+                }
+            },
+            confirmButton = {
+                TextButton(modifier = Modifier.testTag("diagnostics_confirm"), onClick = {
+                    asking = false
+                    working = true
+                    scope.launch {
+                        val result = try { diagnostics.export() } finally { working = false }
+                        when (result) {
+                            is com.rumi.hermesvoice.core.diag.DiagExportResult.Ready -> {
+                                val chooser = diagnostics.shareIntent(context, result.file)
+                                message = if (chooser == null) "Couldn't prepare the file to share." else runCatching {
+                                    context.startActivity(chooser)
+                                    null
+                                }.getOrElse { "No app is available to share the file." }
+                            }
+                            com.rumi.hermesvoice.core.diag.DiagExportResult.Busy -> message = "Diagnostics are already being prepared."
+                            is com.rumi.hermesvoice.core.diag.DiagExportResult.Failed -> message = "Couldn't prepare the diagnostics file."
+                        }
+                    }
+                }) { Text("Share") }
+            },
+            dismissButton = { TextButton(onClick = { asking = false }) { Text("Cancel") } },
+        )
     }
 }
 
@@ -971,14 +1056,18 @@ internal fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerA
 @Composable
 private fun PhoneBackgroundWakeRow(state: PhoneUiState, model: PhoneViewModel) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    val wake = state.phoneWake ?: return
+    val wake = state.phoneWake
     val notifications = PhoneApp.from(context).phoneWake.notificationCapability().shown
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
         model.setPhoneBackgroundWake(true)
     }
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Text("Keep listening with this app closed or the screen off", Modifier.weight(1f))
-        Switch(checked = wake.session.running, modifier = Modifier.testTag("phone_background_wake"), onCheckedChange = { on ->
+        Text("Background standby", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
+        InfoHelpButton(SettingsHelp.standby())
+    }
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text("Phone background wake standby", Modifier.weight(1f))
+        Switch(checked = state.watch.phoneBackgroundWakeEnabled, modifier = Modifier.testTag("phone_background_wake"), onCheckedChange = { on ->
             if (on && !notifications && model.askNotificationsOnce()) {
                 notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
             } else {
@@ -986,22 +1075,166 @@ private fun PhoneBackgroundWakeRow(state: PhoneUiState, model: PhoneViewModel) {
             }
         })
     }
-    Text(BackgroundText.phoneWakeStatus(wake, notifications), style = MaterialTheme.typography.bodyMedium,
-        modifier = Modifier.testTag("phone_background_wake_status"),
-        color = if (wake.session.wanted && !wake.session.microphone) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.tertiary)
-    Text("Off by default. While on, a notification with Stop stays visible, and when this app is closed or the screen is off " +
-        "the phone listens for the wake phrase with its ON-DEVICE speech recognizer only (nothing is streamed to a server; a " +
-        "phone without one, or without the wake phrase's language, doesn't listen and says so). It uses noticeably more " +
-        "battery, has short gaps between listening windows, and Android or the phone's maker may still stop it. Opening the " +
-        "app hands listening back to the app. It doesn't survive a restart of the phone; switch it on again then.",
-        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    if (wake != null) {
+        Text(BackgroundText.phoneWakeStatus(wake, notifications), style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.testTag("phone_background_wake_status"),
+            color = if (wake.session.wanted && !wake.session.microphone) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.tertiary)
+    }
+    ScreenOffRow(
+        label = "Phone background wake recognition with screen off",
+        checked = state.watch.phoneBackgroundWakeScreenOffEnabled,
+        masterOn = state.watch.phoneBackgroundWakeEnabled,
+        device = "Phone",
+        tag = "phone_background_wake_screen_off",
+        onChange = { on -> model.setPhoneBackgroundWakeScreenOff(on) },
+    )
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text("Watch background wake standby", Modifier.weight(1f))
+        Switch(checked = state.watch.watchBackgroundWakeEnabled, modifier = Modifier.testTag("watch_background_wake"),
+            onCheckedChange = { on -> model.setWatchBackgroundWake(on) })
+    }
+    Text(
+        when {
+            !state.watch.watchBackgroundWakeEnabled -> "Watch standby: off"
+            state.watchReachable == false -> "Watch standby: requested; the Watch is not reachable, it applies this when it syncs"
+            else -> "Watch standby: requested. It starts when the Watch app is next opened (Android lets a microphone start only " +
+                "from a visible app); the Watch shows what it is really doing."
+        },
+        style = MaterialTheme.typography.bodyMedium, modifier = Modifier.testTag("watch_background_wake_status"),
+        color = MaterialTheme.colorScheme.tertiary,
+    )
+    ScreenOffRow(
+        label = "Watch background wake recognition with screen off",
+        checked = state.watch.watchBackgroundWakeScreenOffEnabled,
+        masterOn = state.watch.watchBackgroundWakeEnabled,
+        device = "Watch",
+        tag = "watch_background_wake_screen_off",
+        onChange = { on -> model.setWatchBackgroundWakeScreenOff(on) },
+    )
+}
+
+/**
+ * A device's "background wake recognition with screen off" preference: subordinate to that device's standby switch, off by
+ * default, about BACKGROUND recognition only (never the app open on screen). Shown disabled, value kept, while the standby is off.
+ */
+@Composable
+private fun ScreenOffRow(label: String, checked: Boolean, masterOn: Boolean, device: String, tag: String, onChange: (Boolean) -> Unit) {
+    SwitchRow(label, checked, enabled = masterOn, tag = tag, onChange = onChange)
+    Text(
+        when {
+            !masterOn -> "$device standby is off: no effect now. Your choice (${if (checked) "on" else "off"}) is kept."
+            checked -> "$device recognition may continue with its screen off (requested only)."
+            else -> "$device pauses listening while its own screen is off."
+        },
+        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.testTag(tag + "_note"),
+    )
 }
 
 @Composable
-private fun SwitchRow(label: String, checked: Boolean, enabled: Boolean = true, tag: String? = null, onChange: (Boolean) -> Unit) {
+private fun SwitchRow(label: String, checked: Boolean, enabled: Boolean = true, tag: String? = null, help: HelpTopic? = null,
+                      onChange: (Boolean) -> Unit) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Text(label, Modifier.weight(1f), color = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
+        if (help != null) InfoHelpButton(help)
         Switch(checked = checked, onCheckedChange = onChange, enabled = enabled,
             modifier = if (tag != null) Modifier.testTag(tag) else Modifier)
+    }
+}
+
+@Composable
+private fun SectionTitle(title: String, help: HelpTopic) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(title, style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+        InfoHelpButton(help)
+    }
+}
+
+/**
+ * A small ⓘ button that opens [topic]'s explanation in a dismissible, scrollable dialog. Opening or closing it changes nothing
+ * else: no setting, no state of the app. The button's spoken name names the option it explains.
+ */
+@Composable
+internal fun InfoHelpButton(topic: HelpTopic) {
+    var open by rememberSaveable(topic.id) { mutableStateOf(false) }
+    IconButton(onClick = { open = true },
+        modifier = Modifier.testTag(topic.buttonTag).semantics { contentDescription = topic.contentDescription }) {
+        Text("\u24D8", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.clearAndSetSemantics { })
+    }
+    if (open) HelpDialog(topic) { open = false }
+}
+
+@Composable
+private fun HelpDialog(topic: HelpTopic, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(topic.title) },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()).testTag(topic.dialogTag), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                topic.paragraphs.forEach { Text(it, style = MaterialTheme.typography.bodyMedium) }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss, modifier = Modifier.testTag("help_close")) { Text("Close") } },
+    )
+}
+
+/**
+ * How long a delivered voice request keeps being followed for later replies: a whole number in minutes, hours or days (1 minute
+ * to 3 days) or a preset. Typing changes only a draft; the value is checked and saved on Done, when the field loses focus or a
+ * unit/preset is chosen, and a refused entry is explained without being saved. The opt-in switch above is separate.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun LaterReplyWindowRow(state: PhoneUiState, model: PhoneViewModel) {
+    val stored = state.laterReplyWindowMinutes
+    var text by remember(stored) { mutableStateOf(LaterReplyWindow.displayValue(stored).toString()) }
+    var unit by remember(stored) { mutableStateOf(LaterReplyWindow.displayUnit(stored)) }
+    var wasFocused by remember { mutableStateOf(false) }
+    val focus = LocalFocusManager.current
+    fun commit() {
+        if (text != LaterReplyWindow.displayValue(stored).toString() || unit != LaterReplyWindow.displayUnit(stored)) {
+            model.commitLaterReplyWindow(text, unit)
+        }
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { value ->
+                    text = value.filter { it.isDigit() }.take(7)
+                    if (state.laterReplyWindowError != null) model.clearLaterReplyWindowError()
+                },
+                label = { Text("Follow for") },
+                singleLine = true,
+                isError = state.laterReplyWindowError != null,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { commit(); focus.clearFocus() }),
+                modifier = Modifier.widthIn(max = 120.dp).testTag("later_reply_window_value")
+                    .onFocusChanged { focusState ->
+                        if (wasFocused && !focusState.isFocused) commit()
+                        wasFocused = focusState.isFocused
+                    },
+            )
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                LaterReplyWindow.Unit.values().forEach { choice ->
+                    FilterChip(selected = unit == choice, onClick = { unit = choice; model.commitLaterReplyWindow(text, choice) },
+                        label = { Text(choice.label) }, modifier = Modifier.testTag("later_reply_unit_${choice.name.lowercase()}"))
+                }
+            }
+        }
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            LaterReplyWindow.presets.forEach { minutes ->
+                FilterChip(selected = stored == minutes, onClick = {
+                    text = LaterReplyWindow.displayValue(minutes).toString()
+                    unit = LaterReplyWindow.displayUnit(minutes)
+                    model.setLaterReplyWindowMinutes(minutes)
+                }, label = { Text(LaterReplyWindow.describe(minutes)) }, modifier = Modifier.testTag("later_reply_preset_$minutes"))
+            }
+        }
+        state.laterReplyWindowError?.let {
+            Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.testTag("later_reply_window_error"))
+        }
     }
 }

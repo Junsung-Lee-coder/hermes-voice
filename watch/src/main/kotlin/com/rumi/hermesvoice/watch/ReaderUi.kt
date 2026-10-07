@@ -345,8 +345,9 @@ fun SessionsSurface(
 /** What a press does now, or what the voice request is doing: recording, sending, waiting, the wake phrase. */
 fun talkHint(talk: WatchTalkState, wakeListening: Boolean): String = when {
     talk.phase == WatchPhase.RECORDING -> "● Recording · hold 1 s to send"
-    talk.line.isNotBlank() -> talk.line
+    talk.line.isNotBlank() -> if (talk.waitingCount > 1) "${talk.line} · ${talk.waitingCount} waiting" else talk.line
     wakeListening -> "Listening for the wake phrase…"
+    talk.waitingCount > 0 -> "${talk.waitingCount} waiting for a reply · hold 1 s to talk"
     else -> "Hold 1 s to talk"
 }
 

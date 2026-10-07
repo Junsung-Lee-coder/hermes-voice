@@ -35,7 +35,11 @@ class PhoneBackgroundWakeTest {
     private class Phone {
         val calls = mutableListOf<String>()
         var now = 0L
-        var settings = WatchSettings(WakeLocation.PHONE, "루미", revision = 1)
+        var settings = WatchSettings(WakeLocation.PHONE, "루미", revision = 1, phoneBackgroundWakeEnabled = true)
+        var recording = false
+
+        /** The Phone's live screen state (the platform's answer; the earlier fixture reported it off always). */
+        var screenOn = true
         var permission = true
         var onDevice = true
         var notifications = NotificationCapability.SHOWN
@@ -62,6 +66,7 @@ class PhoneBackgroundWakeTest {
             override fun cancelCapture(reason: String) { calls += "cancel_capture:$reason" }
             override fun post(block: () -> Unit) { posted += block }
             override fun statusChanged(status: PhoneWakeStatus) { statuses += status }
+            override fun recordingActive() = recording
         }
 
         val holds = WakeHolds(object : WakeLockPort {
@@ -81,8 +86,8 @@ class PhoneBackgroundWakeTest {
             override fun sendRecognized(request: String) { calls += "send:$request" }
             override fun closed(reason: String) { calls += "closed:$reason" }
             override fun wakeAccepted() { accepted += 1 }
-            override fun armInputs() = WakeArmInputs(enabled = settings.wakeLocation.listensOn(VoiceOrigin.PHONE), resumed = false,
-                interactive = false, ambient = false, permission = permission, microphoneMuted = false, talkIdle = !busy,
+            override fun armInputs() = WakeArmInputs(enabled = settings.mayListen(VoiceOrigin.PHONE), resumed = false,
+                interactive = screenOn, ambient = false, permission = permission, microphoneMuted = false, talkIdle = !busy,
                 phoneReachable = true, nowMs = now, cooldownUntilMs = 0, generation = 0, lastArmedGeneration = null)
         }
 
@@ -132,7 +137,7 @@ class PhoneBackgroundWakeTest {
         assertTrue(phone.status().listeningNow)
         val listen = phone.held.getValue(HoldReason.LISTEN)
         assertTrue("bounded by the window", listen in 1..(WakeContract.BACKGROUND_WINDOW_MS + 10_000))
-        assertTrue("no hold without a reason", phone.held.keys.all { it in setOf(HoldReason.LISTEN, HoldReason.HANDOFF, HoldReason.REARM) })
+        assertTrue("no hold without a reason", phone.held.keys.all { it in setOf(HoldReason.LISTEN, HoldReason.HANDOFF) })
     }
 
     @Test
@@ -176,6 +181,8 @@ class PhoneBackgroundWakeTest {
     fun `each blocker keeps the microphone off and says why`() {
         val cases = listOf<Pair<(Phone) -> Unit, BackgroundNotice>>(
             { p: Phone -> p.settings = WatchSettings(WakeLocation.WATCH, "루미", revision = 1) } to BackgroundNotice.RUNNING,
+            // The foreground location alone never lets a hidden Phone listen: only its own standby switch does.
+            { p: Phone -> p.settings = WatchSettings(WakeLocation.PHONE, "루미", revision = 1) } to BackgroundNotice.RUNNING,
             { p: Phone -> p.permission = false } to BackgroundNotice.NEEDS_PERMISSION,
             { p: Phone -> p.onDevice = false } to BackgroundNotice.NO_RECOGNIZER,
             { p: Phone -> p.notifications = NotificationCapability.NOT_ALLOWED } to BackgroundNotice.NEEDS_NOTIFICATIONS,
@@ -195,13 +202,13 @@ class PhoneBackgroundWakeTest {
     @Test
     fun `a blocker arriving while hidden disarms at once, and nothing re-arms until the app is shown`() {
         val phone = startedAndHidden()
-        phone.settings = WatchSettings(WakeLocation.WATCH, "루미", revision = 2)
+        phone.settings = WatchSettings(WakeLocation.PHONE, "루미", revision = 2, phoneBackgroundWakeEnabled = false)
         phone.background.onEligibilityChanged()
         phone.drain()
         assertFalse(phone.background.owning)
         assertFalse(phone.status().session.microphone)
         assertTrue(phone.calls.contains("service_retype:mic=false"))
-        phone.settings = WatchSettings(WakeLocation.PHONE, "루미", revision = 3)
+        phone.settings = WatchSettings(WakeLocation.PHONE, "루미", revision = 3, phoneBackgroundWakeEnabled = true)
         phone.background.onEligibilityChanged()
         phone.background.onRearmDue()
         assertEquals("still not armed from the background", 1, phone.listened())
@@ -275,5 +282,141 @@ class PhoneBackgroundWakeTest {
         assertTrue(phone.held.isEmpty())
         phone.background.onAppShown()
         assertEquals("a microphone session resumes only by the user's start", BackgroundNotice.PAUSED, phone.status().session.notice)
+    }
+
+    // ── the Phone's own background standby switch ────────────────────────────────────────────
+
+    @Test
+    fun `phone standby on listens hidden even though the foreground location is off`() {
+        val phone = Phone()
+        phone.settings = WatchSettings(WakeLocation.OFF, "루미", revision = 1, phoneBackgroundWakeEnabled = true)
+        phone.background.onAppShown()
+        assertTrue(phone.background.start().microphone)
+        phone.background.onAppHidden()
+        phone.drain()
+        assertTrue(phone.background.owning)
+        assertEquals(1, phone.listened())
+    }
+
+    @Test
+    fun `phone standby off during an open window releases the recognizer and holds at once`() {
+        val phone = startedAndHidden()
+        assertTrue("a window is open", phone.wake.listening)
+        phone.calls.clear()
+        phone.settings = phone.settings.copy(revision = 2, phoneBackgroundWakeEnabled = false)
+        phone.background.onEligibilityChanged()
+        phone.drain()
+        assertFalse(phone.background.owning)
+        assertTrue(phone.calls.contains("recognizer_release"))
+        assertTrue(phone.calls.contains("rearm_cancel"))
+        assertTrue(phone.held.isEmpty())
+        assertTrue(phone.calls.contains("service_retype:mic=false"))
+        assertFalse("not a Stop of the session", phone.calls.contains("service_stop"))
+        assertTrue(phone.status().session.running)
+    }
+
+    @Test
+    fun `phone standby off in the gap between windows cancels the re-arm and a stale due listens to nothing`() {
+        val phone = startedAndHidden()
+        phone.wake.onTimer()
+        phone.wake.onError(phone.wake.generation, 7)
+        assertTrue("the next window is scheduled", phone.calls.any { it.startsWith("rearm_in:") })
+        phone.calls.clear()
+        phone.settings = phone.settings.copy(revision = 2, phoneBackgroundWakeEnabled = false)
+        phone.background.onEligibilityChanged()
+        phone.drain()
+        assertFalse(phone.background.owning)
+        assertTrue(phone.calls.contains("rearm_cancel"))
+        assertTrue(phone.held.isEmpty())
+        val listens = phone.listened()
+        phone.background.onRearmDue()
+        phone.drain()
+        assertEquals("a stale timer callback listens to nothing", listens, phone.listened())
+    }
+
+    @Test
+    fun `the standby switch turned off ends the session and leaves nothing scheduled or held`() {
+        val phone = startedAndHidden()
+        phone.calls.clear()
+        phone.settings = phone.settings.copy(revision = 2, phoneBackgroundWakeEnabled = false)
+        val status = phone.background.onStandbyOff()
+        phone.drain()
+        assertFalse(status.wanted)
+        assertFalse(phone.status().session.running)
+        assertTrue(phone.calls.contains("service_stop"))
+        assertTrue(phone.calls.contains("rearm_cancel"))
+        assertTrue(phone.held.isEmpty())
+        assertFalse(phone.background.owning)
+    }
+
+    @Test
+    fun `the standby switch turned off while hidden and recording lets the recording finish before the session ends`() {
+        val phone = startedAndHidden()
+        phone.wake.onResults(phone.wake.generation, listOf("루미"), final = true)
+        assertTrue(phone.wake.onHandoffDue(captureIdle = true))
+        phone.recording = true
+        phone.calls.clear()
+        phone.settings = phone.settings.copy(revision = 2, phoneBackgroundWakeEnabled = false)
+        phone.background.onStandbyOff()
+        phone.drain()
+        assertFalse(phone.calls.any { it.startsWith("capture_cancelled") || it.startsWith("cancel_capture") })
+        assertFalse("the session stays until the recording ends", phone.calls.contains("service_stop"))
+        phone.recording = false
+        phone.wake.onRequestCaptureEnded(sent = true)
+        phone.background.onIdle()
+        phone.drain()
+        assertTrue(phone.calls.contains("service_stop"))
+        assertTrue(phone.held.isEmpty())
+        assertFalse(phone.background.owning)
+    }
+
+    @Test
+    fun `a standby switched back on before the recording ends keeps the session`() {
+        val phone = startedAndHidden()
+        phone.wake.onResults(phone.wake.generation, listOf("루미"), final = true)
+        assertTrue(phone.wake.onHandoffDue(captureIdle = true))
+        phone.recording = true
+        phone.settings = phone.settings.copy(revision = 2, phoneBackgroundWakeEnabled = false)
+        phone.background.onStandbyOff()
+        phone.settings = phone.settings.copy(revision = 3, phoneBackgroundWakeEnabled = true)
+        phone.recording = false
+        phone.wake.onRequestCaptureEnded(sent = true)
+        phone.background.onIdle()
+        phone.drain()
+        assertFalse(phone.calls.contains("service_stop"))
+        assertTrue(phone.status().session.running)
+    }
+
+    @Test
+    fun `phone standby off never cancels a hands-free recording already under way`() {
+        val phone = startedAndHidden()
+        phone.wake.onResults(phone.wake.generation, listOf("루미"), final = true)
+        assertTrue(phone.wake.onHandoffDue(captureIdle = true))
+        phone.recording = true
+        phone.calls.clear()
+        phone.settings = phone.settings.copy(revision = 2, phoneBackgroundWakeEnabled = false)
+        phone.background.onEligibilityChanged()
+        phone.drain()
+        assertFalse(phone.calls.any { it.startsWith("capture_cancelled") || it.startsWith("cancel_capture") })
+        assertFalse("the microphone type stays until the recording ends", phone.calls.contains("service_retype:mic=false"))
+        phone.recording = false
+        phone.wake.onRequestCaptureEnded(sent = true)
+        phone.background.onIdle()
+        phone.drain()
+        assertTrue(phone.calls.contains("service_retype:mic=false"))
+        assertTrue(phone.held.isEmpty())
+        assertFalse(phone.background.owning)
+    }
+
+    @Test
+    fun `the gaps between windows hold no wake lock on the phone either`() {
+        val phone = startedAndHidden()
+        phone.wake.onTimer()
+        repeat(50) {
+            phone.wake.onError(phone.wake.generation, 7)
+            assertTrue("gap $it holds nothing", phone.held.isEmpty())
+            phone.background.onRearmDue()
+        }
+        assertTrue(phone.held.containsKey(HoldReason.LISTEN))
     }
 }

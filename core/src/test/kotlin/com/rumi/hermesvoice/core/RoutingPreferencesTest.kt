@@ -93,7 +93,7 @@ class RoutingPreferencesTest {
                 timeline += "route"
                 return Turn(listOf(RecipientEvent.Complete(routingReply, "complete")))
             }
-            timeline += "submit:$storedSessionId:$text"
+            timeline += "submit:$storedSessionId:${voiceWords(text)}" // the leading voice marker is not part of what these assertions compare
             return Turn(listOf(RecipientEvent.Complete("final", "complete")))
         }
     }

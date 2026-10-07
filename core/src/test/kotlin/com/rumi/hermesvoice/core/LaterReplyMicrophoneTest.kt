@@ -61,7 +61,7 @@ class LaterReplyMicrophoneTest {
 
     private fun harness(deferMaxMs: Long = 60_000L) = CoreHarness(laterScope = scope, voiceListener = listener,
         wakeListening = { it == VoiceOrigin.PHONE && phoneWindow },
-        // Like PhoneApp: the CPU hold of one attempt (synthesis and handoff)...
+        // Like PhoneApp: the CPU hold of one clip's handoff and playback (never its synthesis)...
         laterWork = { work ->
             holding += 1
             try {
@@ -272,7 +272,7 @@ class LaterReplyMicrophoneTest {
     }
 
     @Test
-    fun `the CPU-holding part covers synthesis and handoff only, synthesis once per spoken reply`() {
+    fun `the CPU-holding part covers handoff and playback only, never the wait for synthesis - and synthesis once per spoken reply`() {
         harness().use { h ->
             val work = existing(h, "work", "Started.")
             routeTo(h, "work")

@@ -594,6 +594,7 @@ class AppSessionRepository(
         }
     }
 
+    /** The stored rows of one of our conversations exactly as the server holds them (a voice request's row starts with its marker). */
     suspend fun history(storedSessionId: String, limit: Int = 50, offset: Int = 0): HistoryPage {
         verifyConversation(storedSessionId)
         return api.getMessages(storedSessionId, limit, offset)

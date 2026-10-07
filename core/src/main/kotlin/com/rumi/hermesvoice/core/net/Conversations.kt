@@ -9,7 +9,6 @@ import com.rumi.hermesvoice.core.HermesException
 import com.rumi.hermesvoice.core.HermesRpcException
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -512,6 +511,11 @@ class GatewayConversationPort(
     }
 }
 
+private val KNOWN_TYPES = setOf("message.start", "message.interim", "message.delta", "message.complete", "error")
+
+/** Event types that only keep a connection alive: they are not progress of a response. */
+private val KEEP_ALIVE_TYPES = setOf("ping", "pong", "heartbeat", "keepalive", "keep_alive")
+
 private class GatewaySubmittedTurn(
     private val subscription: GatewaySubscription,
     override val submitStatus: String,
@@ -544,71 +548,93 @@ private class GatewaySubmittedTurn(
             "owned_ms=$ownedAfterMs ended_ms=$endedAfterMs end=$ending"
     }
 
+    /**
+     * [timeoutMs] is an INACTIVITY bound: the longest the destination may stay silent. Every real gateway event (a
+     * message start, delta, interim or complete, an error, any other typed event) starts it afresh; keep-alive
+     * pings and timers do not. It never runs while [onEvent] runs, so the synthesis and playback of a reply
+     * are not part of it, and no total time limit applies to a healthy response.
+     */
     override suspend fun collect(timeoutMs: Long, onEvent: suspend (RecipientEvent) -> Unit) {
         if (!attributable) throw HermesProtocolException("prompt.submit status '$submitStatus' cannot be attributed to this turn")
         var completed = false
         val startedAt = System.nanoTime()
         fun elapsed() = (System.nanoTime() - startedAt) / 1_000_000
         try {
-            withTimeout(timeoutMs) {
-                var owned = false
-                for (event in subscription.events) {
-                    val known = event.type in setOf("message.start", "message.interim", "message.delta", "message.complete", "error")
-                    seen.merge(if (known) event.type else "other", 1, Int::plus)
-                    when (event.type) {
-                        "message.start" -> if (turnsToSkip == 0 && !owned) {
-                            owned = true
-                            ownedAfterMs = elapsed()
-                        }
-                        "message.complete" -> if (!owned) {
-                            if (turnsToSkip > 0) turnsToSkip--
-                            // This session's next turn is ours (turnsToSkip is 0), and it ended in failure before it
-                            // started (tui_gateway's _emit_terminal_turn_error sends no message.start): say so now.
-                            else {
-                                val failed = event.payload
-                                if (failed != null && failed.optString("status") == "error") {
-                                    ending = "failed_before_start"
-                                    endedAfterMs = elapsed()
-                                    throw HermesProtocolException("destination turn failed before it started: " +
-                                        failed.optString("error").ifBlank { "error" }.take(160))
-                                }
+            var owned = false
+            while (true) {
+                // Waits for the next event that is progress; a keep-alive does not restart the bound.
+                val received = withTimeoutOrNull(timeoutMs) { nextProgressEvent() }
+                if (received == null) {
+                    ending = "timeout"
+                    endedAfterMs = elapsed()
+                    throw HermesProtocolException("no gateway activity for ${timeoutMs}ms before message.complete")
+                }
+                val event = received.getOrNull() ?: break
+                val known = event.type in KNOWN_TYPES
+                seen.merge(if (known) event.type else "other", 1, Int::plus)
+                when (event.type) {
+                    "message.start" -> if (turnsToSkip == 0 && !owned) {
+                        owned = true
+                        ownedAfterMs = elapsed()
+                    }
+                    "message.complete" -> if (!owned) {
+                        if (turnsToSkip > 0) turnsToSkip--
+                        // This session's next turn is ours (turnsToSkip is 0), and it ended in failure before it
+                        // started (tui_gateway's _emit_terminal_turn_error sends no message.start): say so now.
+                        else {
+                            val failed = event.payload
+                            if (failed != null && failed.optString("status") == "error") {
+                                ending = "failed_before_start"
+                                endedAfterMs = elapsed()
+                                throw HermesProtocolException("destination turn failed before it started: " +
+                                    failed.optString("error").ifBlank { "error" }.take(160))
                             }
-                        } else {
-                            val payload = event.payload ?: JSONObject()
-                            completed = true
-                            ownDone = true
-                            ending = "complete:${payload.optString("status").ifBlank { "none" }}"
-                            endedAfterMs = elapsed()
-                            if (superseded) release()
-                            onEvent(RecipientEvent.Complete(payloadText(payload),
-                                payload.optString("status").ifBlank { null }))
-                            return@withTimeout
                         }
-                        "message.interim" -> if (owned) onEvent(RecipientEvent.Interim(payloadText(event.payload ?: JSONObject())))
-                        "error" -> if (owned) {
-                            ending = "error"
-                            endedAfterMs = elapsed()
-                            throw HermesProtocolException("destination turn failed: ${event.payload?.optString("message").orEmpty().take(200)}")
-                        } else if (turnsToSkip == 0) {
-                            // Ours, refused or cancelled before it started (tui_gateway emits a bare error, no
-                            // message.start: _admit_prompt_turn, "cancelled before the agent was ready").
-                            ending = "failed_before_start"
-                            endedAfterMs = elapsed()
-                            throw HermesProtocolException("destination turn failed before it started: " +
-                                event.payload?.optString("message").orEmpty().take(160))
-                        }
+                    } else {
+                        val payload = event.payload ?: JSONObject()
+                        completed = true
+                        ownDone = true
+                        ending = "complete:${payload.optString("status").ifBlank { "none" }}"
+                        endedAfterMs = elapsed()
+                        if (superseded) release()
+                        onEvent(RecipientEvent.Complete(payloadText(payload),
+                            payload.optString("status").ifBlank { null }))
+                        return
+                    }
+                    "message.interim" -> if (owned) onEvent(RecipientEvent.Interim(payloadText(event.payload ?: JSONObject())))
+                    "error" -> if (owned) {
+                        ending = "error"
+                        endedAfterMs = elapsed()
+                        throw HermesProtocolException("destination turn failed: ${event.payload?.optString("message").orEmpty().take(200)}")
+                    } else if (turnsToSkip == 0) {
+                        // Ours, refused or cancelled before it started (tui_gateway emits a bare error, no
+                        // message.start: _admit_prompt_turn, "cancelled before the agent was ready").
+                        ending = "failed_before_start"
+                        endedAfterMs = elapsed()
+                        throw HermesProtocolException("destination turn failed before it started: " +
+                            event.payload?.optString("message").orEmpty().take(160))
                     }
                 }
-                ending = "stream_ended"
-                throw HermesProtocolException("gateway event stream ended before message.complete")
             }
-        } catch (timeout: TimeoutCancellationException) {
-            ending = "timeout"
-            endedAfterMs = elapsed()
-            throw HermesProtocolException("no message.complete within ${timeoutMs}ms", timeout)
+            ending = "stream_ended"
+            throw HermesProtocolException("gateway event stream ended before message.complete")
         } finally {
             // Kept open after this turn's own reply only, until [collectLater] or [release].
             if (!completed) release()
+        }
+    }
+
+    /** The next event that counts as progress (a Result holding it), or a Result holding null when the stream ended. Throws if the stream failed. */
+    private suspend fun nextProgressEvent(): Result<GatewayEvent?> {
+        while (true) {
+            val result = subscription.events.receiveCatching()
+            if (result.isClosed) {
+                result.exceptionOrNull()?.let { throw it }
+                return Result.success(null)
+            }
+            val event = result.getOrThrow()
+            if (event.type.lowercase() !in KEEP_ALIVE_TYPES) return Result.success(event)
+            seen.merge("keepalive", 1, Int::plus)
         }
     }
 

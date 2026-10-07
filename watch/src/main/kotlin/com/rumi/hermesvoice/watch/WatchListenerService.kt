@@ -60,10 +60,16 @@ class WatchListenerService : WearableListenerService() {
         when (event.path) {
             WatchLinkPaths.STATE -> TurnStateMessage.decode(event.data)?.let { app.scope.launch { app.onPhoneState(it) } }
             WatchLinkPaths.STOP -> TurnStateMessage.decode(event.data)?.let { app.scope.launch { app.stopPlayback("stopped", it.turnId) } }
+            WatchLinkPaths.DIAG_REQUEST -> app.onDiagRequest(event.sourceNodeId, event.data)
             WatchLinkPaths.WAKE_VERDICT -> {
                 val source = event.sourceNodeId
                 val data = event.data
                 app.scope.launch { app.onWakeVerdict(source, data) }
+            }
+            WatchLinkPaths.NAVIGATE -> {
+                val source = event.sourceNodeId
+                val data = event.data
+                app.scope.launch { app.onNavigation(source, data) }
             }
             WatchLinkPaths.READER_RESPONSE -> {
                 val source = event.sourceNodeId

@@ -9,6 +9,9 @@ import com.rumi.hermesvoice.core.net.HermesGatewayConnector
 import com.rumi.hermesvoice.core.sessions.OwnedSessionRegistry
 import com.rumi.hermesvoice.core.VoiceOrigin
 import com.rumi.hermesvoice.core.audio.AudioInputVerdict
+import com.rumi.hermesvoice.core.diag.DiagCode
+import com.rumi.hermesvoice.core.diag.DiagOrigin
+import com.rumi.hermesvoice.core.diag.DiagVoiceListener
 import com.rumi.hermesvoice.core.background.BackgroundNotice
 import com.rumi.hermesvoice.core.background.BackgroundPort
 import com.rumi.hermesvoice.core.background.BackgroundSession
@@ -22,6 +25,7 @@ import com.rumi.hermesvoice.core.settings.AppSettings
 import com.rumi.hermesvoice.core.voice.AssembledRoute
 import com.rumi.hermesvoice.core.voice.AudioOwnership
 import com.rumi.hermesvoice.core.voice.MicrophoneClaim
+import com.rumi.hermesvoice.core.voice.PendingTurn
 import com.rumi.hermesvoice.core.voice.PlaybackCue
 import com.rumi.hermesvoice.core.voice.PlaybackRoute
 import com.rumi.hermesvoice.core.voice.RoutedNavigation
@@ -51,6 +55,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 
@@ -79,6 +84,9 @@ class PhoneApp : Application() {
     /** This install's own flags (the relay opt-in, notifications asked), excluded from backup and transfer. */
     val localStore by lazy { SharedPreferencesKeyValueStore(prefs(DeviceLocalFlags.PHONE_PREFERENCES)) }
 
+    /** Typed diagnostic events and the user-started, private export of them (see [PhoneDiagnostics]). */
+    val diagnostics: PhoneDiagnostics by lazy { PhoneDiagnostics(this) }
+
     /** "Speak later replies": this install's own informed opt-in, off unless switched on here (device-local, never restored). */
     val laterConsent: LaterReplyConsent by lazy { LaterReplyConsent(localStore) }
 
@@ -101,6 +109,7 @@ class PhoneApp : Application() {
         if (DeviceLocalFlags.dropLegacy(settingsStore, localStore)) Log.i(RELAY_TAG, "legacy relay flags dropped from the backed-up settings")
         // An undelivered earlier build kept "speak later replies" in the backed-up settings: never taken as consent here.
         if (LaterReplyConsent.dropLegacy(settingsStore)) Log.i(VOICE_TAG, "legacy later-reply opt-in dropped from the backed-up settings")
+        appScope.launch(Dispatchers.IO) { runCatching { diagnostics.pruneOnStart() } }
         PhoneRelayService.createChannel(this)
         PhoneWakeService.createChannel(this)
         _relayStatus.value = relay.status
@@ -209,6 +218,7 @@ class PhoneApp : Application() {
 
     /** Ends following later replies, and every later reply waiting or playing (a Stop, or the option switched off). */
     fun stopLaterReplies() {
+        diagnostics.log.record(DiagCode.STOP_ALL, DiagOrigin.PHONE)
         wiring?.core?.orchestrator?.stopFollowing()
     }
 
@@ -248,28 +258,58 @@ class PhoneApp : Application() {
 
     private val turns = ConcurrentHashMap<Job, String>()
 
-    /** How many Phone-origin voice turns are being sent, answered or played. */
+    /**
+     * How many Phone-origin voice turns are being SENT (recorded audio or text on its way to the destination, its
+     * acknowledgement spoken): not while a delivered turn only waits for its reply, or for an earlier request to its
+     * conversation, so a new request is accepted meanwhile. The waiting turns are in [pendingTurns].
+     */
     val phoneTurns = MutableStateFlow(0)
 
+    /** The accepted voice requests (either device) that are not finished: transmitting, queued, awaiting a reply or speaking it. */
+    val pendingTurns = MutableStateFlow<List<PendingTurn>>(emptyList())
+
+    private var pendingJob: Job? = null
+
+    /** Voice turns (either origin) in their sending phase; the CPU hold of a turn lasts exactly that long (see [launchTurn]). */
+    private val transmitting = java.util.concurrent.atomic.AtomicInteger()
+    private val transmissionEnds = ConcurrentHashMap<String, () -> Unit>()
+
+    /** The turn's sending phase ended (delivered, or it ends without delivery): nothing is held on its behalf any more. */
+    private fun onTransmitted(turnId: String) {
+        transmissionEnds[turnId]?.invoke()
+    }
+
+    /** Stops ONE pending voice request wherever it is (a Stop of the pending list); false when it already ended. */
+    fun stopPendingTurn(turnId: String): Boolean = wiring?.core?.orchestrator?.stopTurn(turnId) == true
+
     /**
-     * Runs one voice turn (Phone or Watch origin) in the application scope, with a time-limited
-     * CPU hold for as long as any turn runs. [phoneOrigin] turns are counted for the Phone's UI.
-     * [microphone]: the recording's claim, taken over by the orchestrator when the turn starts; given
-     * back when the job ends in any way (also cancelled before it ran), so it is never left held.
+     * Runs one voice turn (Phone or Watch origin) in the application scope. The CPU is held awake only while a turn
+     * is being SENT (bounded), never while it waits for its reply or an earlier request. [phoneOrigin] turns are counted
+     * for the Phone's UI while they are sent. [microphone]: the recording's claim, taken over by the orchestrator when the
+     * turn starts; given back when the job ends in any way (also cancelled before it ran), so it is never left held.
      */
     fun launchTurn(turnId: String, phoneOrigin: Boolean, microphone: MicrophoneClaim? = null, block: suspend () -> Unit): Job {
-        if (phoneOrigin) phoneTurns.value += 1
+        if (phoneOrigin) phoneTurns.update { it + 1 }
+        val sending = java.util.concurrent.atomic.AtomicBoolean(true)
+        val endSending = {
+            if (sending.compareAndSet(true, false)) {
+                if (phoneOrigin) phoneTurns.update { it - 1 }
+                if (transmitting.decrementAndGet() == 0) holds.release(HoldReason.TURN)
+            }
+        }
+        transmissionEnds[turnId] = endSending
         val job = appScope.launch(start = CoroutineStart.LAZY) {
             try {
                 block()
             } finally {
                 turns.remove(coroutineContext[Job])
-                if (phoneOrigin) phoneTurns.value -= 1
-                if (turns.isEmpty()) holds.release(HoldReason.TURN)
+                transmissionEnds.remove(turnId)
+                endSending()
             }
         }
         job.invokeOnCompletion { microphone?.release() }
         turns[job] = turnId
+        transmitting.incrementAndGet()
         holds.acquire(HoldReason.TURN)
         job.start()
         return job
@@ -305,12 +345,15 @@ class PhoneApp : Application() {
         // informed opt-in (Settings, off by default, device-local). The CPU is kept awake for each attempt
         // to synthesize and hand one off (bounded), never while it waits. Recordings claim this Phone's
         // microphone in [audio] before opening it, and a later reply is admitted there only when none does.
-        val (core, connector) = HermesVoiceCore.connect(endpoint, http, tokens, registry, settings, voiceTrace,
+        val (core, connector) = HermesVoiceCore.connect(endpoint, http, tokens, registry, settings, DiagVoiceListener(voiceTrace, diagnostics.log),
             laterScope = appScope, laterWork = ::laterReplyHold,
             wakeListening = { device -> device == VoiceOrigin.PHONE && phoneWakeListening() },
             laterEnabled = { laterConsent.enabled }, ownership = audio,
-            laterSpeaker = { device, holding -> if (device == VoiceOrigin.PHONE) phoneSpeakerLater(holding) })
+            laterSpeaker = { device, holding -> if (device == VoiceOrigin.PHONE) phoneSpeakerLater(holding) },
+            diag = diagnostics.log)
         val dashboard = core.speech as HermesDashboardClient
+        pendingJob?.cancel()
+        pendingJob = appScope.launch { core.orchestrator.pending.collect { pendingTurns.value = it } }
         // A new core has a new (empty) playback route.
         currentRoute.value = core.orchestrator.playbackRoute
         // Both: every admitted wake request is told to the Phone's own wake flow and to the Watch,
@@ -339,7 +382,7 @@ class PhoneApp : Application() {
         speakingLater.value = now > 0
     }
 
-    /** One attempt to synthesize and hand off a later reply, on either device: the CPU stays awake for it (bounded). */
+    /** The handoff and playback of one clip of a reply, on either device: the CPU stays awake for it (bounded). Waiting for synthesis holds nothing. */
     private suspend fun laterReplyHold(work: suspend () -> Unit) {
         laterAttempts.incrementAndGet()
         holds.acquire(HoldReason.PLAYBACK, LATER_REPLY_HOLD_MS)
@@ -416,6 +459,11 @@ class PhoneApp : Application() {
 
         override fun onStage(turnId: String, stage: VoiceTurnStage) = log("stage turn=${turnId.take(12)} $stage")
 
+        override fun onTransmitted(turnId: String) {
+            log("transmitted turn=${turnId.take(12)} (waiting for the reply holds nothing)")
+            this@PhoneApp.onTransmitted(turnId)
+        }
+
         override fun onRouted(route: AssembledRoute) {
             log("routed turn=${route.turnId.take(12)} alias=${route.destination.alias} created=${route.created} direct=${route.direct}" +
                 // Debug builds only: the acknowledgement the Phone composed for a conversation it created
@@ -457,9 +505,11 @@ class PhoneApp : Application() {
         const val REGISTRY_PREFS_PREFIX = "hermes_voice_sessions_"
 
         /**
-         * One attempt to synthesize and hand off a later reply: the bound of that CPU hold. The orchestrator
-         * bounds synthesis to 2 minutes, the wake window's close to 3 seconds and playback to 5 minutes
-         * (7 min 3 s), plus a small margin; it is let go as soon as the attempt ends. A busy retry is a new attempt.
+         * One unit of speaking a reply (the handoff and playback of one chunk): the bound of that CPU hold, renewed for
+         * every chunk, so a long reply is never cut by it. A chunk of at most
+         * [com.rumi.hermesvoice.core.voice.TtsBatcher.SINGLE_MAX] characters plays for minutes at most; the margin covers
+         * the 3 s wake window close. Waiting for its synthesis holds nothing. It is let go as soon as the unit ends; a busy retry
+         * is a new unit; nothing is held while a reply only waits.
          */
         private const val LATER_REPLY_HOLD_MS = 7 * 60_000L + 5_000L
 

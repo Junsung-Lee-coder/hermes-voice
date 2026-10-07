@@ -2,6 +2,7 @@ package com.rumi.hermesvoice.core.wake
 
 import com.rumi.hermesvoice.core.VoiceOrigin
 import com.rumi.hermesvoice.core.settings.VadSilence
+import com.rumi.hermesvoice.core.settings.WakeGate
 import com.rumi.hermesvoice.core.settings.WakeLocation
 import com.rumi.hermesvoice.core.settings.WakePhrasePatterns
 import com.rumi.hermesvoice.core.settings.WatchSettings
@@ -30,6 +31,12 @@ interface WakeDevicePort {
 
     /** Platform facts for arming (foreground, screen, permission, microphone, idle, reachability, cooldown). */
     fun armInputs(): WakeArmInputs
+
+    /**
+     * Whether THIS device's own screen is interactive right now (ambient/AOD counts as not interactive), as the platform
+     * says it, ignoring any waiver a wrapper applies for an armed session. Decides a standby's screen-off eligibility.
+     */
+    fun screenInteractive(): Boolean = armInputs().let { it.interactive && !it.ambient }
 
     /** A request to listen was refused; for logs and availability status. */
     fun armBlocked(source: String, block: WakeBlock) {}
@@ -80,8 +87,9 @@ interface WakeClaimPort {
 
 /**
  * One device's foreground wake flow, independent of Android, shared by the Phone and the Watch:
- * it applies the Phone-owned [WatchSettings] (the device listens only when
- * [com.rumi.hermesvoice.core.settings.WakeLocation.listensOn] it), opens one recognizer window per
+ * it applies the Phone-owned [WatchSettings] (the device listens only when its [gate] includes it: the
+ * [com.rumi.hermesvoice.core.settings.WakeLocation] while its app is on screen, its own background standby switch
+ * while it is hidden in an armed session, never one for the other), opens one recognizer window per
  * visibility generation ([WakeWindowCoordinator]), hands a phrase-only result to the app's recorder
  * through a cancellable, generation-bound gate ([WakeHandoffGate]) and sends a same-breath FINAL
  * request as text.
@@ -153,7 +161,7 @@ class WakeDeviceController(
     private var capturing = false
 
     /** Both devices may listen, so one wake episode must be admitted from one of them. */
-    private val arbitrated: Boolean get() = claims != null && settings.wakeLocation == WakeLocation.BOTH
+    private val arbitrated: Boolean get() = claims != null && settings.arbitrationRequired
     private val window = WakeWindowCoordinator(recognizer, timer, host, clock)
     private val handoffGate = WakeHandoffGate()
     private var handoffGeneration = -1L
@@ -171,8 +179,50 @@ class WakeDeviceController(
     /** How long the next window stays open without hearing the phrase ([WakePresence] lengthens it for a background session). */
     var windowMs: Long = WakeContract.WINDOW_MS
 
-    /** Whether this device listens under the current mode. */
-    val enabledHere: Boolean get() = settings.wakeLocation.listensOn(device)
+    /** Which switch decides whether this device may listen now: the foreground location, or its own background standby. */
+    var gate: WakeGate = WakeGate.FOREGROUND
+        private set
+
+    /**
+     * Whether this device may listen under the current settings and [gate]: in the foreground the wake location alone
+     * decides, in the standby the device's own standby switch alone (whatever the location). Whether a window really
+     * opens is the presence's decision ([WakePresence]).
+     */
+    val enabledHere: Boolean get() = when (gate) {
+        WakeGate.FOREGROUND -> settings.listensIn(device, WakeGate.FOREGROUND)
+        WakeGate.STANDBY -> settings.standbyListens(device, screenInteractive)
+    }
+
+    /** This device's own screen was interactive when the presence last reconciled it (see [WakePresence]); only the standby gate reads it. */
+    var screenInteractive: Boolean = true
+        private set
+
+    /** The standby is on but this device's own screen is off and its screen-off preference is off: it waits for the screen. */
+    val screenDenied: Boolean
+        get() = gate == WakeGate.STANDBY && settings.backgroundWakeEnabled(device) && !enabledHere
+
+    /** The platform's own answer for this device's screen now (see [WakeDevicePort.screenInteractive]). */
+    fun platformScreenInteractive(): Boolean = port.screenInteractive()
+
+    private fun idleOffReason(): String = when {
+        gate == WakeGate.FOREGROUND -> "foreground_excluded"
+        !settings.backgroundWakeEnabled(device) -> "standby_off"
+        else -> "screen_off_disallowed"
+    }
+
+    /**
+     * The app moved between the foreground (on screen) and the standby (hidden, or the screen off, in an armed session), or
+     * this device's own screen changed under the standby. Like a settings change: a device the new gate or screen excludes
+     * stops idle listening now, a recording already accepted is not cut; one the gate includes is armed by the caller.
+     */
+    fun setGate(next: WakeGate, interactive: Boolean = screenInteractive): Unit = step {
+        if (next == gate && interactive == screenInteractive) return@step
+        gate = next
+        screenInteractive = interactive
+        if (enabledHere) return@step
+        val reason = idleOffReason()
+        if (capturing) revokeIdleListening(reason) else disable(reason)
+    }
 
     /** The current visibility generation (app shown, or screen back on while shown). */
     val generation: Long get() = window.generation
@@ -182,6 +232,8 @@ class WakeDeviceController(
         val revised = next.revision != settings.revision
         val modeChanged = next.wakeLocation != settings.wakeLocation
         settings = next
+        // Only this device's standby switch went off: the idle listening is revoked, a recording under way is not (it ends and is sent as usual).
+        if (!enabledHere && capturing && !modeChanged) return@step revokeIdleListening(idleOffReason())
         if (!enabledHere) return@step disable("opt_out")
         if (modeChanged && (claim != null || heldHandoff != null || handoffGate.pending || capturing)) {
             // Heard or being recorded under another mode: never sent under this one, and never recorded on in silence.
@@ -458,6 +510,14 @@ class WakeDeviceController(
         if (claim == null) return
         claim = null
         claims?.cancelTimer()
+    }
+
+    /** [disable] without ending the hands-free recording under way: the window, a pending handoff and an unaccepted claim go. */
+    private fun revokeIdleListening(reason: String) {
+        readyCuePending = true
+        heldHandoff = null
+        cancelHandoff()
+        window.close(reason)
     }
 
     private fun disable(reason: String) {

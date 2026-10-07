@@ -51,6 +51,11 @@
             android:exported="false"
             android:foregroundServiceType="microphone|mediaPlayback" />
 
+        <!-- Brings the next wake window of a hidden session after a gap that holds no wake lock (one non-exact alarm, no exact-alarm permission). -->
+        <receiver
+            android:name=".StandbyAlarmReceiver"
+            android:exported="false" />
+
         <service
             android:name=".WatchListenerService"
             android:exported="true">

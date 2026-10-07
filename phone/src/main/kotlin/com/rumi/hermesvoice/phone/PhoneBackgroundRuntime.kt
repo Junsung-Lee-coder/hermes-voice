@@ -1,13 +1,17 @@
 package com.rumi.hermesvoice.phone
 
 import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -350,10 +354,10 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
         override fun wakeAccepted() = haptics.wakeAccepted()
 
         override fun armInputs() = WakeArmInputs(
-            enabled = app.settings.watchSettings().wakeLocation.listensOn(VoiceOrigin.PHONE),
-            // Present and screen state are the background decision's (PhoneBackgroundWake.devicePort).
+            enabled = app.settings.watchSettings().phoneBackgroundWakeEnabled,
+            // Presence is the background decision's (PhoneBackgroundWake.devicePort); the screen is this Phone's own, read from the platform.
             resumed = false,
-            interactive = false,
+            interactive = app.getSystemService(PowerManager::class.java)?.isInteractive == true,
             ambient = false,
             permission = hasMic(),
             microphoneMuted = app.getSystemService(AudioManager::class.java)?.isMicrophoneMute == true,
@@ -369,7 +373,23 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
 
     // ── the session and its service ──────────────────────────────────────────────────────────
 
-    private val rearm = Runnable { background.onRearmDue() }
+    private val standbyAlarm = StandbyScheduler(app)
+
+    /** A gap before the next window is waiting (its handler copy and its alarm copy share this: the first to run takes it). */
+    private var rearmScheduled = false
+
+    private val rearm = Runnable {
+        if (!rearmScheduled) return@Runnable
+        rearmScheduled = false
+        standbyAlarm.cancel()
+        background.onRearmDue()
+    }
+
+    /** The platform alarm of a gap fired (possibly while the CPU slept and the handler could not run). */
+    fun onRearmAlarm() {
+        handler.removeCallbacks(rearm)
+        rearm.run()
+    }
 
     private val host = object : PhoneBackgroundHost {
         override fun settings() = app.settings.watchSettings()
@@ -378,11 +398,19 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
         override fun notifications() = notificationCapability()
 
         override fun scheduleRearm(delayMs: Long) {
+            rearmScheduled = true
             handler.removeCallbacks(rearm)
             handler.postDelayed(rearm, delayMs)
+            standbyAlarm.schedule(delayMs)
         }
 
-        override fun cancelRearm() = handler.removeCallbacks(rearm)
+        override fun cancelRearm() {
+            rearmScheduled = false
+            handler.removeCallbacks(rearm)
+            standbyAlarm.cancel()
+        }
+
+        override fun recordingActive(): Boolean = capturing
 
         override fun cancelCapture(reason: String) {
             captures.activeId?.let { captures.stop(it, CaptureStop.LIFECYCLE) }
@@ -423,7 +451,21 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
     /** The background listening as it really is now (not the saved switch alone). */
     val status: StateFlow<PhoneWakeStatus> = _status
 
+    /** This Phone's own screen going on or off: re-decides the standby against the screen-off preference. Events only, never a poll. */
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                Intent.ACTION_SCREEN_OFF, Intent.ACTION_SCREEN_ON -> handler.post { background.onEligibilityChanged() }
+            }
+        }
+    }
+
     init {
+        // An alarm an earlier process of this app left behind opens nothing.
+        standbyAlarm.cancel(force = true)
+        val screenFilter = IntentFilter(Intent.ACTION_SCREEN_ON).apply { addAction(Intent.ACTION_SCREEN_OFF) }
+        if (Build.VERSION.SDK_INT >= 33) app.registerReceiver(screenReceiver, screenFilter, Context.RECEIVER_NOT_EXPORTED)
+        else app.registerReceiver(screenReceiver, screenFilter)
         background.attach(WakeDeviceController(VoiceOrigin.PHONE, recognizerPort, recognizerPort, background.devicePort(devicePort),
             SystemClock::elapsedRealtime, app.settings.watchSettings(), claimPort))
         // A Phone request in flight owns the microphone and speaker; a later reply holding this Phone's
@@ -459,8 +501,21 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
         return background.start()
     }
 
-    /** The user's switch off or the notification's Stop: everything of the session ends now. */
+    /**
+     * The Phone's background wake standby was switched off in Settings (already saved). The standby session ends and leaves
+     * nothing scheduled; a push-to-talk or hands-free recording, an upload, transfer or playback is not cancelled.
+     */
+    fun standbyOff(): BackgroundStatus {
+        handler.removeCallbacks(handoff)
+        return background.onStandbyOff()
+    }
+
+    /**
+     * The notification's Stop (a real Stop): everything of the session ends now, and the standby switch is saved OFF so the
+     * next time the app is opened does not start it again.
+     */
     fun stop(): BackgroundStatus {
+        saveStandbyOff()
         handler.removeCallbacks(handoff)
         val status = background.stop()
         captures.activeId?.let { captures.stop(it, CaptureStop.LIFECYCLE) }
@@ -469,11 +524,25 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
         return status
     }
 
-    /** The app is on screen: the microphone goes back to the app's own wake flow (before it resumes). */
+    private fun saveStandbyOff() {
+        val current = app.settings.watchSettings()
+        if (!current.phoneBackgroundWakeEnabled) return
+        val saved = app.settings.saveWatchSettings(current.copy(phoneBackgroundWakeEnabled = false))
+        app.appScope.launch { runCatching { WatchSettingsSync.publish(app, saved) } }
+    }
+
+    /**
+     * The app is on screen: the microphone goes back to the app's own wake flow (before it resumes). A saved ON whose
+     * session is not running (the system ended it, the phone restarted) is started again here, from the visible app: the
+     * switch is a request that is honored at the next real visit. A saved OFF is never turned on.
+     */
     fun onAppShown() {
         handler.removeCallbacks(hide)
         handler.removeCallbacks(handoff)
         background.onAppShown()
+        if (app.settings.watchSettings().phoneBackgroundWakeEnabled && !background.status.session.running) {
+            start()
+        }
     }
 
     private val hide = Runnable { background.onAppHidden() }

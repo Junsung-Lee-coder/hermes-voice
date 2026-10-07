@@ -79,10 +79,10 @@ class PcmCaptureLoop(
                 live = true
                 listener.onLive()
             }
-            val chunk = buffer.copyOf(read)
-            measure(chunk)
-            val size = synchronized(pcm) { pcm.write(chunk); pcm.size() }
-            val decision = endpoint?.accept(chunk) ?: EndpointDecision.CONTINUE
+            // The read buffer is reused: nothing keeps a reference to it past this iteration, so no per-chunk copy is made.
+            measure(buffer, read)
+            val size = synchronized(pcm) { pcm.write(buffer, 0, read); pcm.size() }
+            val decision = endpoint?.accept(buffer, read) ?: EndpointDecision.CONTINUE
             if (endpoint != null && !cued && endpoint.calibrated) {
                 cued = true
                 listener.onCalibrated()
@@ -114,11 +114,11 @@ class PcmCaptureLoop(
         if (running.getAndSet(false)) listener.onEnd(reason)
     }
 
-    private fun measure(chunk: ByteArray) {
+    private fun measure(chunk: ByteArray, length: Int) {
         var i = 0
         var localPeak = peak
         var squares = 0.0
-        while (i + 1 < chunk.size) {
+        while (i + 1 < length) {
             val sample = ((chunk[i + 1].toInt() shl 8) or (chunk[i].toInt() and 0xff)).toShort().toInt()
             localPeak = maxOf(localPeak, abs(sample))
             squares += sample.toDouble() * sample
@@ -126,7 +126,7 @@ class PcmCaptureLoop(
         }
         peak = localPeak
         sumSquares += squares
-        samples += chunk.size / 2
+        samples += length / 2
     }
 
     companion object {

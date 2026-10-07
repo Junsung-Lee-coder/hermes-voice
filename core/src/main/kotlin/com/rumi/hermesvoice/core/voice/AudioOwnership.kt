@@ -64,8 +64,11 @@ class AudioOwnership {
     }
 }
 
-/** A later reply admitted to [device]'s speaker. Its flags are written under [AudioOwnership.lock]. */
-internal class LaterSlot(val device: VoiceOrigin, val job: Job) {
+/**
+ * A reply admitted to [device]'s speaker: a later reply, or ([own]) the original reply of a turn,
+ * which a newer request's acknowledgement waits for instead of stopping. Its flags are written under [AudioOwnership.lock].
+ */
+internal class LaterSlot(val device: VoiceOrigin, val job: Job, val own: Boolean = false) {
     /** Completed once its job ended AND the speaker was let go (what a recording waits for). */
     val stopped = CompletableDeferred<Unit>()
 

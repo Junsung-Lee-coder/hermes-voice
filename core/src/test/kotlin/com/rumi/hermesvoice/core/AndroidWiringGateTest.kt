@@ -229,9 +229,15 @@ class AndroidWiringGateTest {
             // No boot start, battery-optimization exemption, overlay, full-screen intent, exact alarm, accessibility or assistant role.
             for (forbidden in listOf("RECEIVE_BOOT_COMPLETED", "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS", "SYSTEM_ALERT_WINDOW", "USE_FULL_SCREEN_INTENT",
                 "SCHEDULE_EXACT_ALARM", "USE_EXACT_ALARM", "BIND_ACCESSIBILITY_SERVICE", "BIND_VOICE_INTERACTION", "FOREGROUND_SERVICE_DATA_SYNC",
-                "FOREGROUND_SERVICE_SPECIAL_USE", "<receiver", "dataSync", "shortService", "specialUse", "systemExempted")) {
+                "FOREGROUND_SERVICE_SPECIAL_USE", "dataSync", "shortService", "specialUse", "systemExempted")) {
                 assertFalse(forbidden, manifest.contains(forbidden))
             }
+            // The only receiver is the private target of the app's own non-exact standby alarm: no intent filter, so no
+            // system broadcast (boot, connectivity, package) can reach it and nothing starts or wakes by itself through it.
+            assertEquals(1, Regex("<receiver").findAll(manifest).count())
+            val receiver = manifest.substringAfter("<receiver").substringBefore("/>")
+            assertTrue(receiver.contains("android:name=\".StandbyAlarmReceiver\"") && receiver.contains("android:exported=\"false\""))
+            assertFalse(receiver.contains("intent-filter"))
         }
         // The foreground services are private to the app and typed for what they do. The relay never has the
         // microphone; only the Phone's separate, opt-in background listening service may.
@@ -318,12 +324,17 @@ class AndroidWiringGateTest {
         assertTrue(phoneWakeService.contains("microphone && enter(false) -> wake.background.onMicrophoneRefused(generation)"))
         assertEquals(1, Regex("startForegroundService").findAll(phoneRuntime).count())
         assertEquals(1, Regex("background\\.start\\(\\)").findAll(phoneRuntime).count())
-        assertTrue(source("$phone/PhoneViewModel.kt").contains("if (on) app.phoneWake.start() else app.phoneWake.stop()"))
+        // The switch saves the request first; on starts the session from the visible app, off ends only the standby session.
+        assertTrue(source("$phone/PhoneViewModel.kt").contains("if (on) app.phoneWake.start() else app.phoneWake.standbyOff()"))
         assertTrue(phoneRuntime.contains("SpeechRecognizer.createOnDeviceSpeechRecognizer(app)") && phoneRuntime.contains("EXTRA_PREFER_OFFLINE"))
         assertFalse("no fallback to a server recognizer", phoneRuntime.contains("createSpeechRecognizer(app"))
         assertTrue(phoneApp.substringAfter("fun onActivityStarted()").substringBefore("fun onActivityStopped()").contains("phoneWake.onAppShown()"))
-        assertFalse("the voice settings never carry or migrate the opt-in",
-            source("core/src/main/kotlin/com/rumi/hermesvoice/core/settings/AppSettings.kt").let { it.contains("background") || it.contains("relay") })
+        // The voice settings carry the two standby REQUESTS (BackgroundStandbySettingsTest), never the session's own
+        // device-local flags: the relay opt-in and the Phone session's wanted flag stay out of them.
+        assertFalse("the voice settings never carry or migrate the sessions' device-local opt-ins",
+            source("core/src/main/kotlin/com/rumi/hermesvoice/core/settings/AppSettings.kt").let {
+                it.contains("relay") || it.contains("DeviceLocalFlags") || it.contains("KEY_PHONE_WAKE") || it.contains("KEY_RELAY")
+            })
     }
 
     @Test
@@ -391,7 +402,8 @@ class AndroidWiringGateTest {
         assertTrue(source("$phone/PhoneWatchBridge.kt").contains("app.launchTurn(turnId, phoneOrigin = false) {"))
         val app = source("$phone/PhoneApp.kt")
         assertTrue(app.substringAfter("fun launchTurn(").let { it.contains("appScope.launch(start = CoroutineStart.LAZY)") && it.contains("holds.acquire(HoldReason.TURN)") &&
-            it.contains("if (turns.isEmpty()) holds.release(HoldReason.TURN)") })
+            // The hold covers the sending phase only (never the wait for a reply), released when the last sending one ends.
+            it.contains("if (transmitting.decrementAndGet() == 0) holds.release(HoldReason.TURN)") })
         assertEquals("one core, one connector: the relay adds none", 1, Regex("HermesVoiceCore\\.connect\\(").findAll(app).count())
     }
 
@@ -423,6 +435,60 @@ class AndroidWiringGateTest {
         val app = source("$watch/WatchApp.kt")
         assertTrue(app.contains("val result = replica.offer(json)") && app.contains("if (result == ReplicaUpdate.APPLIED)"))
         assertFalse(app.contains("WatchSettings.fromJson(json)"))
+    }
+
+    @Test
+    fun `the phone settings screen offers one screen-off switch per device, subordinate to its standby switch and saved through the one snapshot`() {
+        val ui = source("$phone/MainActivity.kt")
+        val model = source("$phone/PhoneViewModel.kt")
+        assertTrue(ui.contains("phone_background_wake_screen_off") && ui.contains("watch_background_wake_screen_off"))
+        assertTrue(ui.contains("Phone background wake recognition with screen off") && ui.contains("Watch background wake recognition with screen off"))
+        assertTrue(ui.contains("state.watch.phoneBackgroundWakeScreenOffEnabled") && ui.contains("state.watch.watchBackgroundWakeScreenOffEnabled"))
+        assertTrue("each switch is disabled (value kept) while its own standby switch is off",
+            Regex("masterOn = state\\.watch\\.phoneBackgroundWakeEnabled").containsMatchIn(ui) &&
+                Regex("masterOn = state\\.watch\\.watchBackgroundWakeEnabled").containsMatchIn(ui) &&
+                ui.contains("SwitchRow(label, checked, enabled = masterOn"))
+        assertTrue(ui.contains("model.setPhoneBackgroundWakeScreenOff(") && ui.contains("model.setWatchBackgroundWakeScreenOff("))
+        assertTrue(model.contains("fun setPhoneBackgroundWakeScreenOff(on: Boolean)") && model.contains("fun setWatchBackgroundWakeScreenOff(on: Boolean)"))
+        assertTrue("both setters save the whole snapshot through updateWatch(copy), never a separate store",
+            model.contains("current.copy(phoneBackgroundWakeScreenOffEnabled = on)") && model.contains("current.copy(watchBackgroundWakeScreenOffEnabled = on)"))
+        assertFalse("the screen-off wording never says the app listens with the screen off unconditionally",
+            ui.contains("or the screen is off the device listens"))
+        assertFalse("no Wear-side switch", source("$watch/WatchApp.kt").contains("screen_off_switch"))
+    }
+
+    @Test
+    fun `the phone runtime reads the real screen state and posts every screen change into the eligibility entrypoint`() {
+        val runtime = source("$phone/PhoneBackgroundRuntime.kt")
+        assertFalse("the inner armInputs no longer hard-codes a non-interactive screen", runtime.contains("interactive = false"))
+        assertTrue(runtime.contains("PowerManager") && runtime.contains("isInteractive"))
+        assertTrue(runtime.contains("Intent.ACTION_SCREEN_OFF") && runtime.contains("Intent.ACTION_SCREEN_ON"))
+        assertTrue(runtime.contains("RECEIVER_NOT_EXPORTED"))
+        assertTrue("the receiver feeds the one eligibility entrypoint", Regex("ACTION_SCREEN_OFF[\\s\\S]{0,400}onEligibilityChanged").containsMatchIn(runtime))
+        assertTrue("a Stop that saves the standby switch off preserves the screen-off preferences by copy",
+            runtime.contains("current.copy(phoneBackgroundWakeEnabled = false)"))
+        assertFalse("no polling of the screen", runtime.contains("postDelayed(screenPoll") || runtime.contains("screenPoll"))
+    }
+
+    @Test
+    fun `the watch runtime treats a display that is not fully on as not interactive and follows display changes by event`() {
+        val runtime = source("$watch/WatchVoiceRuntime.kt")
+        assertTrue(runtime.contains("DisplayManager") && runtime.contains("registerDisplayListener"))
+        assertTrue("the display listener feeds the coordinator's screen events", Regex("onDisplayChanged[\\s\\S]{0,600}coordinator\\.onScreen(Off|On)").containsMatchIn(runtime))
+        assertTrue(runtime.contains("Display.STATE_ON"))
+        assertFalse("no polling of the display", runtime.contains("displayPoll"))
+        val app = source("$watch/WatchApp.kt")
+        assertTrue("the Watch only mirrors the Phone's snapshot", app.contains("replica.offer(json)"))
+    }
+
+    @Test
+    fun `screen-off work adds no permission, component, service type or exact alarm to either manifest`() {
+        for (module in listOf("watch", "phone")) {
+            val manifest = source("$module/src/main/AndroidManifest.xml")
+            assertFalse(manifest.contains("SCHEDULE_EXACT_ALARM") || manifest.contains("USE_EXACT_ALARM"))
+            assertFalse(manifest.contains("RECEIVE_BOOT_COMPLETED"))
+            assertFalse(manifest.contains("ACTION_SCREEN") || manifest.contains("android.intent.action.SCREEN"))
+        }
     }
 
     @Test
@@ -549,7 +615,7 @@ class AndroidWiringGateTest {
         val activity = source("$phone/MainActivity.kt")
         val runtime = source("$phone/PhoneBackgroundRuntime.kt")
         val watchApp = source("$watch/WatchApp.kt")
-        assertTrue(phoneApp.contains("laterSpeaker = { device, holding -> if (device == VoiceOrigin.PHONE) phoneSpeakerLater(holding) })"))
+        assertTrue(phoneApp.contains("laterSpeaker = { device, holding -> if (device == VoiceOrigin.PHONE) phoneSpeakerLater(holding) },"))
         assertTrue(phoneApp.contains("laterScope = appScope, laterWork = ::laterReplyHold,"))
         assertFalse("the CPU hold is not a speaker signal", body(phoneApp, "private suspend fun laterReplyHold(").contains("speakingLater"))
         assertTrue(phoneApp.contains("wakeListening = { device -> device == VoiceOrigin.PHONE && phoneWakeListening() }"))

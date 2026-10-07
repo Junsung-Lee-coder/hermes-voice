@@ -347,11 +347,11 @@ class PcmFramer(sampleRate: Int) {
     private val frame = ByteArray(frameSamples * 2)
     private var filled = 0
 
-    /** Feeds [chunk]; [onFrame] gets each complete frame's RMS and returns false to stop early. */
-    fun push(chunk: ByteArray, onFrame: (Double) -> Boolean) {
+    /** Feeds the first [length] bytes of [chunk]; [onFrame] gets each complete frame's RMS and returns false to stop early. */
+    fun push(chunk: ByteArray, length: Int = chunk.size, onFrame: (Double) -> Boolean) {
         var offset = 0
-        while (offset < chunk.size) {
-            val n = minOf(chunk.size - offset, frame.size - filled)
+        while (offset < length) {
+            val n = minOf(length - offset, frame.size - filled)
             System.arraycopy(chunk, offset, frame, filled, n)
             filled += n
             offset += n

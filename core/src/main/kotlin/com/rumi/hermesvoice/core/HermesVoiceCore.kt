@@ -89,7 +89,11 @@ class HermesVoiceCore(
     clock: () -> Long = System::currentTimeMillis,
     /** Where later replies of delivered voice turns are followed (see [VoiceTurnOrchestrator]); null: not followed. */
     laterScope: CoroutineScope? = null,
-    laterWindowMs: Long = VoiceTurnOrchestrator.LATER_WINDOW_MS,
+    /**
+     * A FIXED follow window for every turn (tests only). Null, as in production: each turn about to be followed reads the
+     * Phone's [AppSettings.laterReplyWindowMillis] when its follow starts.
+     */
+    laterWindowMs: Long? = null,
     /** Wraps one attempt to speak a later reply: synthesis and handoff (the Phone keeps the CPU awake for that, bounded). */
     laterWork: suspend (suspend () -> Unit) -> Unit = { it() },
     /** Whether a device's wake window listens now (it closes for a later reply; never spoken over). */
@@ -106,6 +110,8 @@ class HermesVoiceCore(
     laterSpeaker: (VoiceOrigin, Boolean) -> Unit = { _, _ -> },
     /** The hidden routing session's own model ([RouterRuntime]); null keeps it on the profile's default. */
     routerRuntime: SessionRuntimeSpec? = RouterRuntime.LUNA_LOW,
+    /** The Phone's typed diagnostic events (user-shared only; see [com.rumi.hermesvoice.core.diag.DiagExporter]). Null: none recorded. */
+    diag: com.rumi.hermesvoice.core.diag.DiagLog? = null,
 ) {
     val sessions = AppSessionRepository(sessionsApi, conversations, registry, routerRuntime = routerRuntime,
         diagnostic = { line -> voiceListener.onDiagnostic("", "router", line) })
@@ -123,12 +129,15 @@ class HermesVoiceCore(
     val orchestrator = VoiceTurnOrchestrator(speech, sessions.guardedPort(), config = ::voiceConfig, listener = voiceListener,
         recipientCreator = sessions.recipientCreator(),
         admission = { request -> wakeAdmission.admitTurn(request.wakeTurn, request.origin, request.originNodeId, request.wakeClaimId) },
-        laterScope = laterScope, laterWindowMs = laterWindowMs, laterWork = laterWork,
+        laterScope = laterScope, laterWindowMs = laterWindowMs ?: VoiceTurnOrchestrator.LATER_WINDOW_MS,
+        laterWindowProvider = if (laterWindowMs != null) null else ({ settings.laterReplyWindowMillis }), laterWork = laterWork,
         laterEnabled = laterEnabled, wakeListening = wakeListening, laterDeferMaxMs = laterDeferMaxMs,
         ownership = ownership, laterSpeaker = laterSpeaker)
     val watchAcks = WatchAckRegistry()
     /** A Watch turn's routing is the Phone's switch when its upload arrives; routing off uses the Watch's selection. */
-    val watchIntake = WatchTurnIntake(orchestrator, watchAcks) { upload -> TurnRouting.of(settings.routingEnabled, upload.target) }
+    val watchIntake = WatchTurnIntake(orchestrator, watchAcks,
+        routing = { upload -> TurnRouting.of(settings.routingEnabled, upload.target) },
+        navigation = { settings.watchAutoNavigationApplies }, diag = diag)
 
     /**
      * Snapshotted per turn. The allowlist may be empty: the router can then ask for a new
@@ -151,7 +160,7 @@ class HermesVoiceCore(
             voiceListener: VoiceTurnListener = object : VoiceTurnListener {},
             clock: () -> Long = System::currentTimeMillis,
             laterScope: CoroutineScope? = null,
-            laterWindowMs: Long = VoiceTurnOrchestrator.LATER_WINDOW_MS,
+            laterWindowMs: Long? = null,
             laterWork: suspend (suspend () -> Unit) -> Unit = { it() },
             wakeListening: (VoiceOrigin) -> Boolean = { false },
             laterDeferMaxMs: Long = VoiceTurnOrchestrator.LATER_DEFER_MAX_MS,
@@ -160,11 +169,12 @@ class HermesVoiceCore(
             laterSpeaker: (VoiceOrigin, Boolean) -> Unit = { _, _ -> },
             /** The routing session's model setup limits (production: 90 s in all, a switch only with 5 s left, 2 s of it for the readback; tests may shorten them). */
             runtimeSetupLimits: RuntimeSetupLimits = RuntimeSetupLimits(),
+            diag: com.rumi.hermesvoice.core.diag.DiagLog? = null,
         ): Pair<HermesVoiceCore, HermesGatewayConnector> {
             val dashboard = HermesDashboardClient(endpoint, http, tokens, settings.profile.ifBlank { null })
             val connector = HermesGatewayConnector(dashboard, http)
             val core = HermesVoiceCore(dashboard, dashboard, GatewayConversationPort(settings.profile.ifBlank { null }, runtimeSetupLimits) { connector.connection() }, registry, settings,
-                voiceListener, clock, laterScope, laterWindowMs, laterWork, wakeListening, laterDeferMaxMs, laterEnabled, ownership, laterSpeaker)
+                voiceListener, clock, laterScope, laterWindowMs, laterWork, wakeListening, laterDeferMaxMs, laterEnabled, ownership, laterSpeaker, diag = diag)
             return core to connector
         }
     }

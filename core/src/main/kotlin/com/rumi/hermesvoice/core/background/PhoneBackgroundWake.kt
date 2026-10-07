@@ -1,7 +1,7 @@
 package com.rumi.hermesvoice.core.background
 
 import com.rumi.hermesvoice.core.KeyValueStore
-import com.rumi.hermesvoice.core.VoiceOrigin
+import com.rumi.hermesvoice.core.settings.WakeGate
 import com.rumi.hermesvoice.core.settings.WatchSettings
 import com.rumi.hermesvoice.core.wake.WakeArmInputs
 import com.rumi.hermesvoice.core.wake.WakeBlock
@@ -39,6 +39,9 @@ interface PhoneBackgroundHost {
 
     fun statusChanged(status: PhoneWakeStatus)
     fun log(line: String) {}
+
+    /** A recording (hands-free request) is under way now. */
+    fun recordingActive(): Boolean = false
 }
 
 /**
@@ -52,7 +55,8 @@ interface PhoneBackgroundHost {
  *   the system ended reads as paused until the user starts it again;
  * - its foreground service was typed for the microphone while the app was visible (Android allows
  *   no other way): nothing arms the microphone from the background; and
- * - nothing blocks it ([block]): the wake location includes the Phone, the microphone is allowed,
+ * - nothing blocks it ([block]): the Phone's background wake standby switch is on (the foreground wake
+ *   location is a separate choice, for while the app is on screen), the microphone is allowed,
  *   an ON-DEVICE recognizer exists, and the notification with Stop can be seen.
  *
  * Showing the app takes the microphone back at once: the background window closes, a pending
@@ -60,8 +64,9 @@ interface PhoneBackgroundHost {
  * foreground flow resumes. Hidden, windows follow one another ([WakePresence] with
  * [com.rumi.hermesvoice.core.wake.ContinuousWakePolicy]: a failing recognizer backs off up to a
  * minute, a missing one stops the loop and the session says so). Every CPU hold is finite: the open
- * window up to its deadline, the handoff gap and the gap before the next window, the same as the
- * Watch's background session; the recorder, the request and playback take their own.
+ * window up to its deadline and the handoff gap, the same as the Watch's background session; the idle gap
+ * before the next window holds nothing (the host's alarm brings the next window); the recorder, the request
+ * and playback take their own.
  */
 class PhoneBackgroundWake(
     store: KeyValueStore,
@@ -84,6 +89,12 @@ class PhoneBackgroundWake(
     private var syncPosted = false
     private var last: PhoneWakeStatus? = null
 
+    /** Standby was turned off with the app hidden while a hands-free recording is under way: the microphone is given back when it ends. */
+    private var disarmPending = false
+
+    /** [onStandbyOff] waits for a hands-free recording to end before it ends the session. */
+    private var standbyEndPending = false
+
     /** The background flow owns the microphone: the app is hidden and the session's microphone is armed. */
     val owning: Boolean get() = ::presence.isInitialized && presence.armed
 
@@ -104,6 +115,8 @@ class PhoneBackgroundWake(
     /** Binds the background wake flow; call once, before any event reaches it. */
     fun attach(controller: WakeDeviceController) {
         wake = controller
+        // Background only: this flow listens under the Phone's own standby switch, never under the foreground location.
+        controller.setGate(WakeGate.STANDBY)
         presence = WakePresence(controller, presencePort)
         publish()
     }
@@ -141,8 +154,10 @@ class PhoneBackgroundWake(
         /** Only the hidden app's armed session may listen; the screen may be off. */
         override fun armInputs(): WakeArmInputs {
             val platform = inner.armInputs()
-            return platform.copy(enabled = platform.enabled && owning, resumed = owning, interactive = true)
+            return platform.copy(enabled = platform.enabled && owning, resumed = owning, interactive = true, ambient = false)
         }
+
+        override fun screenInteractive(): Boolean = inner.screenInteractive()
 
         override fun armBlocked(source: String, block: WakeBlock) {
             inner.armBlocked(source, block)
@@ -155,7 +170,7 @@ class PhoneBackgroundWake(
 
     /** What stands in the way of listening in the background now, from live platform facts; null when nothing does. */
     fun block(): MicBlock? = when {
-        !host.settings().wakeLocation.listensOn(VoiceOrigin.PHONE) -> MicBlock.NOT_WANTED
+        !host.settings().phoneBackgroundWakeEnabled -> MicBlock.NOT_WANTED
         !host.microphonePermission() -> MicBlock.PERMISSION
         !host.onDeviceRecognizer() -> MicBlock.NO_RECOGNIZER
         !host.notifications().shown -> MicBlock.NOTIFICATIONS
@@ -176,6 +191,21 @@ class PhoneBackgroundWake(
         val status = session.stop()
         release("stop")
         return status
+    }
+
+    /**
+     * The Phone's background wake standby switch was turned off (already saved): the session ends, but nothing the user
+     * started is cut. Hidden with a recording under way, the idle listening is revoked now and the session ends when the
+     * recording does ([onIdle]); otherwise it is [stop] at once. Not the user's Stop: relay, push-to-talk, transfer and
+     * playback are not touched here.
+     */
+    fun onStandbyOff(): BackgroundStatus {
+        if (owning && !appVisible && host.recordingActive()) {
+            standbyEndPending = true
+            onEligibilityChanged()
+            return session.status
+        }
+        return stop()
     }
 
     // ── the app ──────────────────────────────────────────────────────────────────────────────
@@ -204,7 +234,10 @@ class PhoneBackgroundWake(
      * notifications). Blocked: disarm now, wherever the app is. Unblocked: arm only while visible.
      */
     fun onEligibilityChanged() {
+        if (owning) presence.reconcile()
+        val wasEnabled = ::wake.isInitialized && wake.enabledHere
         if (::wake.isInitialized) wake.onSettings(host.settings())
+        if (owning) presence.settingsApplied(wasEnabled)
         val blocked = block()
         if (blocked != null) disarm(blocked) else session.onMicrophoneBlock(null, appVisible)
         sync()
@@ -242,6 +275,15 @@ class PhoneBackgroundWake(
     }
 
     fun onIdle() {
+        if ((disarmPending || standbyEndPending) && !host.recordingActive()) {
+            disarmPending = false
+            if (standbyEndPending) {
+                standbyEndPending = false
+                if (block() == MicBlock.NOT_WANTED) stop()
+            } else {
+                block()?.let { disarm(it) }
+            }
+        }
         if (owning) presence.onIdle()
         sync()
     }
@@ -256,12 +298,20 @@ class PhoneBackgroundWake(
             owning && ::wake.isInitialized && wake.listening)
 
     private fun disarm(block: MicBlock) {
+        // Hidden, a standby switched off never cuts a recording under way (the wake flow already revoked the idle listening).
+        if (block == MicBlock.NOT_WANTED && owning && !appVisible && host.recordingActive()) {
+            disarmPending = true
+            host.cancelRearm()
+            return sync()
+        }
         session.onMicrophoneBlock(block, appVisible)
         release("disarmed")
     }
 
     /** The background flow stops listening and recording now (unsent) and holds nothing. */
     private fun release(reason: String) {
+        disarmPending = false
+        standbyEndPending = false
         if (!::presence.isInitialized) return
         val was = presence.armed
         presence.onArmed(false)
@@ -293,7 +343,6 @@ class PhoneBackgroundWake(
             val now = clock()
             if (wake.listening) needed[HoldReason.LISTEN] = (wake.windowDeadlineMs() - now).coerceAtLeast(0L) + HOLD_MARGIN_MS
             if (wake.episodePending) needed[HoldReason.HANDOFF] = WakeContract.CLAIM_TIMEOUT_MS + WakeContract.MIC_HANDOFF_MS + HOLD_MARGIN_MS
-            presence.pendingRearm?.let { needed[HoldReason.REARM] = it.delayMs + HOLD_MARGIN_MS }
         }
         holds.reconcile(WatchVoiceCoordinator.MANAGED, needed)
         publish()

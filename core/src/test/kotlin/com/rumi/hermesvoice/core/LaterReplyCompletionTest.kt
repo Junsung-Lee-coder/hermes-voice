@@ -437,10 +437,11 @@ class LaterReplyTruthfulTextTest {
 
     private fun source(path: String) = File(root, path).readText()
 
+    /** The disclosure now lives behind the setting's ⓘ dialog (SettingsHelp); the screen renders exactly this text. */
     private fun settingsWarning(): String {
         val src = source("phone/src/main/kotlin/com/rumi/hermesvoice/phone/MainActivity.kt")
-        val seg = src.substring(src.indexOf("SwitchRow(\"Speak later replies (30 minutes)\""), src.indexOf("modifier = Modifier.testTag(\"speak_later_warning\")"))
-        return Regex("\"((?:[^\"\\\\]|\\\\.)*)\"").findAll(seg.substringAfter("Text(").substringBefore("style =")).joinToString("") { it.groupValues[1] }
+        assertTrue("the screen shows the later-reply help topic", src.contains("SettingsHelp.laterReplies("))
+        return com.rumi.hermesvoice.core.settings.SettingsHelp.laterReplies(30).text
     }
 
     @Test
@@ -455,28 +456,34 @@ class LaterReplyTruthfulTextTest {
     }
 
     @Test
-    fun `the stated bounds are the code's - a free speaker within 10 minutes, then synthesis and the window close - and 1 plus 4 per follow`() {
+    fun `the stated bounds are the code's - a free speaker within 10 minutes, no total time cut after it begins - and 1 plus 4 per follow`() {
         val text = settingsWarning()
         assertFalse(text.contains("must start within 10 minutes"))
         assertTrue(text, text.contains("within 10 minutes of arriving"))
-        assertTrue(text, text.contains("up to 2 more minutes"))
+        assertTrue(text, text.contains("no total time cuts a long reply"))
         val readme = source("README.md")
         assertFalse(readme.contains("must **start** playing within **10 minutes of its arrival**"))
         assertFalse(readme.contains("at most 4 wait per\n  followed request"))
         assertTrue(readme.contains("one being prepared or played plus 4 waiting"))
         assertTrue(readme.contains("may only **begin within 10 minutes of its arrival**"))
+        assertTrue(readme.contains("is **not cut by\n  a total time**"))
         assertTrue(readme.contains("It does **not** wait for the other device"))
         assertEquals(10 * 60_000L, com.rumi.hermesvoice.core.voice.VoiceTurnOrchestrator.LATER_DEFER_MAX_MS)
-        assertEquals(2 * 60_000L, com.rumi.hermesvoice.core.voice.VoiceTurnOrchestrator.LATER_SYNTHESIS_MAX_MS)
-        assertEquals(5 * 60_000L, com.rumi.hermesvoice.core.voice.VoiceTurnOrchestrator.LATER_PLAYBACK_MAX_MS)
+        // v19 self-check R1: the former 2 min synthesis, 5 min playback AND the per-piece 10 min synthesis totals are all gone
+        // (migrated from `ChunkedSpeech.STALL_MS == 10 min`, whose removal is proven behaviourally by SynthesisNoCutoffTest).
+        assertFalse(readme.contains("10 minutes without a finished piece"))
+        assertFalse(readme.contains("makes no progress for 10 minutes"))
         assertEquals(4, com.rumi.hermesvoice.core.voice.VoiceTurnOrchestrator.LATER_QUEUE_MAX)
         assertEquals(8, com.rumi.hermesvoice.core.voice.VoiceTurnOrchestrator.LATER_PENDING_MAX)
     }
 
     @Test
-    fun `the per-attempt CPU hold covers synthesis, the window close and playback - 7 min 5 s - and the README says so`() {
+    fun `the per-unit CPU hold covers one piece's window close and playback, never its synthesis - 7 min 5 s, renewed per piece - and the README says so`() {
         assertTrue(source("phone/src/main/kotlin/com/rumi/hermesvoice/phone/PhoneApp.kt").contains("LATER_REPLY_HOLD_MS = 7 * 60_000L + 5_000L"))
-        assertTrue(source("README.md").contains("at most 7 minutes 5 seconds"))
+        assertTrue(source("README.md").contains("at most 7 minutes 5 seconds, renewed per piece"))
+        // v19 self-check R1: migrated from "covers one piece's synthesis" - waiting for generation holds nothing (proved behaviourally by ChunkedReplyGapTest).
+        assertFalse(source("README.md").contains("(the synthesis of\n  one piece, or"))
+        assertTrue(source("README.md").contains("Waiting for the server to generate a piece's speech holds no CPU, microphone or audio focus"))
     }
 
     @Test
@@ -487,9 +494,9 @@ class LaterReplyTruthfulTextTest {
         assertFalse("never from the error, focus-loss or cancellation paths", phone.substringAfter("player.setOnErrorListener").contains("finished()") ||
             phone.substringBefore("player.setOnCompletionListener").substringAfter("override suspend fun playConfirmed").contains("finished()"))
         val watch = source("core/src/main/kotlin/com/rumi/hermesvoice/core/watchlink/PhoneWatchRelay.kt")
-        assertTrue(watch.contains("val waiter = acks.expect(cue.turnId, cue.sequence, transport.nodeId, played = finished)"))
-        assertTrue(watch.contains("if (ack.ok) runCatching { waiter.played?.invoke() }\n        return waiter.ack.complete(ack)"))
+        assertTrue(watch.contains("val waiter = acks.expectPlayback(cue.turnId, wireSequence, transport.nodeId, played = finished)"))
+        assertTrue(watch.contains("if (ack.ok) runCatching { waiter.played?.invoke() }\n        return waiter.wait.ack.complete(ack)"))
         assertTrue(source("core/src/main/kotlin/com/rumi/hermesvoice/core/voice/VoiceTurnOrchestrator.kt")
-            .contains("target.sink.playConfirmed(audio, cue) { markPlayed(slot, reply, cue, returned = false) }"))
+            .contains("if (last) markPlayed(slot, u, fullCue, returned = false) else chunked.played(index)"))
     }
 }

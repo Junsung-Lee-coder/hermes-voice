@@ -63,15 +63,19 @@ class WatchTalkStateTest {
     }
 
     @Test
-    fun `wake phrase cannot start while busy but push-to-talk may start while waiting`() {
+    fun `a waiting request does not block a new wake phrase or push-to-talk, but a recording or sending one does`() {
         val waiting = WatchTalkState().startRecording("turn-0003", TurnTrigger.PUSH_TO_TALK).sending()
             .onPhoneState(TurnStateMessage("turn-0003", "responding", "", false))
-        assertFalse(waiting.canArmWakePhrase)
+        assertTrue(waiting.canArmWakePhrase)
         assertTrue(waiting.canStartPushToTalk)
         assertEquals(WatchPhase.RECORDING, waiting.startRecording("turn-0004", TurnTrigger.PUSH_TO_TALK).phase)
+        assertEquals(WatchPhase.RECORDING, waiting.startRecording("turn-0005", TurnTrigger.WAKE_PHRASE).phase)
+        val recording = waiting.startRecording("turn-0006", TurnTrigger.PUSH_TO_TALK)
+        assertFalse(recording.canArmWakePhrase)
+        assertFalse(recording.canStartPushToTalk)
         try {
-            waiting.startRecording("turn-0005", TurnTrigger.WAKE_PHRASE)
-            throw AssertionError("wake phrase must not start while a reply is pending")
+            recording.startRecording("turn-0007", TurnTrigger.WAKE_PHRASE)
+            throw AssertionError("a wake phrase must not start while a recording is in progress")
         } catch (_: IllegalStateException) {
         }
     }

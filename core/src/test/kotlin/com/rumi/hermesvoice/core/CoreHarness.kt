@@ -20,7 +20,8 @@ class CoreHarness(
     val localStore: KeyValueStore = InMemoryKeyValueStore(),
     /** Where the orchestrator follows later replies of delivered turns (null: the production default off). */
     laterScope: kotlinx.coroutines.CoroutineScope? = null,
-    laterWindowMs: Long = 60_000L,
+    /** A FIXED follow window; null is production's: each follow reads the Phone's "later_reply_window_minutes" setting. */
+    laterWindowMs: Long? = 60_000L,
     voiceListener: com.rumi.hermesvoice.core.voice.VoiceTurnListener = object : com.rumi.hermesvoice.core.voice.VoiceTurnListener {},
     wakeListening: (VoiceOrigin) -> Boolean = { false },
     laterWork: suspend (suspend () -> Unit) -> Unit = { it() },
