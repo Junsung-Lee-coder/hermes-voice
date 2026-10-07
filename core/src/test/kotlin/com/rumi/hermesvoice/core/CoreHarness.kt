@@ -33,6 +33,8 @@ class CoreHarness(
     /** The routing session's model setup limits: production's, with [runtimeSetupBudgetMs] as the total, unless given. */
     runtimeSetupLimits: com.rumi.hermesvoice.core.net.RuntimeSetupLimits =
         com.rumi.hermesvoice.core.net.RuntimeSetupLimits(budgetMs = runtimeSetupBudgetMs),
+    /** The arrival-alert decision (PhoneApp.replyAlerts); null is no alerting. */
+    replyAlerts: com.rumi.hermesvoice.core.notify.ReplyAlerts? = null,
 ) : AutoCloseable {
     val http: OkHttpClient = OkHttpClient.Builder().readTimeout(10, TimeUnit.SECONDS).build()
     val tokens = InMemoryHermesTokenStore(HermesBearerSession(fake.accessToken, fake.refreshToken, null, "basic", "jun"))
@@ -48,7 +50,7 @@ class CoreHarness(
         voiceListener, clock = { System.currentTimeMillis() + clockOffsetMs }, laterScope = laterScope, laterWindowMs = laterWindowMs,
         laterWork = laterWork, wakeListening = wakeListening, laterDeferMaxMs = laterDeferMaxMs,
         laterEnabled = { laterConsent.enabled }, ownership = ownership, laterSpeaker = laterSpeaker,
-        runtimeSetupLimits = runtimeSetupLimits)
+        runtimeSetupLimits = runtimeSetupLimits, replyAlerts = replyAlerts)
     val core: HermesVoiceCore = wiring.first
 
     override fun close() {

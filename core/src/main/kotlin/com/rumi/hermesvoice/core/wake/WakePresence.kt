@@ -19,6 +19,9 @@ enum class WakeLoop {
     /** The device has no recognizer: the loop stopped. */
     NO_RECOGNIZER,
 
+    /** Armed, but "Listen on" does not select this device: nothing listens, whatever its standby or screen-off switch says. */
+    NOT_SELECTED,
+
     /** Armed with the standby on, but this device's own screen is off and its screen-off preference is off: nothing listens until the screen is back. */
     WAITING_FOR_SCREEN,
 }
@@ -48,7 +51,7 @@ object ContinuousWakePolicy {
 
     private val next = setOf("timeout", "not_matched", "unfinished_request", "request_too_long", "wake_taken", "wake_claim_failed",
         "wake_claim_timeout", "wake_mode_changed", "recognizer_error_6", "recognizer_error_7")
-    private val followedElsewhere = setOf("unavailable", "busy", "opt_out", "pause", "screen_off", "resume", "rearm", "qa_handoff", "foreground_excluded", "standby_off", "screen_off_disallowed")
+    private val followedElsewhere = setOf("unavailable", "busy", "opt_out", "pause", "screen_off", "resume", "rearm", "qa_handoff", "foreground_excluded", "listen_on_excluded", "standby_off", "screen_off_disallowed", "idle_budget")
 
     /** [failures]: how many windows in a row already failed. Null: no window is scheduled. */
     fun next(reason: String, failures: Int): Rearm? = when (reason) {
@@ -113,6 +116,9 @@ class WakePresence(
     /** Consecutive windows that could not open because the Phone is unreachable or the microphone is muted (sets the doubling wait). */
     private var blockedRetries = 0
 
+    /** When the pending re-arm is due, on the wake flow's clock (valid while [pendingRearm] is set). */
+    private var pendingDueMs = 0L
+
     /** The scheduled wait is a blocked retry that a changed condition (the Phone back, the microphone unmuted) may cut short. */
     private var waitingForCondition = false
 
@@ -122,6 +128,7 @@ class WakePresence(
     val loop: WakeLoop
         get() = when {
             !armed -> WakeLoop.OFF
+            !wake.selected -> WakeLoop.NOT_SELECTED
             wake.screenDenied -> WakeLoop.WAITING_FOR_SCREEN
             unavailable -> WakeLoop.NO_RECOGNIZER
             retrying -> WakeLoop.RETRYING
@@ -135,6 +142,7 @@ class WakePresence(
      * gap's alarm (an accepted recording goes on). Called after every change of visibility, screen or arming.
      */
     private fun syncGate(opensWindow: Boolean = true) {
+        observeScreen()
         // The screen is the device's own, from the platform now as well as from events: a missed event or a stale flag cannot make a dark screen look on.
         val screen = screenOn && wake.platformScreenInteractive()
         val next = when {
@@ -154,9 +162,35 @@ class WakePresence(
                 blockedRetries = 0
                 retrying = false
             }
-        } else if (opensWindow && !wasEnabled) {
-            rearm("standby")
+        } else {
+            if (opensWindow && !wasEnabled) rearm("standby")
+            trimRearmToBudget()
         }
+    }
+
+    /**
+     * Feeds the device's own screen fact to the wake flow's screen-activation budget (see [ScreenActivationBudget]). A genuine
+     * new activation of a budgeted standby leaves no retry, backoff or alarm of the activation before it behind.
+     */
+    fun observeScreen() {
+        val activated = wake.observeScreen(screenOn && wake.platformScreenInteractive())
+        if (!activated || !armed || !wake.budgeted) return
+        failures = 0
+        blockedRetries = 0
+        retrying = false
+        waitingForCondition = false
+        if (pendingRearm != null) cancelRearm()
+    }
+
+    /** A pending gap or retry that would land after the screen activation's budget is dropped with the counters of the idle loop. */
+    private fun trimRearmToBudget() {
+        if (pendingRearm == null || !wake.budgeted) return
+        val end = wake.screenBudgetEndMs() ?: return
+        if (pendingDueMs < end) return
+        failures = 0
+        blockedRetries = 0
+        retrying = false
+        cancelRearm()
     }
 
     /**
@@ -171,11 +205,14 @@ class WakePresence(
      * counter; one they newly allow opens exactly one window (a repeat of the same settings never does).
      */
     fun settingsApplied(wasEnabled: Boolean) {
+        observeScreen()
         if (!armed) return
         if (!wake.enabledHere) {
             if (wasEnabled || pendingRearm != null) dropPendingRetry()
-        } else if (!wasEnabled && wake.gate == WakeGate.STANDBY) {
-            rearm("settings")
+        } else {
+            val budgetLifted = wake.settingsLiftedBudget && wake.gate == WakeGate.STANDBY
+            if ((!wasEnabled || budgetLifted) && wake.gate == WakeGate.STANDBY) rearm("settings")
+            trimRearmToBudget()
         }
     }
 
@@ -192,8 +229,10 @@ class WakePresence(
     }
 
     fun onSettingsCurrent() {
+        observeScreen()
         wake.onSettingsCurrent()
         if (armed) rearm("settings_current")
+        if (armed) trimRearmToBudget()
     }
 
     fun onActivityPaused() {
@@ -205,11 +244,13 @@ class WakePresence(
 
     fun onScreenOff() {
         screenOn = false
+        observeScreen()
         if (!armed) wake.onScreenOff() else syncGate()
     }
 
     fun onScreenOn() {
         screenOn = true
+        observeScreen()
         if (!armed) wake.onScreenOn() else syncGate()
     }
 
@@ -243,6 +284,7 @@ class WakePresence(
     /** The wake flow closed its window (or an episode) for [reason]. */
     fun onWindowClosed(reason: String) {
         if (reason == "unavailable") unavailable = true
+        observeScreen()
         if (!armed) return
         // A window the screen closed while this device is still eligible (the screen-off preference is on) is followed like any quiet window.
         if (reason == "screen_off" && wake.enabledHere) return schedule(Rearm(ContinuousWakePolicy.REARM_MS, failure = false))
@@ -253,6 +295,7 @@ class WakePresence(
 
     /** A window could not open. [cooldownRemainingMs]: how long the playback cooldown still lasts. */
     fun onArmBlocked(block: WakeBlock, cooldownRemainingMs: Long) {
+        observeScreen()
         if (!armed) return
         when (block) {
             WakeBlock.COOLDOWN -> schedule(Rearm(cooldownRemainingMs + ContinuousWakePolicy.COOLDOWN_MARGIN_MS, failure = false))
@@ -271,6 +314,7 @@ class WakePresence(
      * blocked retry waits changes nothing.
      */
     fun onConditionChanged() {
+        observeScreen()
         if (!armed || !waitingForCondition) return
         cancelRearm()
         rearm("condition")
@@ -290,6 +334,7 @@ class WakePresence(
     fun onPlaybackBusy() = wake.onPlaybackBusy()
 
     fun onIdle() {
+        observeScreen()
         if (armed) rearm("idle") else wake.onIdle()
     }
 
@@ -299,11 +344,22 @@ class WakePresence(
         if (!armed) return
         // A due gap re-checks the screen first: a late alarm never resurrects listening the screen no longer allows.
         syncGate(opensWindow = false)
+        // A device "Listen on" (or its standby) excludes keeps no alarm alive: a stale one opens nothing and starts no generation.
+        if (!wake.enabledHere) return
         rearm("rearm")
     }
 
     private fun schedule(next: Rearm) {
         waitingForCondition = false
+        val now = wake.nowMs()
+        // Inside a screen activation's budget only: a gap, backoff or retry that would land after it is never scheduled.
+        val end = if (wake.budgeted) wake.screenBudgetEndMs() else null
+        if (end != null && now + next.delayMs >= end) {
+            retrying = false
+            if (pendingRearm != null) cancelRearm()
+            return
+        }
+        pendingDueMs = now + next.delayMs
         pendingRearm = next
         retrying = next.failure
         port.scheduleRearm(next.delayMs)

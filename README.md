@@ -620,6 +620,33 @@ not reproduced, and physical verification is still pending.
   process's monotonic clock; whether that keeps pace with the wall clock while the phone sleeps
   deeply was not checked on a device.
 
+### New-reply alerts (when an answer is not spoken)
+
+When the app receives a final assistant answer that it does **not** speak, it posts one notification: title "New reply",
+text "A new reply is ready" (nothing of the answer; lock-screen version "Hermes Voice" / "New reply"). Tapping it opens
+exactly the conversation the answer was delivered to, through the app's normal conversation navigation; it never switches the
+visible screen by itself, and it is independent of "route and notify" versus "automatically open the routed conversation".
+
+- **What counts.** A completed final answer (not progress, an ACK, interim text, an empty, errored or interrupted completion).
+  Not alerted: an answer that was played to the end (on either device, including remote audio), one whose audio is still being
+  synthesized or played, a Stop or "later replies off" cancellation, and old history loaded on a cold start. Alerted: a text
+  chat reply (never spoken), and a voice answer or later reply that ended without audio (policy, no audio, playback failure,
+  unreachable Watch, queue full, superseded).
+- **Once per answer.** The identity is the turn id plus the answer's position (`<turn>#final`, `<turn>#later<n>`) or one text
+  send; it is never derived from the text, so two answers with identical words each alert, and a replayed gateway frame, a
+  history reload or a restart does not alert again. A bounded ledger of 256 identities is kept in each device's local
+  preferences (`reply_alert_ledger_v1`). A notification the system refuses (permission, channel or app notifications off) still
+  counts as handled: the reply, request, audio and history are unaffected and it is not retried later.
+- **Who alerts.** A Phone-origin answer or text reply: the Phone (a standard notification, so the paired-system bridge to the
+  Watch is the platform's, not this app's). An answer meant for the Watch: the Phone sends only the identity and conversation id
+  over `/hv/v1/reply`; the Watch posts a **local-only** notification and the Phone posts none. If that message cannot be sent,
+  the Phone alerts instead. Delivery of the message is not proof the Watch displayed it.
+- **System behavior.** Its own channel "New replies" (default importance: the system's vibration and sound, Do Not Disturb and the
+  channel settings apply; the app plays no sound or speech for it). It is separate from the quiet background-service channels.
+  The Android notification permission is requested on the Phone only from the visible chat screen, before the first text send,
+  once (`reply_alert_permission_asked`); declining changes nothing else. No new permission, server API, polling or tracking.
+- **Limits.** Reply arrival is when the app receives it, not a server push. A text reply is alerted even while the chat is open.
+
 ## Watch conversation reader
 
 The Watch shows the app's conversations without ever calling Hermes itself:
@@ -685,9 +712,9 @@ signed in, Watch not reachable).
 By default it works only while that device's app is open on screen (foreground) and needs no
 permission beyond the microphone. Each time the app is shown, or the screen turns back on with the
 app shown, the platform `SpeechRecognizer` listens for 5 seconds. Each device can also
-listen with its app closed or the screen off through its own, separate background standby switch
-(off by default, see [Background standby](#background-standby-separate-from-listen-on)); **Listen on**
-alone decides whether a device listens while its app is open. On-device
+listen with its app closed or the screen off through its own background standby switch
+(off by default, see [Background standby](#background-standby-additional-to-listen-on)); **Listen on**
+is the master gate: a device it does not select never listens, with its app open or closed. On-device
 recognition is used when available; if it reports that it lacks the wake phrases' language, the
 app falls back once to the system's default recognition service, which may send audio over the
 network. It never runs while recording, sending, waiting for a reply, playing
@@ -860,20 +887,24 @@ routing preferences apply, and the reply plays on the Phone). It never opens the
   background, through the system vibrator (Do Not Disturb and vibration settings apply). With the
   app closed the recording start and end cues are vibrations too.
 
-### Background standby (separate from Listen on)
+### Background standby (additional to Listen on)
 
 Settings → Wake phrase has two switches, **Phone background wake standby** and **Watch background
 wake standby**, both off by default (also after an update and on a new install). They are standby
-switches, not a second **Listen on**:
+switches, an additional condition on top of **Listen on**, never a replacement for it:
 
 - **Visible app: Listen on alone decides.** While a device's app is open with the screen on, it
   listens only if **Listen on** includes it. Turning its standby switch on never makes it listen
   while its app is open, and turning it off never stops a device that **Listen on** selects.
   Settings says so ("not listening while the app is open ... background standby below is on").
-- **Hidden app: the device's own standby switch decides**, and only in a session the app armed
-  while it was open (Android lets a microphone start only from the visible app). **Listen on**
-  may exclude the device and its standby still works. With that device's own screen off, the
-  screen-off switches below also have to allow it.
+- **Hidden app: Listen on AND the device's own standby switch**, and only in a session the app armed
+  while it was open (Android lets a microphone start only from the visible app). If **Listen on**
+  excludes the device, its standby, screen-off flag and an armed session change nothing: it
+  starts no recognition and re-arms none, and deselecting it tears down any idle window, retry,
+  backoff or alarm (a request already accepted or recorded is not cut). Re-selecting it within the
+  same screen activation continues with the time left of that 5-second budget; only a new screen
+  activation opens a new one. With that device's own screen off, the screen-off switches below also
+  have to allow it.
 - **Requested is not running.** A switch that is on is a request. A hidden Watch stays pending
   until its app is next opened with the screen on, which arms the session without making the
   excluded app listen; the Settings line says "requested" until then.
@@ -898,11 +929,16 @@ own screen, and a value is kept while its standby switch is off (the switch is t
 disabled, with a note).
 
 - **Background only.** They never change what an open app does: with the app open and the screen
-  on, **Listen on** alone decides, as before. A screen that is off does not count as an app that
+  on, **Listen on** decides, as before. A screen that is off does not count as an app that
   is open, and it never bypasses that rule.
-- **Actual background:** a device listens when its own standby switch is on and either its screen
-  is on or its own screen-off switch is on. Screen-off on never turns standby on and never grants
-  the microphone permission or a platform exemption; on means requested, not armed.
+- **Actual background:** with its own standby switch on, a device whose screen-off switch is **on**
+  listens continuously, screen on or off. With the screen-off switch **off** it waits for the wake
+  phrase for only **5 seconds** after its own screen turns on (one budget per screen turn-on; a
+  recognizer restart, an alarm, a repeated screen-on or settings callback, or the app moving to
+  the background does not restart it), then waits for the next turn-on. A phrase heard inside
+  the 5 seconds is followed through as usual; the request itself is not cut at 5 seconds.
+  Screen-off on never turns standby on and never grants the microphone permission or a platform
+  exemption; on means requested, not armed.
 - **Watch always-on (ambient) display** counts as screen off: it listens there only when the
   Watch's screen-off switch is on.
 - **When it is not allowed.** If the screen turns off, or the switch is turned off while the
@@ -1057,7 +1093,7 @@ or closes. Closing the keyboard keeps the draft; switching conversations keeps e
   synced; off by default, see
   [Phone: listening with the app closed](#phone-listening-with-the-app-closed-or-the-screen-off-opt-in)),
   and the two standby switches under Wake phrase (synced; see
-  [Background standby](#background-standby-separate-from-listen-on)). The Watch's background
+  [Background standby](#background-standby-additional-to-listen-on)). The Watch's background
   operation (relay) has no switch: it is on whenever its app is opened (see
   [Background operation](#background-operation)).
 - **Dark by default.** On the Phone, sign-in, lists, chat, Settings and dialogs follow the
@@ -1108,6 +1144,34 @@ bundle. They establish source/build behavior, not physical-device behavior.
   behavior, Wear synchronization, Android share-sheet/FileProvider grants, battery effects, a model's
   compliance with the leading-marker convention, and physical reproduction or resolution of a
   reported issue. No installation or publication is established by these tests.
+
+### Version 19 with new-reply alerts and the accepted-capture repair (same versionCode 19 / `0.1.18-dev`)
+
+This candidate adds the arrival alert described under "New-reply alerts" and keeps the five-second screen-on
+budget, the device-independent "Listen on" gate and the accepted-capture preservation. It is a candidate
+awaiting independent review, not an approved or installed release.
+
+- **Full native tests (Windows, JDK 17, Gradle 8.13, one worker):** 959 Core + 129 Watch + 13 Phone, all
+  passing. Against the inherited 940 Core + 119 Watch baseline that is exactly +19 Core and +10 Watch (the
+  new alert tests); the 13 Phone tests are new and run through a task-scoped Robolectric overlay that is not
+  part of the product tree.
+- **Semantic red/green:** the same alert tests on the immutable repair baseline fail by assertion (Core 7 of
+  15, Watch 7 of 10, Phone 6 of 8, with the guard tests passing); on this source they all pass.
+  Compilation failures and harness failures during development are kept as separate receipts, not counted
+  as red.
+- **Alert path covered:** the real receive, decision, durable once-per-answer claim, notification and tap path
+  on both devices, against the production wiring (Core with the contract double of the dashboard; Phone and
+  Watch classes under Robolectric). Identical text in two answers gives two alerts; replays, history, failed
+  or interrupted sends and cancels give none; a denied permission or disabled channel shows nothing and
+  leaves the reply intact; warm and cold taps open exactly the named owned conversation without changing the
+  optional auto-switch preference.
+- **APKs:** Phone and Watch debug assembly and lint succeed (lint: 0 errors; 31 Phone and 28 Watch warnings);
+  both are `com.rumi.hermesvoice` versionCode 19 / `0.1.18-dev`, signed with the Android Debug certificate.
+  No permission or manifest component was added (`POST_NOTIFICATIONS` was already declared).
+- **Simulated in the tests, not real:** the Data Layer, the hardware key store, and the system notification
+  policy (Do Not Disturb, sound, vibration, lock screen). **Not exercised:** a device or emulator, the actual
+  notification shade or tap, whether the paired system bridges a Phone alert to the Watch, and battery.
+  A successful Watch send is delivery of the message, not proof the Watch displayed the alert.
 
 ### Historical validation (earlier candidates)
 

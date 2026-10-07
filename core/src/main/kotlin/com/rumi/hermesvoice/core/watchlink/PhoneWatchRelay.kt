@@ -135,6 +135,15 @@ class WatchPlaybackSink(
 ) : PlaybackSink {
     override suspend fun play(audio: SpokenAudio, cue: PlaybackCue) = playConfirmed(audio, cue) {}
 
+    override suspend fun deliverReplyAlert(alert: com.rumi.hermesvoice.core.notify.ReplyAlert): Boolean = try {
+        transport.sendMessage(WatchLinkPaths.REPLY, ReplyAlertMessage(alert.identity, alert.storedSessionId).encode())
+        true
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: Exception) {
+        false
+    }
+
     /** [finished] runs when the registry accepts this exact node's successful PLAYED ack, before this call resumes. */
     override suspend fun playConfirmed(audio: SpokenAudio, cue: PlaybackCue, finished: () -> Unit) {
         // The chunks of one long reply get distinct wire sequence numbers, so each chunk has its own exact ACK.

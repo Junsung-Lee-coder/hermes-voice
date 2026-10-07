@@ -1,0 +1,190 @@
+diff -ruN a/watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchForegroundSeparationRoboTest.kt b/watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchForegroundSeparationRoboTest.kt
+--- a/watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchForegroundSeparationRoboTest.kt	2026-10-07 19:38:00.034027183 +0900
++++ b/watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchForegroundSeparationRoboTest.kt	2026-10-07 19:38:00.035378720 +0900
+@@ -139,19 +139,19 @@
+         assertFalse("location OFF excludes the foreground: nothing listens on screen", listening())
+     }
+ 
+-    @Test fun F03_theExcludedWatchListensHiddenAndWithTheScreenOffAndStopsWhenShownAgain() {
++    @Test fun F03_theExcludedWatchNeverListensHiddenOrWithTheScreenOffWhateverStandbySays() {
+         settings(WakeLocation.PHONE, standby = true)
+         launchAndEnterService()
+         assertFalse("excluded on screen", listening())
+         scenario!!.moveToState(Lifecycle.State.CREATED); idle(300)
+-        assertTrue("hidden: the standby alone listens, whatever the location", listening())
++        assertFalse("hidden: standby never selects a Watch that Listen on leaves out", listening())
+         scenario!!.moveToState(Lifecycle.State.RESUMED); idle(500)
+-        assertFalse("shown again: the excluded foreground is closed", listening())
++        assertFalse("shown again: still excluded", listening())
+         assertTrue("the armed service survives the visit", app.voice.presence.armed)
+         screen(false)
+-        assertTrue("screen off with the app still shown is the standby too", listening())
++        assertFalse("screen off with the app still shown: still not selected", listening())
+         screen(true)
+-        assertFalse("screen back on over the visible app: the foreground location rules again", listening())
++        assertFalse("screen back on over the visible app: the selector still excludes it", listening())
+         assertTrue(app.voice.presence.armed)
+     }
+ 
+diff -ruN a/watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchScreenOffRoboTest.kt b/watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchScreenOffRoboTest.kt
+--- a/watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchScreenOffRoboTest.kt	2026-10-07 19:38:00.022594811 +0900
++++ b/watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchScreenOffRoboTest.kt	2026-10-07 19:43:33.360394730 +0900
+@@ -198,7 +198,7 @@
+     }
+ 
+     private fun hiddenListening(pref: Boolean?) {
+-        settings(WakeLocation.OFF, standby = true, screenOff = pref)
++        settings(WakeLocation.WATCH, standby = true, screenOff = pref)
+         startNoisePcm()
+         openArmed(); hide()
+         untilListening()
+@@ -252,14 +252,14 @@
+         hiddenListening(pref = true)
+         screenOff()
+         assertTrue(listening())
+-        settings(WakeLocation.OFF, standby = true, screenOff = false)
++        settings(WakeLocation.WATCH, standby = true, screenOff = false)
+         assertFalse("OFF while already screen off tears the idle recognizer down", listening())
+         assertFalse(HoldReason.LISTEN in held())
+         assertNull(alarms().peekNextScheduledAlarm())
+-        settings(WakeLocation.OFF, standby = true, screenOff = true)
++        settings(WakeLocation.WATCH, standby = true, screenOff = true)
+         untilListening()
+         assertTrue("ON while screen off opens a window", listening())
+-        settings(WakeLocation.OFF, standby = true, screenOff = true)
++        settings(WakeLocation.WATCH, standby = true, screenOff = true)
+         assertTrue("the same snapshot again is not a second window", listening())
+     }
+ 
+@@ -298,29 +298,33 @@
+     }
+ 
+     @Test fun S09_screenOffWithTheMasterOffAndThePreferenceOnListensToNothing() {
+-        settings(WakeLocation.OFF, standby = false, screenOff = true)
++        settings(WakeLocation.WATCH, standby = false, screenOff = true)
+         startNoisePcm()
+         scenario = ActivityScenario.launch(WatchActivity::class.java)
+         idle(500)
+         assertFalse("master off: nothing arms", app.voice.presence.armed)
+-        assertFalse(listening())
++        assertTrue("the selected Watch listens on screen on Listen on alone", listening())
+         hide(); screenOff()
+         idle(2_000)
+         assertFalse("a screen-off preference is never a master", listening())
+         assertNull(alarms().peekNextScheduledAlarm())
+     }
+ 
+-    @Test fun S10_aForegroundExclusionIsNotBypassedByThePreference() {
++    @Test fun S10_aWatchThatListenOnLeavesOutNeverListensWhateverThePreferenceSays() {
+         settings(WakeLocation.PHONE, standby = true, screenOff = true)
+         startNoisePcm()
+         openArmed()
+-        assertFalse("the visible Watch app follows the foreground selector alone", listening())
++        assertFalse("the visible Watch app follows the Listen on selector alone", listening())
++        hide()
++        idle(1_000)
++        assertFalse("hidden: standby and the screen-off preference never select a Watch that Listen on leaves out", listening())
+         screenOff()
+         idle(1_000)
+-        assertTrue("a screen that is really off is background eligibility under its own preference", listening())
++        assertFalse("screen off: still not selected, still silent", listening())
+         screenOn()
+         idle(1_000)
+-        assertFalse("interactive on screen again: the foreground exclusion applies and the preference never bypasses it", listening())
++        assertFalse("interactive again: the selector still excludes it", listening())
++        assertNull(alarms().peekNextScheduledAlarm())
+     }
+ 
+     private companion object {
+diff -ruN a/watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchStandbyAlarmRoboTest.kt b/watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchStandbyAlarmRoboTest.kt
+--- a/watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchStandbyAlarmRoboTest.kt	2026-10-07 19:38:00.026459830 +0900
++++ b/watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchStandbyAlarmRoboTest.kt	2026-10-07 19:38:00.027830515 +0900
+@@ -132,7 +132,7 @@
+         ShadowSpeechRecognizer.setIsOnDeviceRecognitionAvailable(true)
+         shadowOf(app.getSystemService(PowerManager::class.java)).setIsInteractive(true)
+         stubWearable()
+-        settings(WakeLocation.OFF, standby = true)
++        settings(WakeLocation.WATCH, standby = true)
+     }
+ 
+     @After
+@@ -171,7 +171,7 @@
+         hiddenArmedWithScreenOff()
+         untilGap()
+         val operation = alarms().peekNextScheduledAlarm()!!.operation
+-        settings(WakeLocation.OFF, standby = false)
++        settings(WakeLocation.WATCH, standby = false)
+         assertNull("OFF cancels the pending alarm", alarms().peekNextScheduledAlarm())
+         assertTrue(!listening())
+         // A copy of the alarm that was already in flight when OFF arrived (a hidden Wear receives OFF the same way).
+diff -ruN a/watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchStandbyOffTimerRoboTest.kt b/watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchStandbyOffTimerRoboTest.kt
+--- a/watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchStandbyOffTimerRoboTest.kt	2026-10-07 19:38:00.030303719 +0900
++++ b/watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchStandbyOffTimerRoboTest.kt	2026-10-07 19:38:00.031534312 +0900
+@@ -239,9 +239,9 @@
+         assertFalse(app.settings.value.watchBackgroundWakeEnabled)
+     }
+ 
+-    @Test fun O01_hiddenGapAlarmAndManualRecordingAndOffLeavesNoAlarm() = offWithPendingGapAndPtt(WakeLocation.OFF, hidden = true, screenOff = false)
++    @Test fun O01_hiddenGapAlarmAndManualRecordingAndOffLeavesNoAlarm() = offWithPendingGapAndPtt(WakeLocation.WATCH, hidden = true, screenOff = false)
+ 
+-    @Test fun O02_hiddenScreenOffGapAlarmAndManualRecordingAndOffLeavesNoAlarm() = offWithPendingGapAndPtt(WakeLocation.OFF, hidden = true, screenOff = true)
++    @Test fun O02_hiddenScreenOffGapAlarmAndManualRecordingAndOffLeavesNoAlarm() = offWithPendingGapAndPtt(WakeLocation.WATCH, hidden = true, screenOff = true)
+ 
+     @Test fun O03_selectedForegroundGapThenManualRecordingThenHiddenThenOffLeavesNoAlarm() {
+         settings(WakeLocation.WATCH, standby = true)
+@@ -267,7 +267,7 @@
+     }
+ 
+     @Test fun O04_repeatedOffAndTheSameSnapshotAgainKeepTheRecordingAndAddNoAlarm() {
+-        settings(WakeLocation.OFF, standby = true)
++        settings(WakeLocation.WATCH, standby = true)
+         startNoisePcm()
+         openArmed(); hide()
+         assertTrue(listening())
+@@ -275,9 +275,9 @@
+         assertTrue(app.voice.onTalkPressed()); idle(100)
+         assertTrue(app.voice.capturing)
+         assertNotNull("positive control: the gap alarm survives the recording starting", alarms().peekNextScheduledAlarm())
+-        settings(WakeLocation.OFF, standby = false)
+-        settings(WakeLocation.OFF, standby = false)
+-        app.applySettings(WatchSettings(WakeLocation.OFF, "루미", watchBackgroundWakeEnabled = false, revision = revision).toJson()) // an equal revision again
++        settings(WakeLocation.WATCH, standby = false)
++        settings(WakeLocation.WATCH, standby = false)
++        app.applySettings(WatchSettings(WakeLocation.WATCH, "루미", watchBackgroundWakeEnabled = false, revision = revision).toJson()) // an equal revision again
+         idle(200)
+         assertNull(alarms().peekNextScheduledAlarm())
+         assertTrue(app.voice.capturing)
+@@ -286,7 +286,7 @@
+     }
+ 
+     @Test fun O05_acceptedHandsFreeRecordingIsKeptByOffAndNoAlarmIsScheduled() {
+-        settings(WakeLocation.OFF, standby = true)
++        settings(WakeLocation.WATCH, standby = true)
+         startNoisePcm()
+         openArmed(); hide()
+         assertTrue("listening hidden", listening())
+@@ -294,7 +294,7 @@
+         results("루미"); idle(1_000)
+         assertTrue("the accepted hands-free recording is really under way", app.voice.capturing)
+         assertNull("positive control: nothing is scheduled while the recording runs", alarms().peekNextScheduledAlarm())
+-        settings(WakeLocation.OFF, standby = false)
++        settings(WakeLocation.WATCH, standby = false)
+         assertTrue("OFF never cancels an accepted recording", app.voice.capturing)
+         assertNull("OFF schedules no retry", alarms().peekNextScheduledAlarm())
+         assertEquals(microphoneType, serviceType())
+@@ -306,13 +306,13 @@
+     }
+ 
+     @Test fun O06_phoneSwitchAloneIsNotTheWatchSwitch() {
+-        settings(WakeLocation.OFF, standby = true)
++        settings(WakeLocation.WATCH, standby = true)
+         openArmed(); hide()
+         untilGap()
+         val pending = alarms().peekNextScheduledAlarm()
+         assertNotNull(pending)
+         revision += 1
+-        app.applySettings(watchScreenOffOn(WatchSettings(WakeLocation.OFF, "루미", watchBackgroundWakeEnabled = true, phoneBackgroundWakeEnabled = false, revision = revision).toJson()))
++        app.applySettings(watchScreenOffOn(WatchSettings(WakeLocation.WATCH, "루미", watchBackgroundWakeEnabled = true, phoneBackgroundWakeEnabled = false, revision = revision).toJson()))
+         idle(50)
+         assertNotNull("the Watch's own gap alarm is not touched by the Phone switch", alarms().peekNextScheduledAlarm())
+     }

@@ -1,5 +1,8 @@
 package com.rumi.hermesvoice.core.voice
 
+import com.rumi.hermesvoice.core.notify.FinalReply
+import com.rumi.hermesvoice.core.notify.FinalReplySource
+import com.rumi.hermesvoice.core.notify.ReplyAlert
 import com.rumi.hermesvoice.core.HermesAuthRequiredException
 import com.rumi.hermesvoice.core.HermesException
 import com.rumi.hermesvoice.core.HermesPlaybackBusyException
@@ -79,6 +82,12 @@ fun interface PlaybackSink {
     suspend fun playConfirmed(audio: SpokenAudio, cue: PlaybackCue, finished: () -> Unit) {
         play(audio, cue)
     }
+
+    /**
+     * Hands a reply-arrival alert to the device this sink plays on, for that device to show itself. True only when the link took
+     * it. The Phone's own sink (and any sink without a separate device) returns false: the Phone shows its own alerts.
+     */
+    suspend fun deliverReplyAlert(alert: com.rumi.hermesvoice.core.notify.ReplyAlert): Boolean = false
 }
 
 class VoiceTurnRequest(
@@ -332,6 +341,8 @@ class VoiceTurnOrchestrator(
     private val maxPendingTurns: Int = MAX_PENDING_TURNS,
     /** Most requests per destination session, the one awaiting its reply included; a request beyond it is refused visibly. */
     private val maxPerSession: Int = SESSION_QUEUE_MAX,
+    /** Told of each actual final answer received (own or later), with what became of its audio: the arrival alert's only input. */
+    private val finalReply: (com.rumi.hermesvoice.core.notify.FinalReply) -> Unit = {},
 ) {
     private val deliveryLock = Mutex()
     private val floorLock = ownership.lock
@@ -501,7 +512,7 @@ class VoiceTurnOrchestrator(
             val (outcome, nextSequence) = respond(request, delivered)
             sessionGate.release(held[0]!!)
             unreleased = null
-            follow(request, delivered.turn, nextSequence)
+            follow(request, delivered.turn, nextSequence, delivered.route.destination.storedSessionId)
             return outcome
         } finally {
             // Stopped or failed before the reply was followed: the destination subscription is released here, once.
@@ -637,11 +648,17 @@ class VoiceTurnOrchestrator(
         var sequence = 1
         notifyStage(request, VoiceTurnStage.RESPONDING)
         val tracker = RecipientResponseTracker(delivered.settings)
+        var finalDecision: ResponseDecision? = null
+        var finalComplete = false
         try {
             // Waiting for the next event is bounded by the destination's SILENCE only ([responseTimeoutMs]); a reply being
             // synthesized or played is not waiting, and events that arrive meanwhile are kept in order.
             delivered.turn.collect(responseTimeoutMs) { event ->
                 val decision = tracker.onEvent(event) ?: return@collect
+                if (decision.role == SpokenRole.FINAL) {
+                    finalDecision = decision
+                    finalComplete = event is RecipientEvent.Complete && (event.status == null || event.status == "complete")
+                }
                 notifyResponse(request, decision)
                 val text = decision.speakText ?: return@collect
                 try {
@@ -661,6 +678,12 @@ class VoiceTurnOrchestrator(
         } catch (error: IOException) {
             failure = "network: ${error.javaClass.simpleName}"
         }
+        // A real, non-empty final answer was received (never an interim, empty or errored completion): its audio decides the alert.
+        finalDecision?.takeIf { finalComplete && it.text.isNotEmpty() }?.let { final ->
+            val heard = SpokenRole.FINAL in spoken ||
+                (final.reason == "final_already_spoken" && (SpokenRole.FIRST in spoken || SpokenRole.MIDDLE in spoken))
+            emitFinalReply(request, ReplyAlert.identityOf(request.turnId, "final"), route.destination.storedSessionId, FinalReplySource.OWN, heard, false)
+        }
         val outcome = when {
             failure != null && SpokenRole.FINAL !in spoken -> VoiceTurnOutcome.DeliveredResponseFailed(route, spoken.toList(), failure!!)
             else -> VoiceTurnOutcome.Completed(route, spoken.toList())
@@ -679,13 +702,13 @@ class VoiceTurnOrchestrator(
      * latest accepted voice request at its handoff, never elsewhere instead, and reported exactly
      * once. Why arrivals ended is reported too ([VoiceTurnListener.onLaterFollowEnded]).
      */
-    private fun follow(request: VoiceTurnRequest, turn: SubmittedTurn, firstSequence: Int) {
+    private fun follow(request: VoiceTurnRequest, turn: SubmittedTurn, firstSequence: Int, storedSessionId: String) {
         val scope = laterScope
         if (scope == null || !laterEnabled()) return turn.release()
         val windowMs = laterWindowProvider?.let { provider -> provider().takeIf { it in LATER_WINDOW_MIN_MS..LATER_WINDOW_MAX_MS } ?: LATER_WINDOW_MS } ?: laterWindowMs
         val job = scope.launch(start = CoroutineStart.LAZY) {
             // A reply dropped from the queue by a Stop (or the option switched off) is reported as such.
-            val arrived = Channel<LaterReply>(LATER_QUEUE_MAX) { it.report(false, stoppedDetail()) }
+            val arrived = Channel<LaterReply>(LATER_QUEUE_MAX) { it.report(false, stoppedDetail(), cancelled = !it.admitting) }
             val speaker = launch {
                 try {
                     for (reply in arrived) speakLater(reply)
@@ -701,7 +724,7 @@ class VoiceTurnOrchestrator(
                     // Switched off meanwhile: this reply and every later one are not spoken.
                     if (!laterEnabled()) throw LaterStopped()
                     val text = event.text.trim()
-                    if (text.isNotEmpty()) admit(arrived, LaterReply(request, text, sequence++, monotonicMs() + laterDeferMaxMs))
+                    if (text.isNotEmpty()) admit(arrived, LaterReply(request, storedSessionId, text, sequence++, monotonicMs() + laterDeferMaxMs))
                 }) {
                     LaterEnd.WINDOW -> "window"
                     LaterEnd.SUPERSEDED -> "superseded"
@@ -743,27 +766,44 @@ class VoiceTurnOrchestrator(
     }
 
     /** One later reply that arrived: spoken (or not) and reported exactly once. */
-    private inner class LaterReply(request: VoiceTurnRequest, text: String, sequence: Int, deadlineMs: Long) :
+    private inner class LaterReply(request: VoiceTurnRequest, val storedSessionId: String, text: String, sequence: Int, deadlineMs: Long) :
         Utterance(request, SpokenRole.FINAL, sequence, text, deadlineMs, own = false) {
         private val reported = java.util.concurrent.atomic.AtomicBoolean(false)
 
-        fun report(played: Boolean, detail: String) {
+        /** True only while [admit] tries to queue it: a refusal then is not a Stop's drop. */
+        @Volatile var admitting = false
+
+        /** [cancelled]: the user's Stop (or switching later replies off) ended it, so it is no arrival to alert about. */
+        fun report(played: Boolean, detail: String, cancelled: Boolean = false) {
             if (!reported.compareAndSet(false, true)) return
             laterPending.decrementAndGet()
             listener.onLaterReply(request.turnId, played, detail)
             request.listener?.onLaterReply(request.turnId, played, detail)
+            emitFinalReply(request, ReplyAlert.identityOf(request.turnId, "later$sequence"), storedSessionId, FinalReplySource.LATER, played, cancelled && !played)
         }
 
         /** Not played for [detail], unless its sink already confirmed it played to the end: then that is the truth. */
-        fun reportNotPlayed(detail: String) {
+        fun reportNotPlayed(detail: String, cancelled: Boolean = false) {
             val device = playedOn
-            if (device != null) report(true, device.name.lowercase()) else report(false, detail)
+            if (device != null) report(true, device.name.lowercase()) else report(false, detail, cancelled)
+        }
+    }
+
+    private fun emitFinalReply(request: VoiceTurnRequest, identity: String, storedSessionId: String, source: FinalReplySource, heard: Boolean, cancelled: Boolean) {
+        val target = playbackRoute.current()
+        runCatching {
+            finalReply(FinalReply(identity, storedSessionId, target?.device ?: request.origin, heard, cancelled, source, target?.sink))
         }
     }
 
     /** Queues [reply] for this follow's speaker; too many waiting (here or over all follows) is reported at once. */
     private fun admit(arrived: Channel<LaterReply>, reply: LaterReply) {
-        val queued = laterPending.incrementAndGet() <= LATER_PENDING_MAX && arrived.trySend(reply).isSuccess
+        reply.admitting = true
+        val queued = try {
+            laterPending.incrementAndGet() <= LATER_PENDING_MAX && arrived.trySend(reply).isSuccess
+        } finally {
+            reply.admitting = false
+        }
         if (!queued) reply.report(false, "not played: too many later replies waiting")
     }
 
@@ -816,7 +856,7 @@ class VoiceTurnOrchestrator(
             reply.reportNotPlayed("network: ${error.javaClass.simpleName}")
         } catch (stopped: CancellationException) {
             // A Stop (or off) that lands after the sink confirmed the end reports what happened: played.
-            reply.reportNotPlayed(stoppedDetail())
+            reply.reportNotPlayed(stoppedDetail(), cancelled = true)
             throw stopped
         }
     }

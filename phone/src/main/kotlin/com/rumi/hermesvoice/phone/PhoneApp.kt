@@ -57,6 +57,8 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import com.rumi.hermesvoice.core.notify.ReplyAlertLedger
+import com.rumi.hermesvoice.core.notify.ReplyAlerts
 import okhttp3.OkHttpClient
 
 /**
@@ -112,6 +114,7 @@ class PhoneApp : Application() {
         appScope.launch(Dispatchers.IO) { runCatching { diagnostics.pruneOnStart() } }
         PhoneRelayService.createChannel(this)
         PhoneWakeService.createChannel(this)
+        ReplyAlertNotifier.createChannel(this)
         _relayStatus.value = relay.status
         if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
             // Exported so `adb shell am broadcast` reaches it; never registered in a release build.
@@ -250,6 +253,18 @@ class PhoneApp : Application() {
         return true
     }
 
+    /**
+     * True once: the visible first text send asks whether replies may alert (Android 13+ only, and only while the permission is
+     * missing). The send itself never waits on the answer, and a refusal changes nothing else.
+     */
+    fun askReplyAlertsOnce(): Boolean {
+        if (android.os.Build.VERSION.SDK_INT < 33 ||
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) == android.content.pm.PackageManager.PERMISSION_GRANTED) return false
+        if (localStore.getBoolean(DeviceLocalFlags.KEY_REPLY_ALERT_ASKED, false)) return false
+        localStore.putBoolean(DeviceLocalFlags.KEY_REPLY_ALERT_ASKED, true)
+        return true
+    }
+
     fun onRelayServiceGone(generation: Long) {
         _relayStatus.value = relay.onServiceGone(generation)
     }
@@ -350,7 +365,7 @@ class PhoneApp : Application() {
             wakeListening = { device -> device == VoiceOrigin.PHONE && phoneWakeListening() },
             laterEnabled = { laterConsent.enabled }, ownership = audio,
             laterSpeaker = { device, holding -> if (device == VoiceOrigin.PHONE) phoneSpeakerLater(holding) },
-            diag = diagnostics.log)
+            diag = diagnostics.log, replyAlerts = replyAlerts)
         val dashboard = core.speech as HermesDashboardClient
         pendingJob?.cancel()
         pendingJob = appScope.launch { core.orchestrator.pending.collect { pendingTurns.value = it } }
@@ -409,6 +424,28 @@ class PhoneApp : Application() {
 
     /** Counts conversations created by voice turns (Phone or Watch origin), so the UI can reload its list. */
     val conversationsCreated = MutableStateFlow(0)
+
+    /**
+     * The arrival alert for a final answer that was not spoken: decides once per answer (bounded, durable, device-local) and
+     * shows it here, or hands a Watch-target answer to the Watch's own alert (see [ReplyAlerts]).
+     */
+    val replyAlerts: ReplyAlerts by lazy { ReplyAlerts(ReplyAlertLedger(localStore), ReplyAlertNotifier(this), appScope) }
+
+    private val _pendingOpen = MutableStateFlow<String?>(null)
+
+    /**
+     * The conversation a tapped arrival alert asks the screen to open. Kept until a screen has opened it (the app may still be
+     * starting or signing in), never replayed after that, and independent of the "open the routed conversation" preference.
+     */
+    val pendingOpen: StateFlow<String?> = _pendingOpen
+
+    fun requestOpenConversation(storedSessionId: String) {
+        _pendingOpen.value = storedSessionId
+    }
+
+    fun consumePendingOpen(storedSessionId: String) {
+        _pendingOpen.compareAndSet(storedSessionId, null)
+    }
 
     /**
      * A routed turn's conversation the Phone screen should open now; consumed by the screen that is

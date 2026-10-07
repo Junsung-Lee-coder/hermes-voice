@@ -112,9 +112,9 @@ object SettingsHelp {
     ))
 
     fun wakePhrase() = HelpTopic(WAKE_PHRASE, "Wake phrase", listOf(
-        "\"Listen on\" chooses which device waits for the wake phrase while its app is open on screen: only there. A device's " +
-            "own standby switch is separate: it lets that device listen with its app closed, whatever \"Listen on\" says, and never " +
-            "makes it listen while its app is open.",
+        "\"Listen on\" chooses which device waits for the wake phrase, with its app open or closed. A device it does not select " +
+            "never starts listening. A device's own standby switch is an extra condition for listening with its app closed: it " +
+            "never makes a device listen that \"Listen on\" leaves out.",
         "When both devices may hear you, only one of them takes each phrase, so a request is never sent twice.",
         "Say the wake phrase, pause for the buzz, then speak: the request is sent when you stop talking (no time limit). Or say the " +
             "request right after the phrase: it's sent only once the speech recognizer has finished hearing it; if it can't, nothing " +
@@ -135,7 +135,8 @@ object SettingsHelp {
     fun standby() = HelpTopic(STANDBY, "Background wake standby", listOf(
         "Both standby switches are off by default (also after an update, and on a new install). They are standby switches, not a " +
             "Stop: turning one off ends that device's waiting for the wake phrase at once, but never cuts a recording, an upload, " +
-            "a reply or the button's talk, and the \"Listen on\" choice stays as you set it.",
+            "a reply or the button's talk, and the \"Listen on\" choice stays as you set it. Listening with the app closed needs both: " +
+            "the device selected in \"Listen on\" and its standby switch on.",
         "While on, a notification with Stop stays visible, and when the app is closed the device listens for the phrase with its " +
             "ON-DEVICE speech recognizer only (nothing is streamed to a server; a device without one, or without the phrase's " +
             "language, doesn't listen and says so).",
@@ -145,9 +146,9 @@ object SettingsHelp {
         "The Phone's standby is re-started when you open this app if it was ended by the system; the notification's Stop turns it off. " +
             "Android lets a microphone start only from a visible app, so the Watch's standby starts when the Watch app is next opened.",
         "\"Recognition with screen off\" (one per device) is subordinate to that device's standby switch and off by default. " +
-            "While the standby is off it has no effect and your choice is kept. When off, the device stops listening while its own " +
-            "screen is off and waits for the screen to come back; when on, recognition may continue with the screen off or dimmed " +
-            "to the always-on display. It is requested only: screen-off listening remains subject to Android restrictions " +
+            "While the standby is off it has no effect and your choice is kept. When off, the device listens for the wake phrase for " +
+            "only 5 seconds after its own screen turns on, then waits for the screen to turn on again; when on, recognition " +
+            "continues, also with the screen off or dimmed to the always-on display. It is requested only: screen-off listening remains subject to Android restrictions " +
             "(Android and the maker may still stop it) and may increase battery use.",
     ))
 

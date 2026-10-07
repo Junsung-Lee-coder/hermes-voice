@@ -118,6 +118,8 @@ class PhoneBackgroundWake(
         // Background only: this flow listens under the Phone's own standby switch, never under the foreground location.
         controller.setGate(WakeGate.STANDBY)
         presence = WakePresence(controller, presencePort)
+        // First sighting of the device's own screen: the budget of an already interactive screen starts here.
+        presence.observeScreen()
         publish()
     }
 
@@ -213,6 +215,7 @@ class PhoneBackgroundWake(
     /** The app is on screen: the background flow gives the microphone back before the app's own resumes. */
     fun onAppShown() {
         appVisible = true
+        if (::presence.isInitialized) presence.observeScreen()
         release("app_shown")
         // Visible: the only moment the session's microphone may be armed (or re-checked).
         session.onVisible(block())
@@ -222,6 +225,7 @@ class PhoneBackgroundWake(
     /** The app left the screen (or the screen went off): an armed session's flow takes over the microphone. */
     fun onAppHidden() {
         appVisible = false
+        if (::presence.isInitialized) presence.observeScreen()
         if (!session.status.microphone || block() != null) return sync()
         presence.onActivityResumed(settingsPending = false)
         if (!presence.onArmed(true)) presence.onActivityPaused()
@@ -234,6 +238,8 @@ class PhoneBackgroundWake(
      * notifications). Blocked: disarm now, wherever the app is. Unblocked: arm only while visible.
      */
     fun onEligibilityChanged() {
+        // The device's own screen is observed whether or not the background flow owns the microphone: an activation is the screen's, not the session's.
+        if (::presence.isInitialized) presence.observeScreen()
         if (owning) presence.reconcile()
         val wasEnabled = ::wake.isInitialized && wake.enabledHere
         if (::wake.isInitialized) wake.onSettings(host.settings())

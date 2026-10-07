@@ -32,7 +32,11 @@ import com.rumi.hermesvoice.core.wake.WakeEpochItem
 import com.rumi.hermesvoice.core.wake.WakeVerdictMessage
 import com.rumi.hermesvoice.core.settings.WatchSettings
 import com.rumi.hermesvoice.core.settings.WatchSettingsReplica
+import com.rumi.hermesvoice.core.notify.ReplyAlert
+import com.rumi.hermesvoice.core.notify.ReplyAlertLedger
+import com.rumi.hermesvoice.core.notify.ReplyAlertResult
 import com.rumi.hermesvoice.core.watchlink.HapticEvent
+import com.rumi.hermesvoice.core.watchlink.ReplyAlertMessage
 import com.rumi.hermesvoice.core.watchlink.HapticUsage
 import com.rumi.hermesvoice.core.watchlink.LaterPlaybackGuard
 import com.rumi.hermesvoice.core.watchlink.PlayProgress
@@ -147,6 +151,7 @@ class WatchApp : Application() {
         if (stored != null && stored != replica.current.toJson()) prefs.edit().putString(KEY_SETTINGS, replica.current.toJson()).apply()
         _settings.value = replica.current
         WatchVoiceService.createChannel(this)
+        WatchReplyAlertNotifier.createChannel(this)
         voice = WatchVoiceRuntime(this)
         // The Phone's reachability is kept current by the platform's own capability events (no polling before a window).
         runCatching {
@@ -503,6 +508,24 @@ class WatchApp : Application() {
      * Shows [sessionId] in chat. With the Phone's routing on, voice turns still go through the
      * router; with it off, they go to the conversation selected here ([selectedTarget]).
      */
+    /** Handled arrival alerts of this Watch (bounded, durable, device-local): one alert per identity, even across a restart. */
+    private val replyLedger by lazy { ReplyAlertLedger(localStore) }
+    private val replyNotifier by lazy { WatchReplyAlertNotifier(this) }
+
+    /**
+     * The Phone says a final answer for this Watch arrived without audio ([ReplyAlertMessage]): this Watch alone shows the alert
+     * (local-only; the Phone showed none). A repeat of the same identity does nothing. Returns what was decided (null: not valid).
+     */
+    fun onReplyAlert(bytes: ByteArray): ReplyAlertResult? {
+        val message = ReplyAlertMessage.decode(bytes) ?: return null
+        val alert = ReplyAlert(message.identity, message.sessionId)
+        if (!replyLedger.claim(alert.identity)) return ReplyAlertResult.DUPLICATE
+        return if (replyNotifier.show(alert)) ReplyAlertResult.SHOWN_HERE else ReplyAlertResult.NOT_SHOWN_HERE
+    }
+
+    /** A tapped arrival alert: the conversation it names is opened like the user's own choice. */
+    fun openFromReplyAlert(sessionId: String) = selectSession(sessionId)
+
     fun selectSession(sessionId: String) {
         navigationGuard.onUserNavigation()
         openConversation(sessionId)
