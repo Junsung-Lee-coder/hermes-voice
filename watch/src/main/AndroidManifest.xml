@@ -27,7 +27,9 @@
         android:name=".WatchApp"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:theme="@style/Theme.HermesVoiceWatch">
 
         <!-- Not standalone: the Watch only works through the paired Phone. -->
@@ -35,6 +37,7 @@
 
         <activity
             android:name=".WatchActivity"
+            android:launchMode="singleTask"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -47,6 +50,11 @@
             android:name=".WatchVoiceService"
             android:exported="false"
             android:foregroundServiceType="microphone|mediaPlayback" />
+
+        <!-- Brings the next wake window of a hidden session after a gap that holds no wake lock (one non-exact alarm, no exact-alarm permission). -->
+        <receiver
+            android:name=".StandbyAlarmReceiver"
+            android:exported="false" />
 
         <service
             android:name=".WatchListenerService"

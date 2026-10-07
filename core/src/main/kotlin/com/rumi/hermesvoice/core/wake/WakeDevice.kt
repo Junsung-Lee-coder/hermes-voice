@@ -2,6 +2,7 @@ package com.rumi.hermesvoice.core.wake
 
 import com.rumi.hermesvoice.core.VoiceOrigin
 import com.rumi.hermesvoice.core.settings.VadSilence
+import com.rumi.hermesvoice.core.settings.WakeGate
 import com.rumi.hermesvoice.core.settings.WakeLocation
 import com.rumi.hermesvoice.core.settings.WakePhrasePatterns
 import com.rumi.hermesvoice.core.settings.WatchSettings
@@ -31,6 +32,12 @@ interface WakeDevicePort {
     /** Platform facts for arming (foreground, screen, permission, microphone, idle, reachability, cooldown). */
     fun armInputs(): WakeArmInputs
 
+    /**
+     * Whether THIS device's own screen is interactive right now (ambient/AOD counts as not interactive), as the platform
+     * says it, ignoring any waiver a wrapper applies for an armed session. Decides a standby's screen-off eligibility.
+     */
+    fun screenInteractive(): Boolean = armInputs().let { it.interactive && !it.ambient }
+
     /** A request to listen was refused; for logs and availability status. */
     fun armBlocked(source: String, block: WakeBlock) {}
 
@@ -39,6 +46,22 @@ interface WakeDevicePort {
 
     /** As [sendRecognized]; [claimId] is the wake claim the request must be sent with ("Both"), or null. */
     fun sendRecognized(request: String, claimId: String?) = sendRecognized(request)
+
+    /**
+     * A wake phrase was accepted: a final match of the current window that passed every guard and,
+     * in Both, the claim the Phone granted this device. Once per wake episode, before the recorder
+     * handoff or the recognized request (the Phone gives a short pulse for it).
+     */
+    fun wakeAccepted() {}
+
+    /**
+     * The wake episode's hold on this device's microphone: true as soon as a wake phrase is heard
+     * (a claim asked on a partial result, or a phrase accepted), before the accepted cue; false
+     * once nothing of the episode is pending: its recording ([startRequestCapture]) or its request
+     * ([sendRecognized]) took the hold over, or the episode ended without one. Nothing else (such
+     * as a later reply) may start using this device's microphone or speaker meanwhile.
+     */
+    fun holdMicrophone(held: Boolean) {}
 }
 
 /**
@@ -64,8 +87,9 @@ interface WakeClaimPort {
 
 /**
  * One device's foreground wake flow, independent of Android, shared by the Phone and the Watch:
- * it applies the Phone-owned [WatchSettings] (the device listens only when
- * [com.rumi.hermesvoice.core.settings.WakeLocation.listensOn] it), opens one recognizer window per
+ * it applies the Phone-owned [WatchSettings] (the device listens only when its [gate] includes it: the
+ * [com.rumi.hermesvoice.core.settings.WakeLocation] while its app is on screen, its own background standby switch
+ * while it is hidden in an armed session, never one for the other), opens one recognizer window per
  * visibility generation ([WakeWindowCoordinator]), hands a phrase-only result to the app's recorder
  * through a cancellable, generation-bound gate ([WakeHandoffGate]) and sends a same-breath FINAL
  * request as text.
@@ -110,6 +134,26 @@ class WakeDeviceController(
 
     private class Claim(val id: String, var granted: Boolean = false)
 
+    /** [WakeDevicePort.holdMicrophone] was told true and not false yet. */
+    private var microphoneHeld = false
+
+    /** The episode owns the microphone from the phrase on (before the accepted cue). */
+    private fun holdMicrophone() {
+        if (microphoneHeld) return
+        microphoneHeld = true
+        port.holdMicrophone(true)
+    }
+
+    /** After every step: the hold goes back as soon as nothing of the episode is pending any more. */
+    private fun <T> step(block: () -> T): T = try {
+        block()
+    } finally {
+        if (microphoneHeld && !episodePending) {
+            microphoneHeld = false
+            port.holdMicrophone(false)
+        }
+    }
+
     private var claim: Claim? = null
 
     /** A handoff waiting for the Phone's answer to the claim. */
@@ -117,7 +161,7 @@ class WakeDeviceController(
     private var capturing = false
 
     /** Both devices may listen, so one wake episode must be admitted from one of them. */
-    private val arbitrated: Boolean get() = claims != null && settings.wakeLocation == WakeLocation.BOTH
+    private val arbitrated: Boolean get() = claims != null && settings.arbitrationRequired
     private val window = WakeWindowCoordinator(recognizer, timer, host, clock)
     private val handoffGate = WakeHandoffGate()
     private var handoffGeneration = -1L
@@ -135,18 +179,62 @@ class WakeDeviceController(
     /** How long the next window stays open without hearing the phrase ([WakePresence] lengthens it for a background session). */
     var windowMs: Long = WakeContract.WINDOW_MS
 
-    /** Whether this device listens under the current mode. */
-    val enabledHere: Boolean get() = settings.wakeLocation.listensOn(device)
+    /** Which switch decides whether this device may listen now: the foreground location, or its own background standby. */
+    var gate: WakeGate = WakeGate.FOREGROUND
+        private set
+
+    /**
+     * Whether this device may listen under the current settings and [gate]: in the foreground the wake location alone
+     * decides, in the standby the device's own standby switch alone (whatever the location). Whether a window really
+     * opens is the presence's decision ([WakePresence]).
+     */
+    val enabledHere: Boolean get() = when (gate) {
+        WakeGate.FOREGROUND -> settings.listensIn(device, WakeGate.FOREGROUND)
+        WakeGate.STANDBY -> settings.standbyListens(device, screenInteractive)
+    }
+
+    /** This device's own screen was interactive when the presence last reconciled it (see [WakePresence]); only the standby gate reads it. */
+    var screenInteractive: Boolean = true
+        private set
+
+    /** The standby is on but this device's own screen is off and its screen-off preference is off: it waits for the screen. */
+    val screenDenied: Boolean
+        get() = gate == WakeGate.STANDBY && settings.backgroundWakeEnabled(device) && !enabledHere
+
+    /** The platform's own answer for this device's screen now (see [WakeDevicePort.screenInteractive]). */
+    fun platformScreenInteractive(): Boolean = port.screenInteractive()
+
+    private fun idleOffReason(): String = when {
+        gate == WakeGate.FOREGROUND -> "foreground_excluded"
+        !settings.backgroundWakeEnabled(device) -> "standby_off"
+        else -> "screen_off_disallowed"
+    }
+
+    /**
+     * The app moved between the foreground (on screen) and the standby (hidden, or the screen off, in an armed session), or
+     * this device's own screen changed under the standby. Like a settings change: a device the new gate or screen excludes
+     * stops idle listening now, a recording already accepted is not cut; one the gate includes is armed by the caller.
+     */
+    fun setGate(next: WakeGate, interactive: Boolean = screenInteractive): Unit = step {
+        if (next == gate && interactive == screenInteractive) return@step
+        gate = next
+        screenInteractive = interactive
+        if (enabledHere) return@step
+        val reason = idleOffReason()
+        if (capturing) revokeIdleListening(reason) else disable(reason)
+    }
 
     /** The current visibility generation (app shown, or screen back on while shown). */
     val generation: Long get() = window.generation
 
     /** New settings: listen if this device is (still) included, otherwise stop everything wake-related now. */
-    fun onSettings(next: WatchSettings) {
+    fun onSettings(next: WatchSettings): Unit = step {
         val revised = next.revision != settings.revision
         val modeChanged = next.wakeLocation != settings.wakeLocation
         settings = next
-        if (!enabledHere) return disable("opt_out")
+        // Only this device's standby switch went off: the idle listening is revoked, a recording under way is not (it ends and is sent as usual).
+        if (!enabledHere && capturing && !modeChanged) return@step revokeIdleListening(idleOffReason())
+        if (!enabledHere) return@step disable("opt_out")
         if (modeChanged && (claim != null || heldHandoff != null || handoffGate.pending || capturing)) {
             // Heard or being recorded under another mode: never sent under this one, and never recorded on in silence.
             endEpisode("wake_mode_changed")
@@ -162,15 +250,16 @@ class WakeDeviceController(
      * device that was already listening can no longer answer that phrase: it closes, unless the
      * admitted request is this device's own.
      */
-    fun onEpisodeAnswered(epoch: Long, claimId: String?) {
-        if (epoch == windowEpoch || capturing) return
-        if (claimId != null && claimId == claim?.id) return
+    fun onEpisodeAnswered(epoch: Long, claimId: String?): Unit = step {
+        if (epoch == windowEpoch || capturing) return@step
+        if (claimId != null && claimId == claim?.id) return@step
         if (window.listening || heldHandoff != null || (claim != null && claim?.granted != true)) failClaim("wake_taken", release = claim?.granted == true)
     }
 
     /** The app became visible. [settingsPending]: wait for [onSettingsCurrent] before listening. */
-    fun onResume(settingsPending: Boolean = false) {
+    fun onResume(settingsPending: Boolean = false): Unit = step {
         resumed = true
+        readyCuePending = true
         settingsCurrent = !settingsPending
         window.newGeneration("resume")
         requestArm("resume")
@@ -182,7 +271,7 @@ class WakeDeviceController(
         requestArm("settings_current")
     }
 
-    fun onPause() {
+    fun onPause(): Unit = step {
         resumed = false
         disable("pause")
     }
@@ -208,7 +297,8 @@ class WakeDeviceController(
      */
     val episodePending: Boolean get() = !capturing && (claim != null || heldHandoff != null || handoffGate.pending)
 
-    fun onScreenOff() {
+    fun onScreenOff(): Unit = step {
+        readyCuePending = true
         cancelHandoff()
         heldHandoff = null
         window.newGeneration("screen_off")
@@ -219,8 +309,17 @@ class WakeDeviceController(
 
     fun onScreenOn() = requestArm("screen_on")
 
+    /**
+     * A later reply was admitted to this device's speaker: an open window stops listening, so the
+     * reply is never spoken into it. Unlike [onBusy], a wake episode under way is left alone: it owns
+     * the microphone ([WakeDevicePort.holdMicrophone]), so that reply is stopped instead.
+     */
+    fun onPlaybackBusy(): Unit = step {
+        if (!episodePending && !capturing) window.close("busy")
+    }
+
     /** Something else owns the microphone or speaker (push-to-talk, a turn, playback). */
-    fun onBusy() {
+    fun onBusy(): Unit = step {
         cancelHandoff()
         heldHandoff = null
         window.close("busy")
@@ -232,7 +331,7 @@ class WakeDeviceController(
     fun onPermissionGranted() = requestArm("permission")
 
     /** Opens a window unless a gate blocks it; the blocking reason (also reported to the port), or null. */
-    fun requestArm(source: String): WakeBlock? {
+    fun requestArm(source: String): WakeBlock? = step {
         val platform = port.armInputs()
         // A pending handoff means the app's recorder is about to take the microphone.
         val inputs = platform.copy(enabled = enabledHere && settingsCurrent, resumed = resumed && platform.resumed,
@@ -243,7 +342,7 @@ class WakeDeviceController(
         val block = window.requestArm(inputs, windowMs)
         if (block == null && !wasListening) windowEpoch = epoch
         if (block != null) port.armBlocked(source, block)
-        return block
+        block
     }
 
     /**
@@ -251,15 +350,15 @@ class WakeDeviceController(
      * window before it can act on this one. Does nothing while a window is open or a wake episode
      * is under way (a claim asked, a handoff pending, a request being recorded).
      */
-    fun rearm(source: String): WakeBlock? {
-        if (window.listening) return WakeBlock.ALREADY_ARMED
-        if (claim != null || heldHandoff != null || handoffGate.pending || capturing) return WakeBlock.BUSY
+    fun rearm(source: String): WakeBlock? = step {
+        if (window.listening) return@step WakeBlock.ALREADY_ARMED
+        if (claim != null || heldHandoff != null || handoffGate.pending || capturing) return@step WakeBlock.BUSY
         window.newGeneration("rearm")
-        return requestArm(source)
+        requestArm(source)
     }
 
-    fun onResults(generation: Long, hypotheses: List<String>, final: Boolean) {
-        if (!enabledHere) return
+    fun onResults(generation: Long, hypotheses: List<String>, final: Boolean): Unit = step {
+        if (!enabledHere) return@step
         // Claim the episode at the first leading wake phrase, before anything is recorded or sent.
         if (arbitrated && claim == null && generation == this.generation && window.listening &&
             hypotheses.any { WakePhrasePatterns.leadingRequest(settings.wakePatterns, it) != null }) beginClaim()
@@ -267,13 +366,13 @@ class WakeDeviceController(
     }
 
     /** The Phone's answer to a claim or renewal. Answers about any other claim are ignored. */
-    fun onClaimVerdict(claimId: String, verdict: ClaimVerdict) {
-        val current = claim?.takeIf { it.id == claimId } ?: return
-        if (verdict == ClaimVerdict.USED) return forgetClaim()
+    fun onClaimVerdict(claimId: String, verdict: ClaimVerdict): Unit = step {
+        val current = claim?.takeIf { it.id == claimId } ?: return@step
+        if (verdict == ClaimVerdict.USED) return@step forgetClaim()
         if (verdict != ClaimVerdict.GRANTED) {
-            return failClaim(if (verdict == ClaimVerdict.HELD_BY_OTHER) "wake_taken" else "wake_claim_failed", release = false)
+            return@step failClaim(if (verdict == ClaimVerdict.HELD_BY_OTHER) "wake_taken" else "wake_claim_failed", release = false)
         }
-        if (current.granted) return
+        if (current.granted) return@step
         current.granted = true
         claims?.scheduleTimer(WakeContract.CLAIM_RENEW_MS)
         heldHandoff?.let { (generation, handoff) ->
@@ -283,46 +382,63 @@ class WakeDeviceController(
     }
 
     /** The claim timer fired: no answer in time fails closed; a held claim is renewed (without limit). */
-    fun onClaimTimer() {
-        val current = claim ?: return
-        if (!current.granted) return failClaim("wake_claim_timeout")
+    fun onClaimTimer(): Unit = step {
+        val current = claim ?: return@step
+        if (!current.granted) return@step failClaim("wake_claim_timeout")
         claims?.renew(current.id)
         claims?.scheduleTimer(WakeContract.CLAIM_RENEW_MS)
     }
 
     /** The hands-free recording ended. [sent]: it was handed to the Phone with its claim. */
-    fun onRequestCaptureEnded(sent: Boolean) {
+    fun onRequestCaptureEnded(sent: Boolean): Unit = step {
         capturing = false
         if (sent) forgetClaim() else releaseClaim()
     }
 
-    fun onError(generation: Long, code: Int) = window.onError(generation, code)
+    fun onError(generation: Long, code: Int): Unit = step { window.onError(generation, code) }
 
-    fun onTimer() = window.onTimer()
+    fun onTimer(): Unit = step { window.onTimer() }
+
+    /**
+     * The recognizer of window [generation] is really ready for speech (the platform's
+     * onReadyForSpeech). True, for one short "listening" pulse, only for the current listening
+     * window and only once per armed session: a new show, or listening again after it was turned
+     * off, paused or the screen went off. A background session's next windows ([rearm]) and a
+     * window reopened in the same session are the same armed session and stay silent.
+     */
+    fun onRecognizerReady(generation: Long): Boolean {
+        if (!readyCuePending || !enabledHere || generation != this.generation || !window.listening) return false
+        readyCuePending = false
+        return true
+    }
+
+    /** No ready pulse given yet in the current armed session. */
+    private var readyCuePending = true
 
     /**
      * The mic-handoff pause is over: start the recorder if this handoff is still for the current
      * generation, the app is resumed, nothing is capturing, and this device still listens.
      */
-    fun onHandoffDue(captureIdle: Boolean): Boolean {
+    fun onHandoffDue(captureIdle: Boolean): Boolean = step {
         if (!handoffGate.claim(handoffGeneration, generation, resumed, captureIdle && enabledHere)) {
             releaseClaim()
-            return false
+            return@step false
         }
-        if (arbitrated && claim?.granted != true) return false
+        if (arbitrated && claim?.granted != true) return@step false
         // Marked before the recorder starts: starting it reports "busy", which must not give the claim back.
+        // The recording takes the episode's microphone hold over (WakeDevicePort.holdMicrophone).
         capturing = true
         capturing = port.startRequestCapture(VadSilence.millis(settings.vadSilenceSeconds), claim?.id)
         if (!capturing) releaseClaim()
-        return capturing
+        capturing
     }
 
     /**
      * Debug QA only: the phrase-only handoff exactly as a recognizer match would produce it (no
      * recognition). Like a match, it first closes an open window, releasing the recognizer.
      */
-    fun qaSecondUtterance() {
-        if (!enabledHere || !resumed) return
+    fun qaSecondUtterance(): Unit = step {
+        if (!enabledHere || !resumed) return@step
         window.close("qa_handoff")
         windowEpoch = claims?.epoch() ?: 0L
         onHandoff(generation, WakeOutcome.Handoff(WakeHandoff.SECOND_UTTERANCE, ""))
@@ -330,6 +446,8 @@ class WakeDeviceController(
 
     private fun onHandoff(generation: Long, handoff: WakeOutcome.Handoff) {
         if (!enabledHere || !resumed) return releaseClaim()
+        // The phrase is heard: the microphone is this episode's before anything is held, cued or recorded.
+        holdMicrophone()
         if (arbitrated) {
             if (claim == null) beginClaim()
             if (claim?.granted != true) {
@@ -343,6 +461,7 @@ class WakeDeviceController(
 
     private fun proceed(generation: Long, handoff: WakeOutcome.Handoff) {
         if (!enabledHere || !resumed || generation != this.generation) return releaseClaim()
+        port.wakeAccepted()
         when (handoff.contract) {
             WakeHandoff.RECOGNIZED_REQUEST -> {
                 val claimId = claim?.id
@@ -359,6 +478,7 @@ class WakeDeviceController(
 
     private fun beginClaim() {
         val port = claims ?: return
+        holdMicrophone()
         val started = Claim(port.newClaimId())
         claim = started
         port.scheduleTimer(WakeContract.CLAIM_TIMEOUT_MS)
@@ -392,7 +512,16 @@ class WakeDeviceController(
         claims?.cancelTimer()
     }
 
+    /** [disable] without ending the hands-free recording under way: the window, a pending handoff and an unaccepted claim go. */
+    private fun revokeIdleListening(reason: String) {
+        readyCuePending = true
+        heldHandoff = null
+        cancelHandoff()
+        window.close(reason)
+    }
+
     private fun disable(reason: String) {
+        readyCuePending = true
         heldHandoff = null
         capturing = false
         releaseClaim()

@@ -9,6 +9,8 @@ import com.rumi.hermesvoice.core.net.ArchivedFilter
 import com.rumi.hermesvoice.core.net.HermesConversationPort
 import com.rumi.hermesvoice.core.net.HistoryPage
 import com.rumi.hermesvoice.core.net.OutgoingAttachment
+import com.rumi.hermesvoice.core.net.SessionRuntimeException
+import com.rumi.hermesvoice.core.net.SessionRuntimeSpec
 import com.rumi.hermesvoice.core.net.StoredSession
 import com.rumi.hermesvoice.core.net.StoredSessionPage
 import com.rumi.hermesvoice.core.net.SubmittedTurn
@@ -50,6 +52,27 @@ object AppSources {
 enum class OwnedRole { CONVERSATION, ROUTER }
 
 /**
+ * The model the hidden routing session runs on: a fast, inexpensive one at low reasoning, for that
+ * session ONLY (never a recipient conversation, a conversation made by hand, or the profile's
+ * default). `gpt-5.6-luna` on `openai-codex` is the Luna slug the installed Hermes catalog lists
+ * (hermes_cli/codex_models.py, models_catalog_static.py); it is applied through tui_gateway's own
+ * per-session mechanisms ([SessionRuntimeSpec]) and checked by reading the session back.
+ */
+object RouterRuntime {
+    val LUNA_LOW = SessionRuntimeSpec(model = "gpt-5.6-luna", provider = "openai-codex", reasoningEffort = "low")
+}
+
+/** The routing session's model could not be set or proven: nothing was routed or sent (no fallback to another model). */
+class RouterModelException(val reason: String, message: String) : HermesException(message)
+
+/**
+ * The FIRST routing session could not be created (no earlier one to keep): nothing was registered, routed or sent.
+ * [reason] is router_create_refused (the gateway answered with an error code), router_create_unknown (no answer: it may
+ * still have been created) or router_create_failed; the message is written by the app, never the gateway's own text.
+ */
+class RouterCreateException(val reason: String, message: String) : HermesException(message)
+
+/**
  * One session this app created, by its exact stored id. [alias] is how the voice router may name
  * it. For the routing session, [contract] is the routing contract version its hidden seed was
  * written for, and [retired] marks one that was replaced by a newer one (kept: its history stays
@@ -65,10 +88,12 @@ data class OwnedSession(
     val createdAtMs: Long,
     val contract: Int = 1,
     val retired: Boolean = false,
+    /** For the routing session: the [SessionRuntimeSpec.key] verified on it, "" before that. */
+    val modelSpec: String = "",
 ) {
     fun toJson(): JSONObject = JSONObject().put("id", storedSessionId).put("role", role.name).put("title", title)
         .put("alias", alias).put("description", description).put("archived", archived).put("created_at_ms", createdAtMs)
-        .put("contract", contract).put("retired", retired)
+        .put("contract", contract).put("retired", retired).put("model_spec", modelSpec)
 
     companion object {
         /** Strict on what identifies a session: a missing or blank id, or an unknown role, is a corrupt entry. */
@@ -82,6 +107,7 @@ data class OwnedSession(
             createdAtMs = json.optLong("created_at_ms"),
             contract = json.optInt("contract", 1),
             retired = json.optBoolean("retired"),
+            modelSpec = json.optString("model_spec"),
         )
     }
 }
@@ -269,6 +295,10 @@ class AppSessionRepository(
     val registry: OwnedSessionRegistry,
     private val clock: () -> Long = System::currentTimeMillis,
     private val io: CoroutineDispatcher = Dispatchers.IO,
+    /** The routing session's own model ([RouterRuntime]); null leaves it on the profile's default. */
+    private val routerRuntime: SessionRuntimeSpec? = RouterRuntime.LUNA_LOW,
+    /** Metadata-only diagnostics (never text or ids): the router model's state. */
+    private val diagnostic: (String) -> Unit = {},
 ) {
     private val verifiedSources = HashSet<String>()
     private val journal = TurnCreateJournal(registry.store)
@@ -278,6 +308,9 @@ class AppSessionRepository(
     fun turnCreateRecord(turnId: String): TurnCreateRecord? = journal.find(turnId)
 
     private fun active(all: List<OwnedSession> = registry.all()) = all.filter { it.role == OwnedRole.CONVERSATION && !it.archived }
+
+    /** [storedSessionId] if it is one of this app's active conversations (e.g. a routed turn's destination to open), else null. */
+    fun activeConversation(storedSessionId: String): OwnedSession? = active().firstOrNull { it.storedSessionId == storedSessionId }
 
     /**
      * Creates the conversation a voice turn's router asked for, at most once per [turnId], in
@@ -447,36 +480,87 @@ class AppSessionRepository(
      *   history stays on the dashboard and it remains this app's.
      */
     suspend fun ensureRoutingSession(): OwnedSession = lock.withLock {
+        val router = routingSessionLocked()
+        val spec = routerRuntime ?: return@withLock router
+        if (router.modelSpec == spec.key) return@withLock router
+        // Made by an earlier build, or created here without a provable model: switch THIS session only, read back.
+        val switched = try {
+            conversations.ensureRuntime(router.storedSessionId, spec)
+        } catch (error: SessionRuntimeException) {
+            // The detail says whether a switch was sent (then its effect may exist); the request itself never was.
+            diagnostic("router_model=failed reason=${error.reason} stage=${error.stage} write=${error.write}")
+            throw RouterModelException(error.reason, "router model ${spec.model} (${spec.reasoningEffort} reasoning) could not be set on the " +
+                "routing session (${error.reason}): ${error.message}; your request was not sent")
+        } catch (error: HermesRpcException) {
+            diagnostic("router_model=failed reason=rpc_${error.code} write=none")
+            throw RouterModelException("rpc_${error.code}", "router model ${spec.model} could not be set on the routing session " +
+                "(code ${error.code}); your request was not sent")
+        } catch (error: HermesAuthRequiredException) {
+            throw error
+        } catch (error: HermesException) {
+            // A connection that failed some other way: the same visible error, tried again on the next request.
+            diagnostic("router_model=failed reason=${error.javaClass.simpleName}")
+            throw RouterModelException("transport", "router model ${spec.model} could not be set on the routing session " +
+                "(${error.javaClass.simpleName}); your request was not sent")
+        }
+        diagnostic("router_model=${if (switched.switched) "switched" else "already"} spec=${spec.key} build_polls=${switched.polls} setup_ms=${switched.waitedMs}")
+        withContext(io) { registry.update(router.storedSessionId) { it.copy(modelSpec = spec.key) } }
+    }
+
+    /** The routing session to use (made or replaced here when needed), before its model is checked. Called with [lock] held. */
+    private suspend fun routingSessionLocked(): OwnedSession {
         val current = registry.router()
-        if (current != null && (current.contract >= RoutingContract.VERSION || routerMigrationPending())) return@withLock current
+        if (current != null && (current.contract >= RoutingContract.VERSION || routerMigrationPending())) return current
         if (current != null) {
             val saved = withContext(io) { registry.store.commitString(KEY_ROUTER_MIGRATION, RoutingContract.VERSION.toString()) }
             if (!saved) throw LocalStoreException("store_write_failed",
                 "store_write_failed: the routing session update couldn't be saved on this phone; nothing was sent")
         }
+        val spec = routerRuntime
         val created = try {
-            conversations.create(AppSources.ROUTER, "Hermes Voice router", RoutingContract.ROUTER_SEED, hidden = true)
+            if (spec != null) conversations.create(AppSources.ROUTER, "Hermes Voice router", RoutingContract.ROUTER_SEED, hidden = true, spec)
+            else conversations.create(AppSources.ROUTER, "Hermes Voice router", RoutingContract.ROUTER_SEED, hidden = true)
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
             // Replacing an old routing session is optional: keep the old one (the marker stops retries).
-            if (current != null) return@withLock current
-            throw error
+            if (current != null) return current
+            if (error is HermesAuthRequiredException) throw error
+            throw routerCreateFailure(error)
         }
         if (current != null) {
             // A replacement is adopted only if its row reads back as this app's routing session; otherwise the old one stays.
             val row = runCatching { api.getSession(created.storedSessionId) }.getOrNull()
-            if (row == null || row.id != created.storedSessionId || row.source != AppSources.ROUTER) return@withLock current
+            if (row == null || row.id != created.storedSessionId || row.source != AppSources.ROUTER) return current
             synchronized(verifiedSources) { verifiedSources += "${AppSources.ROUTER}|${row.id}" }
         }
+        // The create reported the pinned model back: recorded. Otherwise it is switched and read back before first use.
+        val pinned = spec != null && created.model == spec.model && (created.provider.isEmpty() || created.provider == spec.provider)
         val router = OwnedSession(created.storedSessionId, OwnedRole.ROUTER, "Hermes Voice router", "", "",
-            archived = false, createdAtMs = clock(), contract = RoutingContract.VERSION)
+            archived = false, createdAtMs = clock(), contract = RoutingContract.VERSION, modelSpec = if (pinned) spec!!.key else "")
+        if (pinned) diagnostic("router_model=created spec=${spec!!.key}")
         withContext(io) {
             registry.replaceAll { all ->
                 all.map { if (it.role == OwnedRole.ROUTER && !it.retired) it.copy(retired = true) else it } + router
             }
         }
-        router
+        return router
+    }
+
+    /**
+     * The first routing session's create failed: named by the error's code or class only (the gateway's text can carry
+     * paths or details that must not be shown). An unanswered create may still have happened on the server; nothing is
+     * registered or retried here either way.
+     */
+    private fun routerCreateFailure(error: Exception): RouterCreateException {
+        val (reason, detail) = when (error) {
+            is HermesRpcException -> "router_create_refused" to "the gateway refused creating it (code ${error.code})"
+            is HermesException, is java.io.IOException -> "router_create_unknown" to
+                "no answer came (${error.javaClass.simpleName}), so whether the gateway created it is unknown; nothing was registered"
+            else -> "router_create_failed" to "creating it failed (${error.javaClass.simpleName}); nothing was registered"
+        }
+        diagnostic("router_create=failed reason=$reason")
+        return RouterCreateException(reason, "the routing session could not be created ($reason): $detail; your request was not sent")
     }
 
     /** A replacement of the routing session was started for this contract version and never recorded as done. */
@@ -510,6 +594,7 @@ class AppSessionRepository(
         }
     }
 
+    /** The stored rows of one of our conversations exactly as the server holds them (a voice request's row starts with its marker). */
     suspend fun history(storedSessionId: String, limit: Int = 50, offset: Int = 0): HistoryPage {
         verifyConversation(storedSessionId)
         return api.getMessages(storedSessionId, limit, offset)
@@ -543,8 +628,8 @@ class AppSessionRepository(
         return conversations.submit(storedSessionId, text.trim(), attachments)
     }
 
-    /** The voice router's allowlist: our unarchived conversations (possibly none: the router may then ask for one). */
-    fun allowlist(routingStoredSessionId: String): DestinationAllowlist = DestinationAllowlist.create(
+    /** The voice router's allowlist: our unarchived conversations (possibly none: the router may then ask for one); no router for a routing-off turn. */
+    fun allowlist(routingStoredSessionId: String?): DestinationAllowlist = DestinationAllowlist.create(
         active().map { DestinationEntry(it.alias, it.storedSessionId, it.description.ifBlank { TextSanitizer.clean(it.title) }) },
         routingStoredSessionId,
     )

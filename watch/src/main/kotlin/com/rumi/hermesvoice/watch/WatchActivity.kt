@@ -10,11 +10,9 @@ import android.os.Bundle
 import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -39,6 +37,7 @@ import com.rumi.hermesvoice.core.watchlink.ReaderGestureMapping
 import com.rumi.hermesvoice.core.watchlink.ReaderSurface
 import com.rumi.hermesvoice.core.watchlink.SwipeDirection
 import com.rumi.hermesvoice.core.watchlink.TurnTrigger
+import com.rumi.hermesvoice.core.watchlink.WatchPhase
 import com.rumi.hermesvoice.core.watchlink.WatchLinkPaths
 import java.io.File
 import kotlinx.coroutines.Job
@@ -47,11 +46,16 @@ import kotlinx.coroutines.tasks.await
 
 /**
  * The Watch UI: a conversation reader (session browser ↔ selected conversation, swipe left to
- * switch, swipe right to send the app to the background, vertical touch or bezel to scroll) with
- * push-to-talk, the wake phrase state and the control of the background session. It owns no voice
- * logic: the wake flow, the recorder and the session live in the application's
- * [WatchVoiceRuntime] (`app.voice`), which this activity tells when it is shown or hidden and
- * whose state it renders. Permission prompts are asked here because only an activity can.
+ * switch, swipe right or Back to send the app to the background, vertical touch or bezel to scroll)
+ * with push-to-talk as a one-second hold anywhere on it (start, then a new hold to stop) and the
+ * wake phrase state. It owns no voice logic: the wake flow, the recorder and the session live in
+ * the application's [WatchVoiceRuntime] (`app.voice`), which this activity tells when it is shown
+ * or hidden and whose state it renders.
+ *
+ * Background operation is on by default: every show of a real open ensures it (once per open; a
+ * running session is reused, and after the notification's Stop nothing starts it again until the
+ * user opens the app again). There is no background control in the app. Permission prompts are
+ * asked here because only an activity can: each at most once per open, never by a swipe.
  */
 class WatchActivity : ComponentActivity() {
     private val app by lazy { WatchApp.from(this) }
@@ -60,28 +64,47 @@ class WatchActivity : ComponentActivity() {
     private var qaHeardPending: Pair<String, Boolean>? = null
     private var qaHeardDelayMs = QA_HEARD_DELAY_MS
 
-    /** A tap on Start that waits for the notification prompt to close and the activity to be back on screen. */
-    private var startBackgroundPending = false
+    /** This instance stands for a real user open (a launch, or the task brought back) not yet told to the runtime. */
+    private var openPending = false
+
+    /** A permission prompt this activity asked for is up: the stop and restart around it are not a new open. */
+    private var promptShowing = false
+
+    /** Asked in this open already (each prompt at most once per open; kept across recreation). */
+    private var askedMicrophone = false
+    private var askedNotifications = false
 
     /** The settings read of the current show; cancelled when the app leaves the screen. */
     private var settingsPull: Job? = null
 
     private val micPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        promptShowing = false
         voice.onPermissionResult()
     }
 
     /**
-     * Asked at Start while notifications aren't allowed (Android 13+; the system stops asking after
-     * repeated refusals). The session starts whatever the answer; the platform's answer, read again
-     * then, decides whether it may listen (see WatchVoiceCoordinator.block).
+     * Asked once per open while notifications aren't allowed (Android 13+; the system stops asking
+     * after repeated refusals). The session runs whatever the answer; the platform's answer, read
+     * again then, decides whether it may listen (see WatchVoiceCoordinator.block).
      */
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
-        startBackgroundPending = true
-        if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) startBackgroundNow()
+        promptShowing = false
+        voice.onPermissionResult()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Only a fresh launcher entry grants open authority; restored tasks continue their old open.
+        openPending = savedInstanceState == null && isUserOpen(intent)
+        savedInstanceState?.let {
+            promptShowing = it.getBoolean(STATE_PROMPT)
+            askedMicrophone = it.getBoolean(STATE_ASKED_MIC)
+            askedNotifications = it.getBoolean(STATE_ASKED_NOTIFICATIONS)
+        }
+        // Back sends the app to the background like the right swipe; it never finishes it.
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() = toBackground("back")
+        })
         setContent {
             val talk by app.talk.collectAsStateWithLifecycle()
             val settings by app.settings.collectAsStateWithLifecycle()
@@ -89,13 +112,19 @@ class WatchActivity : ComponentActivity() {
             val reader by app.reader.collectAsStateWithLifecycle()
             val listening by voice.wakeListening.collectAsStateWithLifecycle()
             val unavailable by voice.wakeUnavailable.collectAsStateWithLifecycle()
-            val background by voice.voiceStatus.collectAsStateWithLifecycle()
             val chatFocus = remember { FocusRequester() }
             val sessionsFocus = remember { FocusRequester() }
             val onScrollStep = { app.haptic(HapticEvent.SCROLL_STEP) }
             MaterialTheme(colors = WatchColors) {
-                Box(Modifier.fillMaxSize().background(MaterialTheme.colors.background).readerSwipe(::onSwipe)) {
-                    val history = reader.selectedHistory
+                val history = reader.selectedHistory
+                // The whole main screen takes the one-second hold that starts and stops recording (no Talk button).
+                ReaderRoot(
+                    modifier = Modifier.readerSwipe(::onSwipe),
+                    surfaceKey = reader.surface to history?.sessionId,
+                    recording = talk.phase == WatchPhase.RECORDING,
+                    enabled = { lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) && app.talk.value.phase != WatchPhase.SENDING },
+                    onHoldToggle = ::onTalkPressed,
+                ) {
                     when {
                         reader.surface == ReaderSurface.SESSIONS -> SessionsSurface(reader.sessions, reader.selectedSessionId, sessionsFocus,
                             onSelect = app::selectSession, onRefresh = app::loadSessions, onScrollStep = onScrollStep)
@@ -103,8 +132,8 @@ class WatchActivity : ComponentActivity() {
                             title = reader.sessions.rows.firstOrNull { it.id == history.sessionId }?.title ?: "Conversation",
                             history = history, focusRequester = chatFocus, onOlder = app::loadOlder, onRetry = app::refreshSelected,
                             onScrollStep = onScrollStep,
-                        ) { CompactTalk(talk, listening, ::onTalkPressed) }
-                        else -> TalkHome(phone, talk, settings.watchWakeEnabled, listening, unavailable, background, ::onTalkPressed, ::onBackgroundPressed)
+                        ) { TalkStatusLine(talk, listening) }
+                        else -> TalkHome(phone, talk, settings.watchWakeEnabled, listening, unavailable)
                     }
                     // Bezel input goes to the list on screen; focus follows the surface.
                     LaunchedEffect(reader.surface, history != null) {
@@ -129,12 +158,36 @@ class WatchActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
+        if (isUserOpen(intent)) {
+            openPending = true
+            askedMicrophone = false
+            askedNotifications = false
+        }
         handleQaIntent(intent, restored = false)
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(STATE_PROMPT, promptShowing)
+        outState.putBoolean(STATE_ASKED_MIC, askedMicrophone)
+        outState.putBoolean(STATE_ASKED_NOTIFICATIONS, askedNotifications)
+    }
+
+    /** Launcher/notification-open delivery, never a screen transition, dialog or history restoration. */
+    private fun isUserOpen(intent: Intent?): Boolean = intent?.action == Intent.ACTION_MAIN &&
+        intent.hasCategory(Intent.CATEGORY_LAUNCHER) &&
+        intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY == 0
+
     override fun onResume() {
         super.onResume()
+        if (openPending) {
+            openPending = false
+            voice.onUserOpened()
+        }
         val visit = voice.onActivityResumed()
+        // On by default: started from this visible show (for replies until the settings read below arms its microphone).
+        voice.ensureBackground()
         // Reachability and the synced settings item first; only then may the Watch listen. The read
         // belongs to this show: leaving the screen cancels it, and a late one is ignored anyway.
         settingsPull?.cancel()
@@ -146,8 +199,7 @@ class WatchActivity : ComponentActivity() {
         // Titles for the chat header and the browser; the open conversation is re-read for new messages.
         if (app.reader.value.sessions.status == LoadStatus.IDLE) app.loadSessions()
         if (app.reader.value.selectedSessionId != null) app.refreshSelected()
-        if (!voice.hasMic()) micPermission.launch(Manifest.permission.RECORD_AUDIO)
-        if (startBackgroundPending) startBackgroundNow()
+        askPermissionsOnce()
         qaHeardPending?.let { (text, final) ->
             qaHeardPending = null
             // After this resume's window opened (it waits for the synced settings): the simulated recognizer's result.
@@ -172,29 +224,40 @@ class WatchActivity : ComponentActivity() {
         super.onPause()
     }
 
-    // ── background session ───────────────────────────────────────────────────────────────────
+    // ── background operation ─────────────────────────────────────────────────────────────────
 
     /**
-     * The control on the home screen: Stop when a session runs, otherwise Start. Start happens
-     * here, in the visible activity, and nowhere else. While notifications aren't allowed, Start
-     * asks for them (Android 13+); the session starts whatever the answer, but without them it
-     * only plays replies: a hidden microphone always has its notification and Stop.
+     * The microphone (listening and talking) and, on Android 13+, notifications (the session's
+     * notification with its Stop; without it the session only plays replies): each asked at most
+     * once per open, one at a time. A refusal stands until the user opens the app again.
      */
-    private fun onBackgroundPressed() {
-        if (voice.backgroundStatus.value.running) {
-            Log.i(TAG, "background stop requested (app)")
-            return voice.stopBackground()
+    private fun askPermissionsOnce() {
+        if (promptShowing) return
+        when {
+            !voice.hasMic() && !askedMicrophone -> {
+                askedMicrophone = true
+                promptShowing = true
+                micPermission.launch(Manifest.permission.RECORD_AUDIO)
+            }
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !askedNotifications &&
+                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED -> {
+                askedNotifications = true
+                promptShowing = true
+                notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
         }
-        val ask = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        if (!ask) return startBackgroundNow()
-        notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
 
-    private fun startBackgroundNow() {
-        startBackgroundPending = false
-        val status = voice.startBackground()
-        Log.i(TAG, "background start requested (app) running=${status.running} microphone=${status.microphone} notice=${status.notice}")
+    /**
+     * Right swipe or Back: the app goes to the background, always: never finished, and the session
+     * is never stopped here. Background operation is made sure of first (it is normally already
+     * running from this open); hiding never waits for the service or a permission.
+     */
+    private fun toBackground(reason: String) {
+        if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) voice.ensureBackground()
+        val status = voice.backgroundStatus.value
+        Log.i(TAG, "task moved to back reason=$reason session_running=${status.running} microphone=${status.microphone}")
+        moveTaskToBack(true)
     }
 
     private fun onSwipe(direction: SwipeDirection) {
@@ -203,11 +266,8 @@ class WatchActivity : ComponentActivity() {
                 app.toggleReaderSurface()
                 Log.i(TAG, "gesture swipe=$direction action=toggle surface=${app.reader.value.surface}")
             }
-            ReaderAction.BACKGROUND_APP -> {
-                Log.i(TAG, "gesture swipe=$direction action=background")
-                // The task (and its reader state) stays alive; this is not process termination.
-                moveTaskToBack(true)
-            }
+            // The task (and its reader state) stays alive; this is not process termination.
+            ReaderAction.BACKGROUND_APP -> toBackground("swipe")
         }
     }
 
@@ -233,7 +293,10 @@ class WatchActivity : ComponentActivity() {
     }
 
     private fun onTalkPressed() {
-        if (!voice.onTalkPressed()) micPermission.launch(Manifest.permission.RECORD_AUDIO)
+        if (voice.onTalkPressed()) return
+        // The user's own talk gesture asks for the microphone (also after a refusal at the open).
+        promptShowing = true
+        micPermission.launch(Manifest.permission.RECORD_AUDIO)
     }
 
     // ── debug QA (debuggable builds only) ────────────────────────────────────────────────────
@@ -296,6 +359,9 @@ class WatchActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "HermesVoiceWatch"
+        private const val STATE_PROMPT = "hv_prompt_showing"
+        private const val STATE_ASKED_MIC = "hv_asked_microphone"
+        private const val STATE_ASKED_NOTIFICATIONS = "hv_asked_notifications"
         private const val QA_WAKE_HANDOFF = "hv_qa_wake_handoff"
         private const val QA_RECOGNIZER = "hv_qa_recognizer"
         private const val QA_WAKE_HEARD = "hv_qa_wake_heard"

@@ -65,6 +65,8 @@ data class AssembledRoute(
     val ackText: String,
     /** The destination was created for this turn at the router's request. */
     val created: Boolean = false,
+    /** Routing was off: the user's selected conversation, with the Phone's own acknowledgement. */
+    val direct: Boolean = false,
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("turn_id", turnId)
@@ -73,6 +75,7 @@ data class AssembledRoute(
         .put("destination", destination.alias)
         .put("ack", ackText)
         .put("created", created)
+        .put("direct", direct)
 }
 
 sealed class RoutingParseResult {

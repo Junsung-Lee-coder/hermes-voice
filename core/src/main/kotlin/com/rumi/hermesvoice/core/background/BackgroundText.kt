@@ -11,6 +11,9 @@ object BackgroundText {
     fun watchNotification(status: BackgroundStatus, loop: WakeLoop): String? = when {
         !status.running -> null
         status.microphone && loop == WakeLoop.RETRYING -> "Wake phrase paused, retrying (phone or recognizer not ready). Replies play here"
+        // Asked for, not armed yet (the service is still entering the foreground).
+        status.microphone && loop == WakeLoop.WAITING_FOR_SCREEN -> "Wake phrase waiting for the screen (screen-off recognition is off). Replies play here"
+        status.microphone && loop == WakeLoop.OFF -> "Starting the wake phrase. Replies play here"
         status.microphone -> "Listening for the wake phrase. Replies play here"
         else -> "Replies play here. " + when (status.notice) {
             BackgroundNotice.NEEDS_PERMISSION -> "Listening needs the microphone permission"
@@ -18,14 +21,18 @@ object BackgroundText {
             BackgroundNotice.NEEDS_NOTIFICATIONS -> "Not listening: notifications are off"
             BackgroundNotice.NO_RECOGNIZER -> "Wake phrase unavailable on this watch"
             BackgroundNotice.NEEDS_SETTINGS -> "Not listening: Phone settings check not complete"
-            else -> "The wake phrase is off for the watch"
+            else -> "Background wake standby is off for the watch (Phone settings)"
         }
     }
 
     /** The Watch's own label for the control. */
     fun watchLabel(status: BackgroundStatus, loop: WakeLoop): String = when (status.notice) {
         BackgroundNotice.OFF -> "Background: off"
-        BackgroundNotice.LISTENING -> if (loop == WakeLoop.RETRYING) "Background: retrying" else "Background: listening"
+        BackgroundNotice.LISTENING -> when (loop) {
+            WakeLoop.RETRYING -> "Background: retrying"
+            WakeLoop.WAITING_FOR_SCREEN -> "Background: waiting for screen"
+            else -> "Background: listening"
+        }
         BackgroundNotice.RUNNING -> "Background: replies only"
         BackgroundNotice.NEEDS_PERMISSION -> "Background: replies only (no mic permission)"
         BackgroundNotice.NEEDS_VISIBLE_TO_LISTEN -> "Background: replies only until opened"
@@ -48,6 +55,39 @@ object BackgroundText {
     }
 
     fun phoneNotification(status: BackgroundStatus): String? = if (status.running) "Relaying voice requests and replies for your Watch" else null
+
+    /** The Phone's background-listening notification line; null when nothing runs (no notification). */
+    fun phoneWakeNotification(status: PhoneWakeStatus): String? = when {
+        !status.session.running -> null
+        !status.session.microphone -> "Not listening: " + phoneWakeBlocked(status.session.notice)
+        status.loop == WakeLoop.RETRYING -> "Wake phrase paused, retrying (recognizer not ready)"
+        status.loop == WakeLoop.NO_RECOGNIZER -> "Not listening: no on-device recognizer for the wake phrase"
+        status.loop == WakeLoop.WAITING_FOR_SCREEN -> "Waiting for the screen: screen-off recognition is off for this phone"
+        status.listeningNow -> "Listening for the wake phrase"
+        else -> "Listens for the wake phrase when this app is closed"
+    }
+
+    /** The Phone's status line under its background-listening switch. */
+    fun phoneWakeStatus(status: PhoneWakeStatus, notifications: Boolean): String = when (status.session.notice) {
+        BackgroundNotice.OFF -> "Off. The wake phrase works only while this app is open on screen"
+        BackgroundNotice.PAUSED -> "Paused: Android stopped it. Open this app and switch it on again"
+        BackgroundNotice.REFUSED, BackgroundNotice.NEEDS_VISIBLE -> "Couldn't start. Open this app and switch it on again"
+        BackgroundNotice.LISTENING -> when {
+            status.loop == WakeLoop.RETRYING -> "On, retrying: the recognizer isn't ready"
+            status.loop == WakeLoop.WAITING_FOR_SCREEN -> "On, waiting for the screen: recognition with the screen off is off for this phone"
+            status.listeningNow -> "Listening in the background now"
+            else -> "On: listens when this app is closed"
+        } + if (notifications) " (Stop is in the notification)" else ""
+        else -> "On, but not listening: " + phoneWakeBlocked(status.session.notice)
+    }
+
+    private fun phoneWakeBlocked(notice: BackgroundNotice): String = when (notice) {
+        BackgroundNotice.NEEDS_PERMISSION -> "it needs the microphone permission (tap Talk once to grant it), then open this app"
+        BackgroundNotice.NEEDS_NOTIFICATIONS -> "notifications are off, so its Stop couldn't be seen"
+        BackgroundNotice.NO_RECOGNIZER -> "this phone has no on-device speech recognizer for the wake phrase (it never streams the room to a server)"
+        BackgroundNotice.NEEDS_VISIBLE_TO_LISTEN -> "open this app to let it listen again"
+        else -> "background wake standby is off for this phone (Phone settings)"
+    }
 
     /** The Phone's status line under its switch. [notifications]: the relay's notification can be seen now. */
     fun phoneStatus(status: BackgroundStatus, notifications: Boolean): String = when (status.notice) {

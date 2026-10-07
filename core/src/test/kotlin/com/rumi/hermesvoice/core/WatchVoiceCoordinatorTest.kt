@@ -26,6 +26,7 @@ import com.rumi.hermesvoice.core.wake.WakeTimerPort
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -229,7 +230,7 @@ class WatchVoiceCoordinatorTest {
     }
 
     @Test
-    fun `in Both the wait for the Phone's answer is held, and a refusal holds the gap to the next window`() {
+    fun `in Both the wait for the Phone's answer is held, and a refusal leaves the gap to the next window unheld`() {
         val w = ComposedWatch(WakeLocation.BOTH, arbitrated = true)
         w.show(); w.start(); w.hide()
         w.heard("루미")
@@ -238,8 +239,9 @@ class WatchVoiceCoordinatorTest {
         assertEquals(setOf(HoldReason.HANDOFF), w.held())
         w.lockLog.clear()
         w.wake.onClaimVerdict("claim-1", ClaimVerdict.HELD_BY_OTHER); w.drain()
-        assertEquals(setOf(HoldReason.REARM), w.held())
-        assertTrue(w.lockLog.indexOfFirst { it.startsWith("acquire:REARM") } < w.lockLog.indexOf("release:HANDOFF"))
+        assertTrue("no CPU hold across the idle gap", w.held().isEmpty())
+        assertTrue(w.lockLog.none { it.contains("REARM") })
+        assertNotNull("the timer alone brings the next window", w.rearmIn)
         w.rearmDue()
         w.heard("루미")
         w.wake.onClaimVerdict("claim-2", ClaimVerdict.GRANTED); w.drain()
@@ -250,7 +252,7 @@ class WatchVoiceCoordinatorTest {
     }
 
     @Test
-    fun `window after window, every gap and every window is held, and holds end with the loop`() {
+    fun `window after window, every window is held, the idle gap holds nothing, and holds end with the loop`() {
         val w = ComposedWatch()
         w.show(); w.start(); w.hide()
         w.screenOn = false; w.coordinator.onScreenOff(); w.drain()
@@ -258,11 +260,11 @@ class WatchVoiceCoordinatorTest {
             assertTrue("window $it open and held", w.windowOpen && HoldReason.LISTEN in w.held())
             w.lockLog.clear()
             w.windowTimeout()
-            assertEquals("gap $it", setOf(HoldReason.REARM), w.held())
-            assertTrue("REARM taken before LISTEN let go", w.lockLog.indexOfFirst { l -> l.startsWith("acquire:REARM") } < w.lockLog.indexOf("release:LISTEN"))
+            assertTrue("gap $it holds nothing", w.held().isEmpty())
+            assertTrue("LISTEN let go at the window's end", w.lockLog.contains("release:LISTEN"))
             w.lockLog.clear()
             w.rearmDue()
-            assertTrue("LISTEN taken before REARM let go", w.lockLog.indexOfFirst { l -> l.startsWith("acquire:LISTEN") } < w.lockLog.indexOf("release:REARM"))
+            assertTrue("LISTEN taken for the next window", w.lockLog.any { l -> l.startsWith("acquire:LISTEN") })
         }
         for (entry in w.lockLog.filter { it.startsWith("acquire:") }) {
             val (_, reason, timeout) = entry.split(":")
@@ -286,8 +288,7 @@ class WatchVoiceCoordinatorTest {
         w.rearmDue()
         assertTrue(w.log.last().endsWith(":PHONE_UNREACHABLE"))
         assertEquals(ContinuousWakePolicy.BLOCKED_RETRY_MS, w.rearmIn)
-        assertEquals(setOf(HoldReason.REARM), w.held())
-        assertTrue(w.lockLog.last().let { it.startsWith("acquire:REARM:") && it.substringAfterLast(':').toLong() <= HoldReason.REARM.maxMs })
+        assertTrue("the wait between retries holds no wake lock", w.held().isEmpty())
         assertEquals(WakeLoop.RETRYING, w.status.loop)
         assertEquals("Background: retrying", BackgroundText.watchLabel(w.status.session, w.status.loop))
         assertTrue(BackgroundText.watchNotification(w.status.session, w.status.loop)!!.startsWith("Wake phrase paused, retrying"))
@@ -296,7 +297,7 @@ class WatchVoiceCoordinatorTest {
         assertTrue(w.windowOpen)
         assertEquals(WakeLoop.ACTIVE, w.status.loop)
         // A failing recognizer backs off up to a minute, each gap held for a bounded time.
-        repeat(8) { w.wake.onError(w.wake.generation, 5); w.drain(); assertTrue(HoldReason.REARM in w.held()); w.rearmDue() }
+        repeat(8) { w.wake.onError(w.wake.generation, 5); w.drain(); assertTrue(w.held().isEmpty()); assertNotNull(w.rearmIn); w.rearmDue() }
         assertEquals(WakeLoop.ACTIVE, w.status.loop)
     }
 

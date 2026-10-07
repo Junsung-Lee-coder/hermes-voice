@@ -13,6 +13,9 @@ import java.util.Base64
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -153,7 +156,7 @@ class HermesDashboardClient(
     override suspend fun speak(text: String): SpokenAudio {
         val clean = text.trim()
         require(clean.isNotEmpty()) { "speech text is empty" }
-        val json = authorized(endpoint.route("api/audio/speak"), "POST", JSONObject().put("text", clean))
+        val json = authorized(endpoint.route("api/audio/speak"), "POST", JSONObject().put("text", clean), synthesis = true)
         val dataUrl = json.optString("data_url")
         if (!json.optBoolean("ok", false) || !dataUrl.startsWith("data:") || !dataUrl.contains(";base64,")) {
             throw HermesProtocolException("speak response has no base64 data_url")
@@ -217,10 +220,36 @@ class HermesDashboardClient(
      * socket, so every request + parse runs on [Dispatchers.IO]: Android forbids network I/O on the
      * main thread (NetworkOnMainThreadException), which is where ViewModel coroutines run.
      */
-    private suspend fun authorized(url: HttpUrl, method: String, body: JSONObject?, scoped: Boolean = true): JSONObject =
-        withContext(Dispatchers.IO) { authorizedOnIo(url, method, body, scoped) }
+    private suspend fun authorized(url: HttpUrl, method: String, body: JSONObject?, scoped: Boolean = true, synthesis: Boolean = false): JSONObject =
+        withContext(Dispatchers.IO) {
+            if (!synthesis) return@withContext authorizedOnIo(url, method, body, scoped, http, null)
+            // The synthesis request has no elapsed limit, so its call is cancelled with the coroutine: this also ends a
+            // blocking body read, which coroutine cancellation alone would not.
+            val current = java.util.concurrent.atomic.AtomicReference<Call?>()
+            coroutineScope {
+                val watcher = launch { try { awaitCancellation() } finally { current.get()?.cancel() } }
+                try {
+                    authorizedOnIo(url, method, body, scoped, synthesisHttp, current)
+                } finally {
+                    watcher.cancel()
+                }
+            }
+        }
 
-    private suspend fun authorizedOnIo(url: HttpUrl, method: String, body: JSONObject?, scoped: Boolean): JSONObject {
+    /**
+     * `/api/audio/speak` answers one atomic JSON document only after the whole text is synthesized, so no fixed read or
+     * call time can tell a healthy long synthesis from a dead one: this client has none (the bounded connect and write
+     * timeouts stay). Nothing bounds a request that never answers by time: it ends with the audio, an error or a
+     * disconnect, or when its caller's coroutine is cancelled (a Stop), which cancels the live call (an accepted limit:
+     * a half-open connection holds its reply's place until then). Every other request (auth, refresh, sessions,
+     * transcription) keeps the bounded client.
+     */
+    private val synthesisHttp: OkHttpClient by lazy {
+        http.newBuilder().readTimeout(0, java.util.concurrent.TimeUnit.MILLISECONDS).callTimeout(0, java.util.concurrent.TimeUnit.MILLISECONDS).build()
+    }
+
+    private suspend fun authorizedOnIo(url: HttpUrl, method: String, body: JSONObject?, scoped: Boolean,
+                                       client: OkHttpClient, current: java.util.concurrent.atomic.AtomicReference<Call?>?): JSONObject {
         val target = if (scoped && !profile.isNullOrBlank()) {
             url.newBuilder().addQueryParameter("profile", profile).build()
         } else {
@@ -228,7 +257,7 @@ class HermesDashboardClient(
         }
         var session = tokens.load() ?: throw HermesAuthRequiredException("Hermes dashboard sign-in required")
         repeat(2) { attempt ->
-            execute(request(target, method, body, session.accessToken)).use { response ->
+            execute(request(target, method, body, session.accessToken), client, current).use { response ->
                 when {
                     response.code == 401 && attempt == 0 -> session = refreshAfterRejection(session)
                     response.code == 401 -> throw HermesAuthRequiredException("Hermes dashboard rejected the refreshed session")
@@ -279,7 +308,12 @@ class HermesDashboardClient(
         return "${url.encodedPath} failed (${response.code})" + if (detail.isNullOrBlank()) "" else ": ${detail.take(200)}"
     }
 
-    private suspend fun execute(request: Request): Response = http.newCall(request).await()
+    private suspend fun execute(request: Request, client: OkHttpClient = http,
+                                current: java.util.concurrent.atomic.AtomicReference<Call?>? = null): Response {
+        val call = client.newCall(request)
+        current?.set(call)
+        return call.await()
+    }
 
     companion object {
         const val MAX_TRANSCRIBE_BYTES = 25 * 1024 * 1024

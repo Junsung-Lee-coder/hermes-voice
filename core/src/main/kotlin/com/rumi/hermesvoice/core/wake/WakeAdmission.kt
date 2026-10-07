@@ -1,7 +1,6 @@
 package com.rumi.hermesvoice.core.wake
 
 import com.rumi.hermesvoice.core.VoiceOrigin
-import com.rumi.hermesvoice.core.settings.WakeLocation
 import com.rumi.hermesvoice.core.settings.WatchSettings
 import java.nio.charset.StandardCharsets
 import org.json.JSONObject
@@ -93,7 +92,7 @@ class WakeAdmission(
     val epoch: Long get() = synchronized(lock) { answered }
 
     /** Whether wake-phrase turns need a claim now: only when both devices may listen. */
-    fun required(): Boolean = settings().wakeLocation == WakeLocation.BOTH
+    fun required(): Boolean = settings().arbitrationRequired
 
     fun claim(claim: WakeClaim): ClaimVerdict = synchronized(lock) { decide(claim) }
 
@@ -102,7 +101,7 @@ class WakeAdmission(
 
     private fun decide(claim: WakeClaim): ClaimVerdict {
         val current = settings()
-        if (!current.wakeLocation.listensOn(claim.origin)) return ClaimVerdict.NOT_LISTENING
+        if (!current.mayListen(claim.origin)) return ClaimVerdict.NOT_LISTENING
         if (current.revision != claim.settingsRevision) return ClaimVerdict.STALE_SETTINGS
         val now = clock()
         expire(now)

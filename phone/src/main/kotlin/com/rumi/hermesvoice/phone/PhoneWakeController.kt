@@ -79,7 +79,7 @@ class PhoneWakeController(
 
     /** On-device recognition is preferred; [onDevice] false uses the system's default recognition service. */
     private fun startRecognizer(generation: Long, onDevice: Boolean): Boolean = runCatching {
-        val created = if (onDevice) SpeechRecognizer.createOnDeviceSpeechRecognizer(activity) else SpeechRecognizer.createSpeechRecognizer(activity)
+        val created = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && onDevice) SpeechRecognizer.createOnDeviceSpeechRecognizer(activity) else SpeechRecognizer.createSpeechRecognizer(activity)
         recognizer = created
         created.setRecognitionListener(listenerFor(generation, onDevice, guard.open()))
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)

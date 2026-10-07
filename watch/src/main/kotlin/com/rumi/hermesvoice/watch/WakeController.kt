@@ -38,6 +38,13 @@ class WakeController(
     private val onActivity: () -> Unit = {},
 ) {
     private val handler = Handler(Looper.getMainLooper())
+
+    /**
+     * The recognizer of the current window is really ready for speech, the first time in this
+     * armed session ([WakeDeviceController.onRecognizerReady]): the runtime gives the short
+     * "listening" pulse. The debug fixture recognizer never reports readiness, so it never pulses.
+     */
+    var onReadyCue: () -> Unit = {}
     private var recognizer: SpeechRecognizer? = null
     private val guard = RecognizerGuard()
 
@@ -78,7 +85,7 @@ class WakeController(
 
     /** On-device recognition is preferred; [onDevice] false uses the system's default recognition service. */
     private fun startRecognizer(generation: Long, onDevice: Boolean): Boolean = runCatching {
-        val created = if (onDevice) SpeechRecognizer.createOnDeviceSpeechRecognizer(context) else SpeechRecognizer.createSpeechRecognizer(context)
+        val created = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && onDevice) SpeechRecognizer.createOnDeviceSpeechRecognizer(context) else SpeechRecognizer.createSpeechRecognizer(context)
         recognizer = created
         created.setRecognitionListener(listenerFor(generation, onDevice, guard.open()))
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
@@ -123,7 +130,12 @@ class WakeController(
         runCatching { SpeechRecognizer.isOnDeviceRecognitionAvailable(context) }.getOrDefault(false)
 
     private fun listenerFor(gen: Long, onDevice: Boolean, token: Long) = object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) { Log.i(TAG, "wake recognizer ready gen=$gen") }
+        override fun onReadyForSpeech(params: Bundle?) {
+            // A late callback of a released recognizer, or a later window of the same armed session, stays silent.
+            val cue = guard.isCurrent(token) && wake.onRecognizerReady(gen)
+            Log.i(TAG, "wake recognizer ready gen=$gen cue=$cue")
+            if (cue) onReadyCue()
+        }
         override fun onBeginningOfSpeech() { Log.i(TAG, "wake recognizer speech_begin gen=$gen") }
         override fun onEndOfSpeech() { Log.i(TAG, "wake recognizer speech_end gen=$gen") }
         override fun onRmsChanged(rmsdB: Float) {}

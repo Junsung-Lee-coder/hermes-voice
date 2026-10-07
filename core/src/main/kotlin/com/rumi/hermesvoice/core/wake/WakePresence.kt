@@ -1,5 +1,7 @@
 package com.rumi.hermesvoice.core.wake
 
+import com.rumi.hermesvoice.core.settings.WakeGate
+
 /** When to open the next window of an armed background session; [failure] counts toward the back-off. */
 data class Rearm(val delayMs: Long, val failure: Boolean)
 
@@ -16,6 +18,9 @@ enum class WakeLoop {
 
     /** The device has no recognizer: the loop stopped. */
     NO_RECOGNIZER,
+
+    /** Armed with the standby on, but this device's own screen is off and its screen-off preference is off: nothing listens until the screen is back. */
+    WAITING_FOR_SCREEN,
 }
 
 /**
@@ -31,13 +36,19 @@ object ContinuousWakePolicy {
     const val FIRST_BACKOFF_MS = 1_000L
     const val MAX_BACKOFF_MS = 60_000L
 
-    /** How often a window is retried while the Phone is unreachable or the microphone is muted. */
+    /** The first wait before a window is retried while the Phone is unreachable or the microphone is muted. */
     const val BLOCKED_RETRY_MS = 15_000L
     const val COOLDOWN_MARGIN_MS = 100L
 
+    /** The longest wait between retries while the Phone is unreachable or the microphone is muted (the wait doubles up to it). */
+    const val MAX_BLOCKED_RETRY_MS = 300_000L
+
+    /** The wait before the [retries]-th (0-based) consecutive blocked retry: doubles from [BLOCKED_RETRY_MS] up to [MAX_BLOCKED_RETRY_MS]. */
+    fun blockedRetryDelay(retries: Int): Long = (BLOCKED_RETRY_MS shl retries.coerceIn(0, 16)).coerceAtMost(MAX_BLOCKED_RETRY_MS)
+
     private val next = setOf("timeout", "not_matched", "unfinished_request", "request_too_long", "wake_taken", "wake_claim_failed",
         "wake_claim_timeout", "wake_mode_changed", "recognizer_error_6", "recognizer_error_7")
-    private val followedElsewhere = setOf("unavailable", "busy", "opt_out", "pause", "screen_off", "resume", "rearm", "qa_handoff")
+    private val followedElsewhere = setOf("unavailable", "busy", "opt_out", "pause", "screen_off", "resume", "rearm", "qa_handoff", "foreground_excluded", "standby_off", "screen_off_disallowed")
 
     /** [failures]: how many windows in a row already failed. Null: no window is scheduled. */
     fun next(reason: String, failures: Int): Rearm? = when (reason) {
@@ -66,9 +77,21 @@ interface WakePresencePort {
  * ([ContinuousWakePolicy]), and the flow listens again after each request. Disarming with the app
  * hidden stops everything at once, unsent; with the app visible it returns to the foreground rules.
  */
-class WakePresence(private val wake: WakeDeviceController, private val port: WakePresencePort) {
+class WakePresence(
+    private val wake: WakeDeviceController,
+    private val port: WakePresencePort,
+    /**
+     * The device's one wake flow serves both the app on screen and the hidden session (the Watch): it listens under
+     * the foreground location while the app is shown with the screen on, and under its own standby switch otherwise.
+     * False: the flow is fixed to the gate it was built with (the Phone's background-only flow).
+     */
+    private val followsVisibility: Boolean = false,
+) {
     var visible = false
         private set
+
+    /** The screen is on (a screen off over the visible app counts as hidden for an armed session). */
+    private var screenOn = true
 
     /** A background session's microphone is armed. */
     var armed = false
@@ -87,19 +110,79 @@ class WakePresence(private val wake: WakeDeviceController, private val port: Wak
     /** The last scheduled wait was a retry (a failure, an unreachable Phone or a muted microphone). */
     private var retrying = false
 
+    /** Consecutive windows that could not open because the Phone is unreachable or the microphone is muted (sets the doubling wait). */
+    private var blockedRetries = 0
+
+    /** The scheduled wait is a blocked retry that a changed condition (the Phone back, the microphone unmuted) may cut short. */
+    private var waitingForCondition = false
+
     /** The device's recognizer reported that it isn't there. */
     val recognizerUnavailable: Boolean get() = unavailable
 
     val loop: WakeLoop
         get() = when {
             !armed -> WakeLoop.OFF
+            wake.screenDenied -> WakeLoop.WAITING_FOR_SCREEN
             unavailable -> WakeLoop.NO_RECOGNIZER
             retrying -> WakeLoop.RETRYING
             else -> WakeLoop.ACTIVE
         }
 
+    /**
+     * Moves the wake flow to the gate that applies now: the standby while a session is armed and the app is hidden or the
+     * screen is off, the foreground location otherwise. Entering the standby with the foreground excluding the device
+     * opens the next window; entering the foreground with the location excluding it closes the idle window and the
+     * gap's alarm (an accepted recording goes on). Called after every change of visibility, screen or arming.
+     */
+    private fun syncGate(opensWindow: Boolean = true) {
+        // The screen is the device's own, from the platform now as well as from events: a missed event or a stale flag cannot make a dark screen look on.
+        val screen = screenOn && wake.platformScreenInteractive()
+        val next = when {
+            !followsVisibility -> wake.gate
+            armed && !(visible && screen) -> WakeGate.STANDBY
+            else -> WakeGate.FOREGROUND
+        }
+        if (next == wake.gate && screen == wake.screenInteractive) return
+        val wasEnabled = wake.enabledHere
+        wake.setGate(next, screen)
+        if (!armed) return
+        if (!wake.enabledHere) {
+            // Nothing may listen now: no gap, retry or counter of the idle loop outlives that.
+            if (next == WakeGate.FOREGROUND || wasEnabled || pendingRearm != null) {
+                cancelRearm()
+                failures = 0
+                blockedRetries = 0
+                retrying = false
+            }
+        } else if (opensWindow && !wasEnabled) {
+            rearm("standby")
+        }
+    }
+
+    /**
+     * The device's own screen or the standby settings may have changed without an event reaching the presence (the
+     * Phone has no visibility events; the Watch's display listener and screen receiver may race the settings): bring the
+     * gate and the screen fact in line with the platform now, tearing the idle loop down or reopening it exactly once.
+     */
+    fun reconcile() = syncGate()
+
+    /**
+     * New settings were applied to the wake flow: a device they leave without permission to listen keeps no gap, retry or
+     * counter; one they newly allow opens exactly one window (a repeat of the same settings never does).
+     */
+    fun settingsApplied(wasEnabled: Boolean) {
+        if (!armed) return
+        if (!wake.enabledHere) {
+            if (wasEnabled || pendingRearm != null) dropPendingRetry()
+        } else if (!wasEnabled && wake.gate == WakeGate.STANDBY) {
+            rearm("settings")
+        }
+    }
+
     fun onActivityResumed(settingsPending: Boolean) {
         visible = true
+        screenOn = true
+        syncGate()
         // A recognizer may have been installed meanwhile: every show tries again.
         unavailable = false
         if (!armed) return wake.onResume(settingsPending)
@@ -115,17 +198,19 @@ class WakePresence(private val wake: WakeDeviceController, private val port: Wak
 
     fun onActivityPaused() {
         visible = false
-        if (armed) return
+        if (armed) return syncGate()
         wake.onPause()
         port.cancelCapture("pause")
     }
 
     fun onScreenOff() {
-        if (!armed) wake.onScreenOff()
+        screenOn = false
+        if (!armed) wake.onScreenOff() else syncGate()
     }
 
     fun onScreenOn() {
-        if (!armed) wake.onScreenOn()
+        screenOn = true
+        if (!armed) wake.onScreenOn() else syncGate()
     }
 
     /**
@@ -137,7 +222,9 @@ class WakePresence(private val wake: WakeDeviceController, private val port: Wak
         if (now == armed) return armed
         if (now && !visible) return false
         armed = now
+        syncGate(opensWindow = false)
         failures = 0
+        blockedRetries = 0
         retrying = false
         cancelRearm()
         if (now) {
@@ -157,6 +244,8 @@ class WakePresence(private val wake: WakeDeviceController, private val port: Wak
     fun onWindowClosed(reason: String) {
         if (reason == "unavailable") unavailable = true
         if (!armed) return
+        // A window the screen closed while this device is still eligible (the screen-off preference is on) is followed like any quiet window.
+        if (reason == "screen_off" && wake.enabledHere) return schedule(Rearm(ContinuousWakePolicy.REARM_MS, failure = false))
         val next = ContinuousWakePolicy.next(reason, failures) ?: return
         failures = if (next.failure) failures + 1 else 0
         schedule(next)
@@ -167,12 +256,38 @@ class WakePresence(private val wake: WakeDeviceController, private val port: Wak
         if (!armed) return
         when (block) {
             WakeBlock.COOLDOWN -> schedule(Rearm(cooldownRemainingMs + ContinuousWakePolicy.COOLDOWN_MARGIN_MS, failure = false))
-            WakeBlock.PHONE_UNREACHABLE, WakeBlock.MICROPHONE_MUTED -> schedule(Rearm(ContinuousWakePolicy.BLOCKED_RETRY_MS, failure = true))
+            WakeBlock.PHONE_UNREACHABLE, WakeBlock.MICROPHONE_MUTED -> {
+                schedule(Rearm(ContinuousWakePolicy.blockedRetryDelay(blockedRetries), failure = true))
+                blockedRetries += 1
+                waitingForCondition = true
+            }
             else -> Unit
         }
     }
 
+    /**
+     * The thing a blocked window waited for may have changed (the Phone became reachable, the microphone was unmuted): the
+     * next window opens now instead of at the end of the doubling wait. Nothing else is rescheduled, so an event while no
+     * blocked retry waits changes nothing.
+     */
+    fun onConditionChanged() {
+        if (!armed || !waitingForCondition) return
+        cancelRearm()
+        rearm("condition")
+    }
+
+    /** The standby was switched off while a recording defers the disarm: the idle loop gives up its pending gap, retry and counters now. */
+    fun dropPendingRetry() {
+        failures = 0
+        blockedRetries = 0
+        retrying = false
+        cancelRearm()
+    }
+
     fun onBusy() = wake.onBusy()
+
+    /** A later reply holds this device's speaker: the open window stops listening; an episode under way goes on. */
+    fun onPlaybackBusy() = wake.onPlaybackBusy()
 
     fun onIdle() {
         if (armed) rearm("idle") else wake.onIdle()
@@ -180,10 +295,15 @@ class WakePresence(private val wake: WakeDeviceController, private val port: Wak
 
     fun onRearmDue() {
         pendingRearm = null
-        if (armed) rearm("rearm")
+        waitingForCondition = false
+        if (!armed) return
+        // A due gap re-checks the screen first: a late alarm never resurrects listening the screen no longer allows.
+        syncGate(opensWindow = false)
+        rearm("rearm")
     }
 
     private fun schedule(next: Rearm) {
+        waitingForCondition = false
         pendingRearm = next
         retrying = next.failure
         port.scheduleRearm(next.delayMs)
@@ -191,12 +311,16 @@ class WakePresence(private val wake: WakeDeviceController, private val port: Wak
 
     private fun cancelRearm() {
         pendingRearm = null
+        waitingForCondition = false
         port.cancelRearm()
     }
 
     private fun rearm(source: String) {
         if (unavailable) return
         // A window that opens means the loop works again; one that is blocked schedules its own retry.
-        if (wake.rearm(source) == null) retrying = false
+        if (wake.rearm(source) == null) {
+            retrying = false
+            blockedRetries = 0
+        }
     }
 }

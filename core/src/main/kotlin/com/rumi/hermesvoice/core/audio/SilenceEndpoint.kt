@@ -65,10 +65,10 @@ class SilenceEndpoint(
     /** The adaptive background floor (RMS), or NaN while calibrating. */
     val floor: Double get() = vad?.floor ?: Double.NaN
 
-    fun accept(chunk: ByteArray): EndpointDecision {
+    fun accept(chunk: ByteArray, length: Int = chunk.size): EndpointDecision {
         if (phase == Phase.DONE) return EndpointDecision.CONTINUE
         var decision = EndpointDecision.CONTINUE
-        framer.push(chunk) { level ->
+        framer.push(chunk, length) { level ->
             decision = frame(level)
             decision == EndpointDecision.CONTINUE
         }

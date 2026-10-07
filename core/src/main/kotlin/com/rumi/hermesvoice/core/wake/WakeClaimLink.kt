@@ -133,6 +133,14 @@ class WakeClaimTransit(
         release(current.claimId)
     }
 
+    /** Stop withdraws the current in-transit authority, including a sent turn still awaiting admission. */
+    @Synchronized
+    fun cancel() {
+        val current = transit ?: return
+        transit = null
+        release(current.claimId)
+    }
+
     /**
      * The Phone's answer to a renewal. USED: the request was admitted (the same as its first state).
      * Anything else but GRANTED: the claim is gone while the request was still on its way.

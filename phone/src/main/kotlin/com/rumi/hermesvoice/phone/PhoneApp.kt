@@ -9,18 +9,26 @@ import com.rumi.hermesvoice.core.net.HermesGatewayConnector
 import com.rumi.hermesvoice.core.sessions.OwnedSessionRegistry
 import com.rumi.hermesvoice.core.VoiceOrigin
 import com.rumi.hermesvoice.core.audio.AudioInputVerdict
+import com.rumi.hermesvoice.core.diag.DiagCode
+import com.rumi.hermesvoice.core.diag.DiagOrigin
+import com.rumi.hermesvoice.core.diag.DiagVoiceListener
 import com.rumi.hermesvoice.core.background.BackgroundNotice
 import com.rumi.hermesvoice.core.background.BackgroundPort
 import com.rumi.hermesvoice.core.background.BackgroundSession
 import com.rumi.hermesvoice.core.background.BackgroundStatus
 import com.rumi.hermesvoice.core.background.DeviceLocalFlags
+import com.rumi.hermesvoice.core.background.LaterReplyConsent
 import com.rumi.hermesvoice.core.background.NotificationCapability
 import com.rumi.hermesvoice.core.background.HoldReason
 import com.rumi.hermesvoice.core.background.WakeHolds
 import com.rumi.hermesvoice.core.settings.AppSettings
 import com.rumi.hermesvoice.core.voice.AssembledRoute
+import com.rumi.hermesvoice.core.voice.AudioOwnership
+import com.rumi.hermesvoice.core.voice.MicrophoneClaim
+import com.rumi.hermesvoice.core.voice.PendingTurn
 import com.rumi.hermesvoice.core.voice.PlaybackCue
 import com.rumi.hermesvoice.core.voice.PlaybackRoute
+import com.rumi.hermesvoice.core.voice.RoutedNavigation
 import com.rumi.hermesvoice.core.voice.VoiceTurnListener
 import com.rumi.hermesvoice.core.voice.VoiceTurnStage
 import com.rumi.hermesvoice.core.wake.WakeEpisode
@@ -39,12 +47,15 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 
@@ -62,11 +73,28 @@ class PhoneApp : Application() {
         Log.e("HermesVoice", "background task failed: ${error.javaClass.simpleName}")
     })
 
+    /** Main-thread work of the application (opening a microphone once a later reply has stopped). */
+    val mainScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate + CoroutineExceptionHandler { _, error ->
+        Log.e("HermesVoice", "main task failed: ${error.javaClass.simpleName}")
+    })
+
     private val settingsStore by lazy { SharedPreferencesKeyValueStore(prefs(AppSettings.PREFERENCES_NAME)) }
     val settings: AppSettings by lazy { AppSettings(settingsStore) }
 
     /** This install's own flags (the relay opt-in, notifications asked), excluded from backup and transfer. */
-    private val localStore by lazy { SharedPreferencesKeyValueStore(prefs(DeviceLocalFlags.PHONE_PREFERENCES)) }
+    val localStore by lazy { SharedPreferencesKeyValueStore(prefs(DeviceLocalFlags.PHONE_PREFERENCES)) }
+
+    /** Typed diagnostic events and the user-started, private export of them (see [PhoneDiagnostics]). */
+    val diagnostics: PhoneDiagnostics by lazy { PhoneDiagnostics(this) }
+
+    /** "Speak later replies": this install's own informed opt-in, off unless switched on here (device-local, never restored). */
+    val laterConsent: LaterReplyConsent by lazy { LaterReplyConsent(localStore) }
+
+    /**
+     * This process's microphones and later-reply speaker: every Phone recording claims the
+     * microphone here BEFORE opening it, and later replies are admitted here, under one lock.
+     */
+    val audio = AudioOwnership()
 
     /** Elapsed-realtime millis when Phone speaker playback last ended (wake-phrase cooldown). */
     @Volatile var lastPhonePlaybackEndedAtMs: Long = 0L
@@ -79,7 +107,11 @@ class PhoneApp : Application() {
             "revision=${settings.watchSettingsRevision} migrated=$migrated")
         // Legacy copies of the relay flags in the backed-up settings file are switched off, never carried over.
         if (DeviceLocalFlags.dropLegacy(settingsStore, localStore)) Log.i(RELAY_TAG, "legacy relay flags dropped from the backed-up settings")
+        // An undelivered earlier build kept "speak later replies" in the backed-up settings: never taken as consent here.
+        if (LaterReplyConsent.dropLegacy(settingsStore)) Log.i(VOICE_TAG, "legacy later-reply opt-in dropped from the backed-up settings")
+        appScope.launch(Dispatchers.IO) { runCatching { diagnostics.pruneOnStart() } }
         PhoneRelayService.createChannel(this)
+        PhoneWakeService.createChannel(this)
         _relayStatus.value = relay.status
         if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
             // Exported so `adb shell am broadcast` reaches it; never registered in a release build.
@@ -144,11 +176,25 @@ class PhoneApp : Application() {
     fun onActivityStarted() {
         activityVisible = true
         _relayStatus.value = relay.onVisible(microphoneWanted = false, microphonePermission = false)
+        // The app's own wake flow resumes next: the background listening gives the microphone back first.
+        phoneWake.onAppShown()
     }
 
     fun onActivityStopped() {
         activityVisible = false
+        phoneWake.onAppHidden()
     }
+
+    private val phoneWakeLazy = lazy { PhoneBackgroundRuntime(this) }
+
+    /**
+     * The opt-in background listening for the wake phrase (off by default; [PhoneBackgroundRuntime]).
+     * Separate from the relay: either works without the other.
+     */
+    val phoneWake: PhoneBackgroundRuntime by phoneWakeLazy
+
+    /** The conversation open on this Phone's screen (routing off sends this Phone's voice requests there). */
+    @Volatile var selectedConversationId: String? = null
 
     /** The user's switch, from the visible app. */
     fun startRelay(): BackgroundStatus =
@@ -163,10 +209,26 @@ class PhoneApp : Application() {
         val hidden = !activityVisible
         relay.stop()
         _relayStatus.value = relay.status
+        // A Stop also ends following later replies, whether the app is open or not.
+        stopLaterReplies()
         if (!hidden) return
         turns.keys.toList().forEach { it.cancel() }
         holds.releaseAll()
     }
+
+    /** Ends following later replies, and every later reply waiting or playing (a Stop, or the option switched off). */
+    fun stopLaterReplies() {
+        diagnostics.log.record(DiagCode.STOP_ALL, DiagOrigin.PHONE)
+        wiring?.core?.orchestrator?.stopFollowing()
+    }
+
+    // ── the Phone's wake windows, as later replies must respect them ─────────────────────────
+
+    /** The app's own (foreground) wake window is listening ([PhoneViewModel]). */
+    @Volatile var foregroundWakeListening = false
+
+    /** A wake window listens on this Phone now (it closes while a later reply holds the Phone's speaker). */
+    fun phoneWakeListening(): Boolean = foregroundWakeListening || (phoneWakeLazy.isInitialized() && phoneWake.listening)
 
     /** Whether the relay's notification (and its Stop) can be seen now, from the platform itself. */
     fun relayNotificationCapability(): NotificationCapability {
@@ -196,25 +258,58 @@ class PhoneApp : Application() {
 
     private val turns = ConcurrentHashMap<Job, String>()
 
-    /** How many Phone-origin voice turns are being sent, answered or played. */
+    /**
+     * How many Phone-origin voice turns are being SENT (recorded audio or text on its way to the destination, its
+     * acknowledgement spoken): not while a delivered turn only waits for its reply, or for an earlier request to its
+     * conversation, so a new request is accepted meanwhile. The waiting turns are in [pendingTurns].
+     */
     val phoneTurns = MutableStateFlow(0)
 
+    /** The accepted voice requests (either device) that are not finished: transmitting, queued, awaiting a reply or speaking it. */
+    val pendingTurns = MutableStateFlow<List<PendingTurn>>(emptyList())
+
+    private var pendingJob: Job? = null
+
+    /** Voice turns (either origin) in their sending phase; the CPU hold of a turn lasts exactly that long (see [launchTurn]). */
+    private val transmitting = java.util.concurrent.atomic.AtomicInteger()
+    private val transmissionEnds = ConcurrentHashMap<String, () -> Unit>()
+
+    /** The turn's sending phase ended (delivered, or it ends without delivery): nothing is held on its behalf any more. */
+    private fun onTransmitted(turnId: String) {
+        transmissionEnds[turnId]?.invoke()
+    }
+
+    /** Stops ONE pending voice request wherever it is (a Stop of the pending list); false when it already ended. */
+    fun stopPendingTurn(turnId: String): Boolean = wiring?.core?.orchestrator?.stopTurn(turnId) == true
+
     /**
-     * Runs one voice turn (Phone or Watch origin) in the application scope, with a time-limited
-     * CPU hold for as long as any turn runs. [phoneOrigin] turns are counted for the Phone's UI.
+     * Runs one voice turn (Phone or Watch origin) in the application scope. The CPU is held awake only while a turn
+     * is being SENT (bounded), never while it waits for its reply or an earlier request. [phoneOrigin] turns are counted
+     * for the Phone's UI while they are sent. [microphone]: the recording's claim, taken over by the orchestrator when the
+     * turn starts; given back when the job ends in any way (also cancelled before it ran), so it is never left held.
      */
-    fun launchTurn(turnId: String, phoneOrigin: Boolean, block: suspend () -> Unit): Job {
-        if (phoneOrigin) phoneTurns.value += 1
+    fun launchTurn(turnId: String, phoneOrigin: Boolean, microphone: MicrophoneClaim? = null, block: suspend () -> Unit): Job {
+        if (phoneOrigin) phoneTurns.update { it + 1 }
+        val sending = java.util.concurrent.atomic.AtomicBoolean(true)
+        val endSending = {
+            if (sending.compareAndSet(true, false)) {
+                if (phoneOrigin) phoneTurns.update { it - 1 }
+                if (transmitting.decrementAndGet() == 0) holds.release(HoldReason.TURN)
+            }
+        }
+        transmissionEnds[turnId] = endSending
         val job = appScope.launch(start = CoroutineStart.LAZY) {
             try {
                 block()
             } finally {
                 turns.remove(coroutineContext[Job])
-                if (phoneOrigin) phoneTurns.value -= 1
-                if (turns.isEmpty()) holds.release(HoldReason.TURN)
+                transmissionEnds.remove(turnId)
+                endSending()
             }
         }
+        job.invokeOnCompletion { microphone?.release() }
         turns[job] = turnId
+        transmitting.incrementAndGet()
         holds.acquire(HoldReason.TURN)
         job.start()
         return job
@@ -241,11 +336,24 @@ class PhoneApp : Application() {
         val endpoint = HermesDashboardEndpoint.parse(settings.dashboardUrl)
         val key = "$endpoint|${settings.profile}"
         wiring?.takeIf { it.key == key }?.let { return it }
+        // The old core's follows end with its connection (their replies are reported as not played).
+        wiring?.core?.orchestrator?.stopFollowing()
         wiring?.connector?.close()
         // Owned session ids are only meaningful on the dashboard/profile that minted them.
         val registry = OwnedSessionRegistry(SharedPreferencesKeyValueStore(prefs(REGISTRY_PREFS_PREFIX + digest(key))))
-        val (core, connector) = HermesVoiceCore.connect(endpoint, http, tokens, registry, settings, voiceTrace)
+        // Later replies of delivered requests are followed in the application, only with this device's
+        // informed opt-in (Settings, off by default, device-local). The CPU is kept awake for each attempt
+        // to synthesize and hand one off (bounded), never while it waits. Recordings claim this Phone's
+        // microphone in [audio] before opening it, and a later reply is admitted there only when none does.
+        val (core, connector) = HermesVoiceCore.connect(endpoint, http, tokens, registry, settings, DiagVoiceListener(voiceTrace, diagnostics.log),
+            laterScope = appScope, laterWork = ::laterReplyHold,
+            wakeListening = { device -> device == VoiceOrigin.PHONE && phoneWakeListening() },
+            laterEnabled = { laterConsent.enabled }, ownership = audio,
+            laterSpeaker = { device, holding -> if (device == VoiceOrigin.PHONE) phoneSpeakerLater(holding) },
+            diag = diagnostics.log)
         val dashboard = core.speech as HermesDashboardClient
+        pendingJob?.cancel()
+        pendingJob = appScope.launch { core.orchestrator.pending.collect { pendingTurns.value = it } }
         // A new core has a new (empty) playback route.
         currentRoute.value = core.orchestrator.playbackRoute
         // Both: every admitted wake request is told to the Phone's own wake flow and to the Watch,
@@ -258,6 +366,35 @@ class PhoneApp : Application() {
         publishWakeEpoch(WakeEpochItem(core.wakeAdmission.epoch))
         return Wiring(key, endpoint, core, dashboard, connector).also { wiring = it }
     }
+
+    private val laterAttempts = java.util.concurrent.atomic.AtomicInteger()
+    private val laterOnPhone = java.util.concurrent.atomic.AtomicInteger()
+
+    /**
+     * A later reply holds THIS Phone's speaker: from its admission here to its end, on every path.
+     * Both wake flows close an open window for it (an episode under way owns the microphone and is
+     * left alone). Never set while one waits, is synthesized, retries, or plays on the Watch.
+     */
+    val speakingLater = MutableStateFlow(false)
+
+    private fun phoneSpeakerLater(holding: Boolean) {
+        val now = if (holding) laterOnPhone.incrementAndGet() else laterOnPhone.decrementAndGet()
+        speakingLater.value = now > 0
+    }
+
+    /** The handoff and playback of one clip of a reply, on either device: the CPU stays awake for it (bounded). Waiting for synthesis holds nothing. */
+    private suspend fun laterReplyHold(work: suspend () -> Unit) {
+        laterAttempts.incrementAndGet()
+        holds.acquire(HoldReason.PLAYBACK, LATER_REPLY_HOLD_MS)
+        try {
+            work()
+        } finally {
+            if (laterAttempts.decrementAndGet() == 0) holds.release(HoldReason.PLAYBACK)
+        }
+    }
+
+    /** The latest later reply's result for the Phone's status line ("played on …" or why not). */
+    val laterReplies = MutableStateFlow<String?>(null)
 
     private fun prefs(name: String) = getSharedPreferences(name, Context.MODE_PRIVATE)
 
@@ -272,6 +409,25 @@ class PhoneApp : Application() {
 
     /** Counts conversations created by voice turns (Phone or Watch origin), so the UI can reload its list. */
     val conversationsCreated = MutableStateFlow(0)
+
+    /**
+     * A routed turn's conversation the Phone screen should open now; consumed by the screen that is
+     * showing ([PhoneViewModel]). Not replayed: a screen created later never acts on an old one.
+     */
+    val routedOpen = MutableSharedFlow<String>(extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+
+    /**
+     * "Open the routed conversation" (Settings): read when each turn is accepted, acted on once
+     * after its delivery, and only while this app is on screen: it never brings the app forward,
+     * and it moves neither the playback target nor the Watch's own conversation.
+     */
+    val routedNavigation = RoutedNavigation(autoNavigate = { settings.autoNavigationApplies }) { storedSessionId ->
+        if (!activityVisible) {
+            Log.i(VOICE_TAG, "routed conversation not opened: app not on screen")
+            return@RoutedNavigation
+        }
+        routedOpen.tryEmit(storedSessionId)
+    }
 
     /**
      * Where spoken acks and replies play now: the device of the latest accepted voice request (null
@@ -291,19 +447,46 @@ class PhoneApp : Application() {
         override fun onNotAdmitted(turnId: String, origin: VoiceOrigin, reason: String) =
             log("not admitted turn=${turnId.take(12)} origin=$origin reason=$reason (nothing sent, target unchanged)")
 
-        override fun onAccepted(turnId: String, origin: VoiceOrigin) =
+        override fun onAccepted(turnId: String, origin: VoiceOrigin) {
             log("accepted turn=${turnId.take(12)} origin=$origin playback_target=$origin")
+            routedNavigation.onAccepted(turnId, origin)
+        }
+
+        override fun onDelivered(route: AssembledRoute) {
+            log("delivered turn=${route.turnId.take(12)} alias=${route.destination.alias} direct=${route.direct}")
+            routedNavigation.onDelivered(route)
+        }
 
         override fun onStage(turnId: String, stage: VoiceTurnStage) = log("stage turn=${turnId.take(12)} $stage")
 
+        override fun onTransmitted(turnId: String) {
+            log("transmitted turn=${turnId.take(12)} (waiting for the reply holds nothing)")
+            this@PhoneApp.onTransmitted(turnId)
+        }
+
         override fun onRouted(route: AssembledRoute) {
-            log("routed turn=${route.turnId.take(12)} alias=${route.destination.alias} created=${route.created}" +
+            log("routed turn=${route.turnId.take(12)} alias=${route.destination.alias} created=${route.created} direct=${route.direct}" +
                 // Debug builds only: the acknowledgement the Phone composed for a conversation it created
                 // (its title and alias; never the transcript or the router's sentence).
                 if (route.created && applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) " phone_ack=\"${route.ackText}\"" else "")
             // A conversation the router asked for now exists: lists on screen should show it.
             if (route.created) conversationsCreated.value += 1
         }
+
+        override fun onLaterReply(turnId: String, played: Boolean, detail: String) {
+            log("later reply turn=${turnId.take(12)} played=$played ${if (played) "device" else "reason"}=$detail")
+            laterReplies.value = if (played) "Later reply played on the ${if (detail == "watch") "Watch" else "phone"}"
+                else "A later reply couldn't be played: ${detail.take(100)}"
+        }
+
+        /** Which replies became speech, and why not (metadata only: role, length, the tracker's reason). */
+        override fun onResponse(turnId: String, decision: com.rumi.hermesvoice.core.voice.ResponseDecision) =
+            log("response turn=${turnId.take(12)} role=${decision.role} chars=${decision.text.length} " +
+                "spoken=${decision.speakText != null} reason=${decision.reason}")
+
+        /** Stage diagnostics: counts, durations, sizes, device kinds and failure classes; never text or ids. */
+        override fun onDiagnostic(turnId: String, stage: String, detail: String) =
+            log("diag turn=${turnId.take(12).ifEmpty { "-" }} stage=$stage $detail")
 
         override fun onPlayed(cue: PlaybackCue) = log("played turn=${cue.turnId.take(12)} seq=${cue.sequence} " +
             "role=${cue.role} origin=${cue.origin} device=${cue.device} " +
@@ -320,6 +503,15 @@ class PhoneApp : Application() {
         private const val QA_ACTION = "com.rumi.hermesvoice.QA_PHONE"
         private const val QA_RELAY = "hv_qa_relay"
         const val REGISTRY_PREFS_PREFIX = "hermes_voice_sessions_"
+
+        /**
+         * One unit of speaking a reply (the handoff and playback of one chunk): the bound of that CPU hold, renewed for
+         * every chunk, so a long reply is never cut by it. A chunk of at most
+         * [com.rumi.hermesvoice.core.voice.TtsBatcher.SINGLE_MAX] characters plays for minutes at most; the margin covers
+         * the 3 s wake window close. Waiting for its synthesis holds nothing. It is let go as soon as the unit ends; a busy retry
+         * is a new unit; nothing is held while a reply only waits.
+         */
+        private const val LATER_REPLY_HOLD_MS = 7 * 60_000L + 5_000L
 
         private fun digest(value: String): String = MessageDigest.getInstance("SHA-256")
             .digest(value.toByteArray()).take(8).joinToString("") { "%02x".format(it) }

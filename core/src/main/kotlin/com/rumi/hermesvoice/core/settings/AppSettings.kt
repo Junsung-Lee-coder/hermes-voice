@@ -28,6 +28,9 @@ enum class WakeLocation(val label: String) {
     }
 }
 
+/** Which switch lets a device wait for the wake phrase now: the foreground [WakeLocation] (app on screen) or its own background standby. */
+enum class WakeGate { FOREGROUND, STANDBY }
+
 /**
  * The shared VAD's trailing-silence setting: how long a hands-free request may pause before it is
  * sent, on both devices. Phone-owned; [DEFAULT_SECONDS] unless the user picks another of [choices].
@@ -53,6 +56,77 @@ object VadSilence {
 }
 
 /**
+ * How long the Phone keeps following a delivered voice request for replies that arrive after the
+ * first answer ("later replies"). Phone-owned whole minutes, [MIN_MINUTES]..[MAX_MINUTES] (3 days),
+ * [DEFAULT_MINUTES] unless the user picks another. It is only a duration: it never grants the
+ * separate later-reply consent, and it applies as a snapshot to each NEW delivered turn.
+ */
+object LaterReplyWindow {
+    const val MIN_MINUTES = 1
+    const val MAX_MINUTES = 4320
+    const val DEFAULT_MINUTES = 30
+    private const val MILLIS_PER_MINUTE = 60_000L
+
+    /** Quick choices shown next to the numeric entry; every one is inside the valid range. */
+    val presets: List<Int> = listOf(30, 60, 6 * 60, 24 * 60, MAX_MINUTES)
+
+    enum class Unit(val label: String, val minutes: Int) {
+        MINUTES("minutes", 1), HOURS("hours", 60), DAYS("days", 1440)
+    }
+
+    /** [minutes] if it is inside the valid range, else null. */
+    fun validOrNull(minutes: Int?): Int? = minutes?.takeIf { it in MIN_MINUTES..MAX_MINUTES }
+
+    /** Overflow-free whole-minutes → millis conversion; [minutes] must be valid. */
+    fun millis(minutes: Int): Long = requireNotNull(validOrNull(minutes)) { "later reply window must be 1–4320 minutes" } * MILLIS_PER_MINUTE
+
+    /**
+     * A stored value: plain decimal digits only (no sign, fraction, exponent, hex, spaces or
+     * separators) naming a valid minute count; anything else is null so the caller falls back.
+     */
+    fun parseStored(raw: String?): Int? {
+        if (raw == null || raw.isEmpty() || raw.length > 6 || !raw.all { it in '0'..'9' }) return null
+        return validOrNull(raw.toInt())
+    }
+
+    /** Result of reading a typed number in a [Unit]: the minutes, or why it was refused. */
+    sealed class Entry {
+        data class Valid(val minutes: Int) : Entry()
+        data class Invalid(val reason: String) : Entry()
+    }
+
+    /** Strict typed entry: whole digits only, scaled by [unit], then range-checked without overflow. */
+    fun fromEntry(text: String, unit: Unit): Entry {
+        val digits = text.trim()
+        if (digits.isEmpty()) return Entry.Invalid("Enter a whole number")
+        if (digits.length > 7 || !digits.all { it in '0'..'9' }) return Entry.Invalid("Enter a whole number")
+        val minutes = digits.toLong() * unit.minutes
+        if (minutes < MIN_MINUTES) return Entry.Invalid("At least 1 minute")
+        if (minutes > MAX_MINUTES) return Entry.Invalid("At most 3 days (4320 minutes)")
+        return Entry.Valid(minutes.toInt())
+    }
+
+    /** The unit a stored [minutes] is shown in: the largest one that divides it exactly. */
+    fun displayUnit(minutes: Int): Unit = when {
+        minutes % Unit.DAYS.minutes == 0 -> Unit.DAYS
+        minutes % Unit.HOURS.minutes == 0 -> Unit.HOURS
+        else -> Unit.MINUTES
+    }
+
+    fun displayValue(minutes: Int): Int = minutes / displayUnit(minutes).minutes
+
+    /** "30 minutes", "1 hour", "1 hour 30 minutes", "3 days": the exact configured duration in words. */
+    fun describe(minutes: Int): String {
+        val valid = validOrNull(minutes) ?: DEFAULT_MINUTES
+        val days = valid / 1440
+        val hours = valid % 1440 / 60
+        val mins = valid % 60
+        return listOf(days to "day", hours to "hour", mins to "minute").filter { it.first > 0 }
+            .joinToString(" ") { (count, noun) -> "$count $noun" + if (count == 1) "" else "s" }
+    }
+}
+
+/**
  * Phone-owned voice settings, replicated to the Watch over the Data Layer. The Watch never talks
  * to Hermes, so nothing here is a credential. Push-to-talk is always available; the wake phrase is
  * opt-in per device ([wakeLocation]). The Watch keeps a replica and applies a snapshot only when
@@ -66,10 +140,58 @@ data class WatchSettings(
     val vadSilenceSeconds: Double = VadSilence.DEFAULT_SECONDS,
     /** Phone wall-clock millis of the save; 0 for a legacy payload or a never-synced Watch. */
     val revision: Long = 0L,
+    /** The Phone may wait for the wake phrase with its app hidden (a background standby). Default OFF. */
+    val phoneBackgroundWakeEnabled: Boolean = false,
+    /** The Watch may wait for the wake phrase with its app hidden (a background standby). Default OFF. */
+    val watchBackgroundWakeEnabled: Boolean = false,
+    /** The Phone's standby may keep recognizing with the Phone's screen off (subordinate to its standby switch). Default OFF. */
+    val phoneBackgroundWakeScreenOffEnabled: Boolean = false,
+    /** The Watch's standby may keep recognizing with the Watch's screen off or in ambient/AOD (subordinate to its standby switch). Default OFF. */
+    val watchBackgroundWakeScreenOffEnabled: Boolean = false,
+    /**
+     * After a Watch-originated voice request is delivered to a routed conversation, the Watch selects that conversation for its
+     * next visible visit. Effective only while voice routing is on (the Phone applies that gate); retained while routing is off. Default OFF.
+     */
+    val watchAutoNavigateToRouted: Boolean = false,
 ) {
     init {
         require(VadSilence.validOrNull(vadSilenceSeconds) == vadSilenceSeconds) { "invalid trailing silence" }
     }
+
+    /** Whether [device] has its background standby switched on. */
+    fun backgroundWakeEnabled(device: VoiceOrigin): Boolean = when (device) {
+        VoiceOrigin.PHONE -> phoneBackgroundWakeEnabled
+        VoiceOrigin.WATCH -> watchBackgroundWakeEnabled
+    }
+
+    /** Whether [device]'s background recognition may continue with ITS OWN screen off. A request only: it never turns the standby on. */
+    fun backgroundScreenOffEnabled(device: VoiceOrigin): Boolean = when (device) {
+        VoiceOrigin.PHONE -> phoneBackgroundWakeScreenOffEnabled
+        VoiceOrigin.WATCH -> watchBackgroundWakeScreenOffEnabled
+    }
+
+    /**
+     * Whether [device] waits for the wake phrase hidden (background): its standby switch, and while ITS OWN screen is not
+     * interactive also its screen-off preference. [screenInteractive] is that device's own screen only.
+     */
+    fun standbyListens(device: VoiceOrigin, screenInteractive: Boolean): Boolean =
+        backgroundWakeEnabled(device) && (screenInteractive || backgroundScreenOffEnabled(device))
+
+    /** Whether [device] waits for the wake phrase under [gate]: the foreground location alone, or its own standby switch alone. */
+    fun listensIn(device: VoiceOrigin, gate: WakeGate): Boolean = when (gate) {
+        WakeGate.FOREGROUND -> wakeLocation.listensOn(device)
+        WakeGate.STANDBY -> backgroundWakeEnabled(device)
+    }
+
+    /**
+     * Whether [device] may wait for the wake phrase in EITHER mode (on screen under [wakeLocation], or hidden under its
+     * standby switch). Only for deciding whether two devices could hear one phrase, so a claim is needed (arbitration);
+     * it is never the gate that opens a window (that is [listensIn] for the device's current mode).
+     */
+    fun mayListen(device: VoiceOrigin): Boolean = wakeLocation.listensOn(device) || backgroundWakeEnabled(device)
+
+    /** Both devices may hear one spoken phrase, so a wake episode must be admitted from one of them (see WakeAdmission). */
+    val arbitrationRequired: Boolean get() = mayListen(VoiceOrigin.PHONE) && mayListen(VoiceOrigin.WATCH)
 
     /** Whether the Watch listens for the wake phrase. */
     val watchWakeEnabled: Boolean get() = wakeLocation.listensOn(VoiceOrigin.WATCH)
@@ -85,6 +207,11 @@ data class WatchSettings(
         .put("haptics_enabled", hapticsEnabled)
         .put("vad_silence_seconds", vadSilenceSeconds)
         .put("revision", revision)
+        .put("phone_background_wake_enabled", phoneBackgroundWakeEnabled)
+        .put("watch_background_wake_enabled", watchBackgroundWakeEnabled)
+        .put("phone_background_wake_screen_off_enabled", phoneBackgroundWakeScreenOffEnabled)
+        .put("watch_background_wake_screen_off_enabled", watchBackgroundWakeScreenOffEnabled)
+        .put("watch_auto_navigate_to_routed", watchAutoNavigateToRouted)
         .toString()
 
     companion object {
@@ -125,7 +252,32 @@ data class WatchSettings(
                 is Int, is Long -> (value as Number).toLong().takeIf { it >= 0 } ?: return null
                 else -> return null
             }
-            return WatchSettings(location, patterns, haptics, silence, revision)
+            val phoneStandby = when (val value = json.opt("phone_background_wake_enabled")) {
+                null -> false
+                is Boolean -> value
+                else -> return null
+            }
+            val watchStandby = when (val value = json.opt("watch_background_wake_enabled")) {
+                null -> false
+                is Boolean -> value
+                else -> return null
+            }
+            val phoneScreenOff = when (val value = json.opt("phone_background_wake_screen_off_enabled")) {
+                null -> false
+                is Boolean -> value
+                else -> return null
+            }
+            val watchScreenOff = when (val value = json.opt("watch_background_wake_screen_off_enabled")) {
+                null -> false
+                is Boolean -> value
+                else -> return null
+            }
+            val watchNavigate = when (val value = json.opt("watch_auto_navigate_to_routed")) {
+                null -> false
+                is Boolean -> value
+                else -> return null
+            }
+            return WatchSettings(location, patterns, haptics, silence, revision, phoneStandby, watchStandby, phoneScreenOff, watchScreenOff, watchNavigate)
         }
 
         /** The Watch's own stored copy; a missing or unreadable one is the safe default (wake OFF). */
@@ -238,7 +390,10 @@ class AppSettings(private val store: KeyValueStore) {
 
     /** Revision of the last saved Watch settings snapshot (see [WatchSettings.revision]). */
     val watchSettingsRevision: Long
-        get() = store.getString(KEY_WATCH_REVISION)?.toLongOrNull() ?: 0L
+        get() = maxOf(store.getString(KEY_WATCH_REVISION)?.toLongOrNull() ?: 0L, standbyRecord()?.revision ?: 0L)
+
+    /** The stored standby record; null when it was never written or is unreadable (both switches then read OFF). */
+    private fun standbyRecord(): WatchSettings? = WatchSettings.parse(store.getString(KEY_STANDBY_RECORD))
 
     /** Saves all shared voice settings as one snapshot with a strictly increasing revision, and returns it. */
     @Synchronized
@@ -247,7 +402,19 @@ class AppSettings(private val store: KeyValueStore) {
         watchWakePatterns = settings.wakePatterns
         watchHapticsEnabled = settings.hapticsEnabled
         vadSilenceSeconds = settings.vadSilenceSeconds
-        store.putString(KEY_WATCH_REVISION, maxOf(nowMs, watchSettingsRevision + 1).toString())
+        val revision = maxOf(nowMs, watchSettingsRevision + 1)
+        store.putString(
+            KEY_STANDBY_RECORD,
+            WatchSettings(
+                revision = revision,
+                phoneBackgroundWakeEnabled = settings.phoneBackgroundWakeEnabled,
+                watchBackgroundWakeEnabled = settings.watchBackgroundWakeEnabled,
+                phoneBackgroundWakeScreenOffEnabled = settings.phoneBackgroundWakeScreenOffEnabled,
+                watchBackgroundWakeScreenOffEnabled = settings.watchBackgroundWakeScreenOffEnabled,
+                watchAutoNavigateToRouted = settings.watchAutoNavigateToRouted,
+            ).toJson(),
+        )
+        store.putString(KEY_WATCH_REVISION, revision.toString())
         return watchSettings()
     }
 
@@ -256,10 +423,61 @@ class AppSettings(private val store: KeyValueStore) {
         get() = ThemeMode.parse(store.getString(KEY_THEME_MODE))
         set(value) = store.putString(KEY_THEME_MODE, value.name)
 
+    /**
+     * Voice routing (Phone-owned, on by default): on, the router picks or creates the conversation;
+     * off, a voice request goes to the conversation selected on the device that sent it.
+     */
+    var routingEnabled: Boolean
+        get() = store.getBoolean(KEY_ROUTING_ENABLED, true)
+        set(value) = store.putBoolean(KEY_ROUTING_ENABLED, value)
+
+    /**
+     * Open the routed conversation on this Phone after a routed request was delivered (off by
+     * default). Kept while routing is off, but applies only while routing is on ([autoNavigationApplies]).
+     */
+    var autoNavigateToRouted: Boolean
+        get() = store.getBoolean(KEY_AUTO_NAVIGATE, false)
+        set(value) = store.putBoolean(KEY_AUTO_NAVIGATE, value)
+
+    val autoNavigationApplies: Boolean get() = routingEnabled && autoNavigateToRouted
+
+    /**
+     * Select the routed conversation on the Watch after a delivered Watch-originated routed request (off by default). Stored in the
+     * revisioned Watch snapshot ([saveWatchSettings]); kept while routing is off, but applies only while routing is on.
+     */
+    val watchAutoNavigateToRouted: Boolean get() = standbyRecord()?.watchAutoNavigateToRouted ?: false
+
+    val watchAutoNavigationApplies: Boolean get() = routingEnabled && watchAutoNavigateToRouted
+
+    /**
+     * Minutes the Phone keeps following a delivered request for later replies (see [LaterReplyWindow]); 30 when nothing valid is
+     * stored. The setter refuses an out-of-range value, so the stored text is always a valid whole number of minutes.
+     */
+    var laterReplyWindowMinutes: Int
+        get() = LaterReplyWindow.parseStored(store.getString(KEY_LATER_REPLY_WINDOW_MINUTES)) ?: LaterReplyWindow.DEFAULT_MINUTES
+        set(value) = store.putString(KEY_LATER_REPLY_WINDOW_MINUTES,
+            requireNotNull(LaterReplyWindow.validOrNull(value)) { "later reply window must be 1–4320 minutes" }.toString())
+
+    /** The window as milliseconds, read now: a turn delivered after a change uses the new value, one already following keeps its own. */
+    val laterReplyWindowMillis: Long get() = LaterReplyWindow.millis(laterReplyWindowMinutes)
+
     fun playback(): ResponsePlaybackSettings = ResponsePlaybackSettings(playFirstResponse, playMiddleResponses)
 
-    fun watchSettings(): WatchSettings =
-        WatchSettings(wakeLocation, watchWakePatterns, watchHapticsEnabled, vadSilenceSeconds, watchSettingsRevision)
+    fun watchSettings(): WatchSettings {
+        val record = standbyRecord()
+        return WatchSettings(
+            wakeLocation,
+            watchWakePatterns,
+            watchHapticsEnabled,
+            vadSilenceSeconds,
+            maxOf(store.getString(KEY_WATCH_REVISION)?.toLongOrNull() ?: 0L, record?.revision ?: 0L),
+            record?.phoneBackgroundWakeEnabled ?: false,
+            record?.watchBackgroundWakeEnabled ?: false,
+            record?.phoneBackgroundWakeScreenOffEnabled ?: false,
+            record?.watchBackgroundWakeScreenOffEnabled ?: false,
+            record?.watchAutoNavigateToRouted ?: false,
+        )
+    }
 
     companion object {
         const val PREFERENCES_NAME = "hermes_voice_settings"
@@ -275,7 +493,12 @@ class AppSettings(private val store: KeyValueStore) {
         const val KEY_WATCH_WAKE_PATTERNS = "watch_wake_patterns"
         const val KEY_WATCH_HAPTICS = "watch_haptics_enabled"
         const val KEY_WATCH_REVISION = "watch_settings_revision"
+        /** One record holding both standby switches and the revision they were saved with, so they persist atomically. */
+        const val KEY_STANDBY_RECORD = "background_wake_standby"
         const val KEY_THEME_MODE = "theme_mode"
+        const val KEY_ROUTING_ENABLED = "voice_routing_enabled"
+        const val KEY_AUTO_NAVIGATE = "open_routed_conversation"
+        const val KEY_LATER_REPLY_WINDOW_MINUTES = "later_reply_window_minutes"
     }
 }
 

@@ -8,12 +8,17 @@ import com.rumi.hermesvoice.core.net.HermesDashboardClient
 import com.rumi.hermesvoice.core.net.HermesGatewayConnector
 import com.rumi.hermesvoice.core.net.HermesSpeechGateway
 import com.rumi.hermesvoice.core.net.OutgoingAttachment
+import com.rumi.hermesvoice.core.net.RuntimeSetupLimits
 import com.rumi.hermesvoice.core.net.SubmittedTurn
 import com.rumi.hermesvoice.core.sessions.AppSessionRepository
 import com.rumi.hermesvoice.core.sessions.HermesSessionsApi
 import com.rumi.hermesvoice.core.sessions.OwnedSessionRegistry
+import com.rumi.hermesvoice.core.sessions.RouterRuntime
+import com.rumi.hermesvoice.core.net.SessionRuntimeSpec
 import com.rumi.hermesvoice.core.settings.AppSettings
+import com.rumi.hermesvoice.core.voice.AudioOwnership
 import com.rumi.hermesvoice.core.voice.RecipientEvent
+import com.rumi.hermesvoice.core.voice.TurnRouting
 import com.rumi.hermesvoice.core.voice.VoiceTurnConfig
 import com.rumi.hermesvoice.core.voice.VoiceTurnListener
 import com.rumi.hermesvoice.core.voice.VoiceTurnOrchestrator
@@ -23,6 +28,7 @@ import com.rumi.hermesvoice.core.wake.WakeEpochStore
 import com.rumi.hermesvoice.core.watchlink.WatchAckRegistry
 import com.rumi.hermesvoice.core.watchlink.WatchTurnIntake
 import java.io.IOException
+import kotlinx.coroutines.CoroutineScope
 import okhttp3.OkHttpClient
 
 /** Result of a text-chat send; the transcript itself is re-read from history after the turn. */
@@ -60,6 +66,9 @@ class ChatService(private val sessions: AppSessionRepository, private val replyT
             ChatSendResult.Failed("sent, but the reply failed: ${error.message}")
         } catch (error: IOException) {
             ChatSendResult.Failed("sent, but the connection dropped: ${error.javaClass.simpleName}")
+        } finally {
+            // Text replies are shown, never followed or spoken.
+            turn.release()
         }
     }
 }
@@ -78,8 +87,34 @@ class HermesVoiceCore(
     voiceListener: VoiceTurnListener = object : VoiceTurnListener {},
     /** Wall-clock millis for the wake claim leases. */
     clock: () -> Long = System::currentTimeMillis,
+    /** Where later replies of delivered voice turns are followed (see [VoiceTurnOrchestrator]); null: not followed. */
+    laterScope: CoroutineScope? = null,
+    /**
+     * A FIXED follow window for every turn (tests only). Null, as in production: each turn about to be followed reads the
+     * Phone's [AppSettings.laterReplyWindowMillis] when its follow starts.
+     */
+    laterWindowMs: Long? = null,
+    /** Wraps one attempt to speak a later reply: synthesis and handoff (the Phone keeps the CPU awake for that, bounded). */
+    laterWork: suspend (suspend () -> Unit) -> Unit = { it() },
+    /** Whether a device's wake window listens now (it closes for a later reply; never spoken over). */
+    wakeListening: (VoiceOrigin) -> Boolean = { false },
+    laterDeferMaxMs: Long = VoiceTurnOrchestrator.LATER_DEFER_MAX_MS,
+    /**
+     * The user's informed opt-in to speak later replies: device-local consent the app owns (never a
+     * backed-up setting). Read when a turn would be followed and at each later reply. Off by default.
+     */
+    laterEnabled: () -> Boolean = { false },
+    /** This process's microphones and later-reply speaker ([AudioOwnership]); shared by every core of the process. */
+    ownership: AudioOwnership = AudioOwnership(),
+    /** A later reply holds a device's speaker (true), or no longer (false). */
+    laterSpeaker: (VoiceOrigin, Boolean) -> Unit = { _, _ -> },
+    /** The hidden routing session's own model ([RouterRuntime]); null keeps it on the profile's default. */
+    routerRuntime: SessionRuntimeSpec? = RouterRuntime.LUNA_LOW,
+    /** The Phone's typed diagnostic events (user-shared only; see [com.rumi.hermesvoice.core.diag.DiagExporter]). Null: none recorded. */
+    diag: com.rumi.hermesvoice.core.diag.DiagLog? = null,
 ) {
-    val sessions = AppSessionRepository(sessionsApi, conversations, registry)
+    val sessions = AppSessionRepository(sessionsApi, conversations, registry, routerRuntime = routerRuntime,
+        diagnostic = { line -> voiceListener.onDiagnostic("", "router", line) })
     val chat = ChatService(sessions)
     /** Arbitrates the wake phrase when both devices listen: one spoken wake episode, one admitted device. */
     val wakeAdmission = WakeAdmission(clock, settings::watchSettings,
@@ -93,12 +128,23 @@ class HermesVoiceCore(
     @Volatile var onWakeEpisode: (WakeEpisode) -> Unit = {}
     val orchestrator = VoiceTurnOrchestrator(speech, sessions.guardedPort(), config = ::voiceConfig, listener = voiceListener,
         recipientCreator = sessions.recipientCreator(),
-        admission = { request -> wakeAdmission.admitTurn(request.wakeTurn, request.origin, request.originNodeId, request.wakeClaimId) })
+        admission = { request -> wakeAdmission.admitTurn(request.wakeTurn, request.origin, request.originNodeId, request.wakeClaimId) },
+        laterScope = laterScope, laterWindowMs = laterWindowMs ?: VoiceTurnOrchestrator.LATER_WINDOW_MS,
+        laterWindowProvider = if (laterWindowMs != null) null else ({ settings.laterReplyWindowMillis }), laterWork = laterWork,
+        laterEnabled = laterEnabled, wakeListening = wakeListening, laterDeferMaxMs = laterDeferMaxMs,
+        ownership = ownership, laterSpeaker = laterSpeaker)
     val watchAcks = WatchAckRegistry()
-    val watchIntake = WatchTurnIntake(orchestrator, watchAcks)
+    /** A Watch turn's routing is the Phone's switch when its upload arrives; routing off uses the Watch's selection. */
+    val watchIntake = WatchTurnIntake(orchestrator, watchAcks,
+        routing = { upload -> TurnRouting.of(settings.routingEnabled, upload.target) },
+        navigation = { settings.watchAutoNavigationApplies }, diag = diag)
 
-    /** Snapshotted per turn. The allowlist may be empty: the router can then ask for a new conversation. */
-    private suspend fun voiceConfig(): VoiceTurnConfig {
+    /**
+     * Snapshotted per turn. The allowlist may be empty: the router can then ask for a new
+     * conversation. A routing-off turn never touches the router session (not even to create it).
+     */
+    private suspend fun voiceConfig(routing: TurnRouting): VoiceTurnConfig {
+        if (routing is TurnRouting.Direct) return VoiceTurnConfig(null, sessions.allowlist(null), settings.playback())
         val router = sessions.ensureRoutingSession()
         return VoiceTurnConfig(router.storedSessionId, sessions.allowlist(router.storedSessionId), settings.playback())
     }
@@ -113,11 +159,22 @@ class HermesVoiceCore(
             settings: AppSettings,
             voiceListener: VoiceTurnListener = object : VoiceTurnListener {},
             clock: () -> Long = System::currentTimeMillis,
+            laterScope: CoroutineScope? = null,
+            laterWindowMs: Long? = null,
+            laterWork: suspend (suspend () -> Unit) -> Unit = { it() },
+            wakeListening: (VoiceOrigin) -> Boolean = { false },
+            laterDeferMaxMs: Long = VoiceTurnOrchestrator.LATER_DEFER_MAX_MS,
+            laterEnabled: () -> Boolean = { false },
+            ownership: AudioOwnership = AudioOwnership(),
+            laterSpeaker: (VoiceOrigin, Boolean) -> Unit = { _, _ -> },
+            /** The routing session's model setup limits (production: 90 s in all, a switch only with 5 s left, 2 s of it for the readback; tests may shorten them). */
+            runtimeSetupLimits: RuntimeSetupLimits = RuntimeSetupLimits(),
+            diag: com.rumi.hermesvoice.core.diag.DiagLog? = null,
         ): Pair<HermesVoiceCore, HermesGatewayConnector> {
             val dashboard = HermesDashboardClient(endpoint, http, tokens, settings.profile.ifBlank { null })
             val connector = HermesGatewayConnector(dashboard, http)
-            val core = HermesVoiceCore(dashboard, dashboard, GatewayConversationPort(settings.profile.ifBlank { null }) { connector.connection() }, registry, settings,
-                voiceListener, clock)
+            val core = HermesVoiceCore(dashboard, dashboard, GatewayConversationPort(settings.profile.ifBlank { null }, runtimeSetupLimits) { connector.connection() }, registry, settings,
+                voiceListener, clock, laterScope, laterWindowMs, laterWork, wakeListening, laterDeferMaxMs, laterEnabled, ownership, laterSpeaker, diag = diag)
             return core to connector
         }
     }

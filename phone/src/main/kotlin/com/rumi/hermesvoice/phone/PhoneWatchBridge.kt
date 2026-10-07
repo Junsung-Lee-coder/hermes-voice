@@ -95,6 +95,16 @@ class PhoneWatchListenerService : WearableListenerService() {
                 val accepted = runCatching { PhoneApp.from(this).wiring().core.watchAcks.onPlayedMessage(event.sourceNodeId, event.data) }
                 if (accepted.getOrNull() != true) Log.w(TAG, "ignored playback ack from ${event.sourceNodeId.take(8)}")
             }
+            WatchLinkPaths.PLAY_PROGRESS ->
+                runCatching { PhoneApp.from(this).wiring().core.watchAcks.onProgressMessage(event.sourceNodeId, event.data) }
+            WatchLinkPaths.CANCEL -> {
+                val request = TurnStateMessage.decode(event.data)
+                val stopped = request != null && runCatching {
+                    PhoneApp.from(this).wiring().core.watchIntake.cancelTurn(request.turnId, event.sourceNodeId)
+                }.getOrNull() == true
+                Log.i(TAG, "watch stop request from=${event.sourceNodeId.take(8)} stopped=$stopped")
+            }
+            WatchLinkPaths.DIAG_RESPONSE -> PhoneApp.from(this).diagnostics.onWatchResponse(event.sourceNodeId, event.data)
             WatchLinkPaths.READER_REQUEST -> answerReader(event.sourceNodeId, event.data)
             WatchLinkPaths.WAKE_CLAIM -> answerWakeClaim(event.sourceNodeId, event.data)
         }

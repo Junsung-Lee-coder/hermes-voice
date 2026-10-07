@@ -89,8 +89,10 @@ class VoiceTurnOrchestratorTest {
                     trySend(RecipientEvent.Complete(routingReply, "complete"))
                 }, "streaming", true)
             }
-            timeline += "submit:$storedSessionId:$text"
-            val channel = destinationScripts.remove(text) ?: Channel<RecipientEvent>(Channel.UNLIMITED).apply {
+            // the recipient prompt starts with the voice marker; the fixture keys on the words.
+            val words = voiceWords(text)
+            timeline += "submit:$storedSessionId:$words"
+            val channel = destinationScripts.remove(words) ?: Channel<RecipientEvent>(Channel.UNLIMITED).apply {
                 trySend(RecipientEvent.Interim("first"))
                 trySend(RecipientEvent.Interim("middle"))
                 trySend(RecipientEvent.Complete("final", "complete"))
@@ -228,8 +230,12 @@ class VoiceTurnOrchestratorTest {
         assertTrue(outcome is VoiceTurnOutcome.DeliveredResponseFailed)
     }
 
+    // v19 migration of "a newer turn's ack interrupts the older turn's response playback": the older reply is an
+    // independent request now. It is never interrupted nor superseded: the newer request is accepted at once, its
+    // acknowledgement waits for the audio that is playing, goes before the older reply that is still waiting, and
+    // both requests complete.
     @Test
-    fun `a newer turn's ack interrupts the older turn's response playback`() = runBlocking {
+    fun `a newer turn's ack waits for the older turn's response playback instead of interrupting it`() = runBlocking {
         playback = ResponsePlaybackSettings(playFirstResponse = true)
         val olderEvents = Channel<RecipientEvent>(Channel.UNLIMITED)
         destinationScripts["older words"] = olderEvents
@@ -242,15 +248,20 @@ class VoiceTurnOrchestratorTest {
         while (timeline.none { it == "play:watch:FIRST:older first" }) delay(5)
 
         transcript = "newer words"
-        val newer = orchestrator.run(request("t-new", VoiceOrigin.PHONE))
+        val newer = async { orchestrator.run(request("t-new", VoiceOrigin.PHONE)) }
         olderEvents.send(RecipientEvent.Complete("older final", "complete"))
+        delay(300)
+        assertFalse("the audio that plays is not stopped", timeline.any { it.startsWith("stopped:") })
+        assertFalse("the newer ack waits for it", timeline.contains("play:phone:ACK:Sending to work."))
+        hold.complete(Unit)
 
         val olderOutcome = older.await()
-        assertTrue("$olderOutcome", olderOutcome is VoiceTurnOutcome.Interrupted)
-        assertTrue(newer is VoiceTurnOutcome.Completed)
+        val newerOutcome = newer.await()
+        assertTrue("$olderOutcome", olderOutcome is VoiceTurnOutcome.Completed)
+        assertTrue("$newerOutcome", newerOutcome is VoiceTurnOutcome.Completed)
         val order = timeline.toList()
-        assertTrue(order.indexOf("stopped:FIRST:older first") < order.indexOf("play:phone:ACK:Sending to work."))
-        assertFalse(order.contains("play:watch:FINAL:older final"))
+        assertFalse("never silently dropped", order.none { it.endsWith("FINAL:older final") })
+        assertTrue(order.indexOf("play:watch:FIRST:older first") < order.indexOf("play:phone:ACK:Sending to work."))
         assertEquals(listOf("submit:work_session:older words", "submit:work_session:newer words"),
             order.filter { it.startsWith("submit:") })
     }

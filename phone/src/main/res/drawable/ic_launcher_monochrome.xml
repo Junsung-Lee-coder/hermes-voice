@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Themed (monochrome) launcher icon: the same mark as ic_launcher_foreground; the system tints it.
+     Drawn inside the 66dp adaptive-icon safe zone. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M44,25H64A16,16 0,0 1,80 41V55A16,16 0,0 1,64 71H50L37.6,79.2Q35.4,80.6 35.7,78.1L37,69.39A16,16 0,0 1,28 55V41A16,16 0,0 1,44 25Z M48,37A6,6 0,0 1,60 37V45A6,6 0,0 1,48 45Z M41,46A13,13 0,0 0,52 58.85V63H48A2,2 0,0 0,46 65A2,2 0,0 0,48 67H60A2,2 0,0 0,62 65A2,2 0,0 0,60 63H56V58.85A13,13 0,0 0,67 46A2,2 0,0 0,63 46A9,9 0,0 1,45 46A2,2 0,0 0,41 46Z" />
+</vector>

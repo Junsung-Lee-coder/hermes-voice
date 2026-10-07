@@ -3,10 +3,11 @@ package com.rumi.hermesvoice.core.watchlink
 /**
  * Watch haptics, pure so the timing rules are testable off-device. Durations follow the original
  * Recorder Watch policy: recording start 50 ms, recording end 2 × 30 ms with a 12 ms pause, and a
- * 10 ms tick per rotary/bezel scroll step. There is no haptic for button intent, thinking, timers
- * or recomposition.
+ * 10 ms tick per rotary/bezel scroll step; plus 20 ms when the wake-phrase recognizer is really ready
+ * to listen, once per armed session ([com.rumi.hermesvoice.core.wake.WakeDeviceController.onRecognizerReady]).
+ * There is no haptic for button intent, thinking, timers or recomposition.
  */
-enum class HapticEvent { RECORDING_START, RECORDING_END, SCROLL_STEP }
+enum class HapticEvent { RECORDING_START, RECORDING_END, SCROLL_STEP, WAKE_READY }
 
 data class HapticPattern(val pulseMs: Long, val pulses: Int, val pauseMs: Long = 12) {
     /** `VibrationEffect.createWaveform` timings: leading 0 ms delay, then pulse/pause alternating. */
@@ -29,6 +30,7 @@ enum class HapticUsage { HARDWARE_FEEDBACK, TOUCH }
 object WatchHapticPolicy {
     fun usageFor(event: HapticEvent): HapticUsage = when (event) {
         HapticEvent.RECORDING_START, HapticEvent.RECORDING_END -> HapticUsage.HARDWARE_FEEDBACK
+        HapticEvent.WAKE_READY -> HapticUsage.HARDWARE_FEEDBACK
         HapticEvent.SCROLL_STEP -> HapticUsage.TOUCH
     }
 
@@ -36,6 +38,7 @@ object WatchHapticPolicy {
         HapticEvent.RECORDING_START -> HapticPattern(50, 1)
         HapticEvent.RECORDING_END -> HapticPattern(30, 2)
         HapticEvent.SCROLL_STEP -> HapticPattern(10, 1)
+        HapticEvent.WAKE_READY -> HapticPattern(20, 1)
     }
 }
 

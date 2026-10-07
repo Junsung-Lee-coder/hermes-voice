@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ApplicationInfo
+import android.hardware.display.DisplayManager
 import android.content.pm.PackageManager
 import android.media.AudioManager
 import android.os.Build
@@ -15,6 +16,7 @@ import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
+import android.view.Display
 import androidx.core.content.ContextCompat
 import com.rumi.hermesvoice.core.audio.CaptureEnd
 import com.rumi.hermesvoice.core.audio.PcmCaptureLoop
@@ -46,7 +48,6 @@ import java.util.UUID
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * The Watch's one voice runtime, owned by the application: the wake flow ([WakeController]), the
@@ -95,13 +96,24 @@ class WatchVoiceRuntime(private val app: WatchApp) {
         if (presence.present && captures.activeId == null) startCapture(TurnTrigger.PUSH_TO_TALK)
     }
 
-    /** The next window of an armed session; the Phone's reachability is read again first, for a bounded time (the gap stays held). */
+    /** The platform alarm that backs the idle gap between two windows (no wake lock is held in it). */
+    private val standbyAlarm = StandbyScheduler(app)
+
+    /** A gap is scheduled and not yet run: the handler and the alarm both carry it, and whichever comes first runs it once. */
+    private var rearmScheduled = false
+
+    /** The next window of an armed session. The Phone's reachability is the cached, event-driven fact, never queried here. */
     private val rearmRunnable: Runnable = Runnable {
-        if (!coordinator.onRearmTimer()) return@Runnable
-        app.scope.launch {
-            withTimeoutOrNull(WatchVoiceCoordinator.REACHABILITY_TIMEOUT_MS) { app.refreshPhoneReachable() }
-            coordinator.onRearmDue()
-        }
+        if (!rearmScheduled) return@Runnable
+        rearmScheduled = false
+        standbyAlarm.cancel()
+        coordinator.onRearmDue()
+    }
+
+    /** The platform alarm of the gap was delivered (the handler may not have run: the CPU slept). A stale or repeated one does nothing. */
+    fun onRearmAlarm() {
+        handler.removeCallbacks(rearmRunnable)
+        rearmRunnable.run()
     }
 
     /**
@@ -177,7 +189,7 @@ class WatchVoiceRuntime(private val app: WatchApp) {
         override fun armInputs() = WakeArmInputs(
             enabled = true,
             resumed = false,
-            interactive = app.getSystemService(PowerManager::class.java)?.isInteractive == true,
+            interactive = app.getSystemService(PowerManager::class.java)?.isInteractive == true && displayFullyOn(),
             ambient = false,
             permission = hasMic(),
             microphoneMuted = app.getSystemService(AudioManager::class.java)?.isMicrophoneMute == true,
@@ -249,11 +261,19 @@ class WatchVoiceRuntime(private val app: WatchApp) {
 
         override fun scheduleRearm(delayMs: Long) {
             Log.i(TAG, "wake window re-arms in $delayMs ms (background session)")
+            rearmScheduled = true
             handler.removeCallbacks(rearmRunnable)
             handler.postDelayed(rearmRunnable, delayMs)
+            standbyAlarm.schedule(delayMs)
         }
 
-        override fun cancelRearm() = handler.removeCallbacks(rearmRunnable)
+        override fun cancelRearm() {
+            rearmScheduled = false
+            handler.removeCallbacks(rearmRunnable)
+            standbyAlarm.cancel()
+        }
+
+        override fun recordingActive(): Boolean = captures.activeId != null || talkPending
 
         override fun cancelCapture(reason: String) {
             captures.activeId?.let { end(it, CaptureStop.LIFECYCLE) }
@@ -284,6 +304,9 @@ class WatchVoiceRuntime(private val app: WatchApp) {
 
         override fun retypeService(microphone: Boolean): Boolean = WatchVoiceService.running?.retype(microphone) ?: false
 
+        // Starting the service is only a request: WatchVoiceService reports its entry (onServiceEntered).
+        override val confirmsEntry: Boolean get() = true
+
         // A service whose start is still on its way ends itself when it arrives (it must enter the foreground first).
         override fun stopService() {
             WatchVoiceService.running?.finish()
@@ -298,6 +321,12 @@ class WatchVoiceRuntime(private val app: WatchApp) {
 
     val wake: WakeController = WakeController(app, coordinator.devicePort(wakePort), app.settings.value, claimPort) {
         coordinator.onRecognizerActivity()
+    }.also { controller ->
+        // One 20 ms pulse when listening for the wake phrase really starts (once per armed session).
+        controller.onReadyCue = {
+            Log.i(TAG, "haptic ${HapticEvent.WAKE_READY}")
+            app.haptic(HapticEvent.WAKE_READY)
+        }
     }
 
     /** Whether the wake flow follows the screen or an armed background session. */
@@ -326,24 +355,36 @@ class WatchVoiceRuntime(private val app: WatchApp) {
         return NotificationCapability.SHOWN
     }
 
-    /** The user's Start, from the visible activity only. */
-    fun startBackground(): BackgroundStatus = coordinator.start()
+    /**
+     * Background operation is on by default: called by the visible activity on every show and before it sends itself to
+     * the back. Starts the session once per real open (never restarts, doubles or stops a running one; nothing after the
+     * user's Stop until the next open). True when it started now.
+     */
+    fun ensureBackground(): Boolean = coordinator.ensureDefault().also { started ->
+        if (started) Log.i(TAG, "background start (default) running=${background.status.running} microphone=${background.status.microphone}")
+    }
+
+    /** The user really opened the app (a launch, or the task brought back to the front), not a resume after a dialog. */
+    fun onUserOpened() = coordinator.onUserOpened()
+
+    /** WatchVoiceService entered the foreground for session [generation] (typed for the microphone or not). */
+    fun onServiceEntered(generation: Long, microphone: Boolean) = coordinator.onServiceEntered(generation, microphone)
 
     /**
-     * The user's Stop (notification or app), safe to repeat. The session is over for good: nothing
-     * listens or records for it any more. With the app hidden that means everything stops now:
-     * the wake window, a recording (unsent, its claim given back), an upload that has not reached
-     * the link, playback, and every wake lock. With the app on screen, foreground use goes on.
+     * The user's Stop (the notification's), safe to repeat. The session is over until the user opens
+     * the app again: the old wake window, capture/handoff, pending upload, playback and claims
+     * end whether visible or hidden. A later explicit foreground PTT is a new operation.
      */
     fun stopBackground() {
-        val hidden = !presence.visible
+        // Tombstone old turn/speaker identities before wake/capture teardown can clear talk state.
+        app.cancelPendingUploads("Stopped")
         coordinator.stop()
-        if (!hidden) return
         handler.removeCallbacks(handoffRunnable)
         handler.removeCallbacks(talkAfterRelease)
         talkPending = false
         captures.activeId?.let { end(it, CaptureStop.LIFECYCLE) }
-        app.cancelPendingUploads("Stopped")
+        captureClaimId = null
+        recognizedClaimId = null
         app.stopPlayback("stopped")
         app.holds.releaseAll()
     }
@@ -405,6 +446,9 @@ class WatchVoiceRuntime(private val app: WatchApp) {
     }
 
     val capturing: Boolean get() = captures.activeId != null
+
+    /** A wake phrase was heard and its recording or request is about to start (a claim, a held handoff, the pause). */
+    val wakeEpisodePending: Boolean get() = wake.wake.episodePending
 
     // ── capture ──────────────────────────────────────────────────────────────────────────────
 
@@ -475,6 +519,21 @@ class WatchVoiceRuntime(private val app: WatchApp) {
 
     // ── screen, settings, talk state ─────────────────────────────────────────────────────────
 
+    /** A display that is dimmed or in always-on/ambient (doze) mode is not "on": for the screen-off policy it is non-interactive. */
+    private fun displayFullyOn(): Boolean =
+        app.getSystemService(DisplayManager::class.java)?.getDisplay(Display.DEFAULT_DISPLAY)?.state?.let { it == Display.STATE_ON } ?: true
+
+    /** Display state changes (always-on/ambient included) are events too; nothing polls the display. */
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) = Unit
+        override fun onDisplayRemoved(displayId: Int) = Unit
+        override fun onDisplayChanged(displayId: Int) {
+            if (displayId != Display.DEFAULT_DISPLAY) return
+            val on = displayFullyOn()
+            handler.post { if (on) coordinator.onScreenOn() else coordinator.onScreenOff() }
+        }
+    }
+
     /** Only posts a signal; the microphone is never touched from the receiver. */
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -516,6 +575,8 @@ class WatchVoiceRuntime(private val app: WatchApp) {
     }
 
     init {
+        // A process started again owns no alarm of an earlier one: nothing stale may run a window.
+        standbyAlarm.cancel(force = true)
         coordinator.attach(wake.wake)
         val notificationChanges = IntentFilter().apply {
             addAction(NotificationManager.ACTION_APP_BLOCK_STATE_CHANGED)
@@ -531,6 +592,7 @@ class WatchVoiceRuntime(private val app: WatchApp) {
         } else {
             app.registerReceiver(screenReceiver, screen)
         }
+        app.getSystemService(DisplayManager::class.java)?.registerDisplayListener(displayListener, handler)
         if (app.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
             // Exported so `adb shell am broadcast` reaches it; never registered in a release build.
             ContextCompat.registerReceiver(app, qaReceiver, IntentFilter(QA_ACTION), ContextCompat.RECEIVER_EXPORTED)
@@ -546,7 +608,14 @@ class WatchVoiceRuntime(private val app: WatchApp) {
                 }
             }
         }
-        // Phone-owned settings: a mode that excludes the Watch stops listening and any hands-free capture at
+        // The cached reachability of the Phone changed (a Data Layer event, a send or show result): a window waiting for it opens now.
+        app.scope.launch {
+            var first = true
+            app.phoneReachable.collect {
+                if (first) first = false else coordinator.onReachabilityChanged()
+            }
+        }
+        // Phone-owned settings: a standby switch or mode that excludes the Watch stops listening and any hands-free capture at
         // once, and disarms a background session; including it again arms one only while the app is on screen.
         app.scope.launch {
             app.settings.collect { coordinator.onEligibilityChanged() }

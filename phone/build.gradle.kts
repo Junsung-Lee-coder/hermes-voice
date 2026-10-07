@@ -3,6 +3,11 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// UI fixture builds only (`-Phv.uiFixture=true`): a separately installed copy with its own application
+// id, whose instrumentation tests render the production composables in a plain test activity. The app
+// itself is never built with it.
+val uiFixture = providers.gradleProperty("hv.uiFixture").orNull == "true"
+
 android {
     namespace = "com.rumi.hermesvoice.phone"
     compileSdk = 35
@@ -13,13 +18,17 @@ android {
         applicationId = "com.rumi.hermesvoice"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0-dev"
+        versionCode = 19
+        versionName = "0.1.18-dev"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+        }
+        debug {
+            if (uiFixture) applicationIdSuffix = ".uifixture"
         }
     }
 
@@ -54,4 +63,10 @@ dependencies {
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
     implementation("com.google.android.gms:play-services-wearable:18.2.0")
+
+    androidTestImplementation(platform("androidx.compose:compose-bom:2024.06.00"))
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    if (uiFixture) debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
