@@ -29,6 +29,8 @@ import com.rumi.hermesvoice.core.background.NotificationCapability
 import com.rumi.hermesvoice.core.background.PhoneBackgroundHost
 import com.rumi.hermesvoice.core.background.PhoneBackgroundWake
 import com.rumi.hermesvoice.core.background.PhoneWakeStatus
+import com.rumi.hermesvoice.core.headset.HeadsetText
+import com.rumi.hermesvoice.core.headset.MicPlan
 import com.rumi.hermesvoice.core.voice.EpisodeMicrophone
 import com.rumi.hermesvoice.core.voice.MicrophoneClaim
 import com.rumi.hermesvoice.core.voice.TurnRouting
@@ -157,6 +159,10 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
 
     private var recorder: PhoneCapture? = null
     private var captureClaimId: String? = null
+
+    /** The headset link a recording is still bringing up, and the loss watch of a running one ("Use headset"). */
+    private var preparing: AutoCloseable? = null
+    private var inputLoss: AutoCloseable? = null
     private var recognizedClaimId: String? = null
 
     /** The microphone claims ([PhoneApp.audio]) of the recording and of the recognized request; handed to their request. */
@@ -170,6 +176,10 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
         override fun stopRecorder(captureId: String, reason: CaptureStop): ByteArray? {
             val active = recorder?.takeIf { it.captureId == captureId }
             recorder = null
+            runCatching { preparing?.close() }
+            preparing = null
+            runCatching { inputLoss?.close() }
+            inputLoss = null
             val wav = active?.stop()
             active?.stats()?.let { stats ->
                 Log.i(TAG, "phone background capture ended turn=${captureId.take(12)} end=$reason pcm_bytes=${stats.pcmBytes} " +
@@ -233,8 +243,9 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
                 override fun onLive() { handler.post { captures.onLive(id) } }
                 override fun onCalibrated() { handler.post { captures.onCalibrated(id) } }
                 override fun onEnd(reason: CaptureEnd) { handler.post { captures.stop(id, CaptureStop.of(reason)) } }
-            })
+            }, app.recordFactory)
         recorder = capture
+        micNotice.value = null
         Log.i(TAG, "phone background capture turn=${id.take(12)} vad_silence_ms=$silenceMs")
         // Opened only once a later reply it stopped has stopped; null: that happens in a moment (or it ends as START_FAILED).
         return microphone.whenSpeakerStopped(app.mainScope) { stopped -> openCapture(id, capture, stopped) } ?: true
@@ -243,12 +254,48 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
     private fun openCapture(id: String, capture: PhoneCapture, stopped: Boolean): Boolean {
         // Cancelled meanwhile (Stop, app shown, settings): nothing to open.
         if (captures.activeId != id || recorder !== capture) return false
-        if (!stopped || !capture.start()) {
+        if (!stopped) {
             captures.stop(id, CaptureStop.START_FAILED)
             return false
         }
+        var settled = false
+        var opened = false
+        val link = app.headsetMic.prepare { plan ->
+            settled = true
+            preparing = null
+            opened = beginCapture(id, capture, plan)
+        }
+        if (!settled) {
+            preparing = link
+            return true
+        }
+        return opened
+    }
+
+    private fun beginCapture(id: String, capture: PhoneCapture, plan: MicPlan): Boolean {
+        if (captures.activeId != id || recorder !== capture) {
+            plan.release()
+            return false
+        }
+        if (!capture.start(plan) { report -> report.text?.let { micNotice.value = it } }) {
+            captures.stop(id, CaptureStop.START_FAILED)
+            return false
+        }
+        if (plan.preferred != null) {
+            inputLoss = app.headsetMic.watchLoss(plan) {
+                handler.post {
+                    if (captures.activeId == id) {
+                        micNotice.value = HeadsetText.LOST
+                        captures.stop(id, CaptureStop.INPUT_LOST)
+                    }
+                }
+            }
+        }
         return true
     }
+
+    /** Which microphone the current or last background recording really used, or why the headset was lost; null when nothing to say. */
+    val micNotice = MutableStateFlow<String?>(null)
 
     /**
      * A request heard with the app closed: a Phone voice request like any other, run by the

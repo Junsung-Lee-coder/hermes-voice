@@ -119,7 +119,7 @@ class HermesDashboardClient(
     private val http: OkHttpClient,
     private val tokens: HermesTokenStore,
     private val profile: String? = null,
-) : HermesSpeechGateway, HermesSessionsApi {
+) : HermesSpeechGateway, HermesSessionsApi, StoredFileSource {
     private val refreshLock = Mutex()
 
     suspend fun exchangeNativeCode(code: String, codeVerifier: String): HermesBearerSession = withContext(Dispatchers.IO) {
@@ -206,6 +206,41 @@ class HermesDashboardClient(
         return HistoryPage.parse(authorized(url, "GET", null))
     }
 
+    /**
+     * A stored file named in a message, through the dashboard's existing authenticated routes (bearer header only; the path is
+     * the sole query value): images from `GET /api/media?path=`, anything else (or an image that route refuses) from
+     * `GET /api/files/read?path=`. Both answer JSON with a base64 `data_url`; the body and the decoded bytes are bounded by
+     * [StoredFileSource.MAX_BYTES]. The dashboard decides what it will serve; a refusal is reported, never worked around.
+     */
+    override suspend fun fetchStoredFile(ref: com.rumi.hermesvoice.core.attachments.AttachmentRef): StoredFile {
+        val image = ref.kind == com.rumi.hermesvoice.core.attachments.RefKind.IMAGE ||
+            ref.name.substringAfterLast('.', "").lowercase() in setOf("png", "jpg", "jpeg", "gif", "webp")
+        val first = if (image) "api/media" else "api/files/read"
+        return try {
+            readStoredFile(first, ref)
+        } catch (error: HermesHttpException) {
+            if (!image || error.status !in setOf(400, 403, 404, 415)) throw error
+            readStoredFile("api/files/read", ref)
+        }
+    }
+
+    private suspend fun readStoredFile(route: String, ref: com.rumi.hermesvoice.core.attachments.AttachmentRef): StoredFile {
+        val url = endpoint.route(route).newBuilder().addQueryParameter("path", ref.path).build()
+        val json = authorized(url, "GET", null, scoped = false, maxBytes = StoredFileSource.MAX_BODY_BYTES)
+        val dataUrl = json.optString("data_url")
+        if (!dataUrl.startsWith("data:") || !dataUrl.contains(";base64,")) throw HermesProtocolException("the file response has no base64 data")
+        val encoded = dataUrl.substringAfter(";base64,")
+        if (encoded.length > (StoredFileSource.MAX_BYTES.toLong() * 4 / 3 + 8)) throw HermesProtocolException("the file is larger than the ${StoredFileSource.MAX_BYTES / (1024 * 1024)} MiB preview limit")
+        val bytes = try {
+            Base64.getDecoder().decode(encoded)
+        } catch (error: IllegalArgumentException) {
+            throw HermesProtocolException("the file response is not valid base64", error)
+        }
+        if (bytes.isEmpty()) throw HermesProtocolException("the file is empty")
+        val mime = json.optString("mime_type").ifBlank { dataUrl.substringBefore(";base64,").removePrefix("data:") }
+        return StoredFile(ref.name, mime.substringBefore(';').trim().lowercase().ifEmpty { "application/octet-stream" }, bytes)
+    }
+
     /** `PATCH /api/sessions/{id}` with `{archived}`; the profile rides in the body as the route expects. */
     override suspend fun setArchived(sessionId: String, archived: Boolean) {
         val body = JSONObject().put("archived", archived)
@@ -220,9 +255,10 @@ class HermesDashboardClient(
      * socket, so every request + parse runs on [Dispatchers.IO]: Android forbids network I/O on the
      * main thread (NetworkOnMainThreadException), which is where ViewModel coroutines run.
      */
-    private suspend fun authorized(url: HttpUrl, method: String, body: JSONObject?, scoped: Boolean = true, synthesis: Boolean = false): JSONObject =
+    private suspend fun authorized(url: HttpUrl, method: String, body: JSONObject?, scoped: Boolean = true, synthesis: Boolean = false,
+                                   maxBytes: Long = Long.MAX_VALUE): JSONObject =
         withContext(Dispatchers.IO) {
-            if (!synthesis) return@withContext authorizedOnIo(url, method, body, scoped, http, null)
+            if (!synthesis) return@withContext authorizedOnIo(url, method, body, scoped, http, null, maxBytes)
             // The synthesis request has no elapsed limit, so its call is cancelled with the coroutine: this also ends a
             // blocking body read, which coroutine cancellation alone would not.
             val current = java.util.concurrent.atomic.AtomicReference<Call?>()
@@ -249,7 +285,8 @@ class HermesDashboardClient(
     }
 
     private suspend fun authorizedOnIo(url: HttpUrl, method: String, body: JSONObject?, scoped: Boolean,
-                                       client: OkHttpClient, current: java.util.concurrent.atomic.AtomicReference<Call?>?): JSONObject {
+                                       client: OkHttpClient, current: java.util.concurrent.atomic.AtomicReference<Call?>?,
+                                       maxBytes: Long = Long.MAX_VALUE): JSONObject {
         val target = if (scoped && !profile.isNullOrBlank()) {
             url.newBuilder().addQueryParameter("profile", profile).build()
         } else {
@@ -262,7 +299,7 @@ class HermesDashboardClient(
                     response.code == 401 && attempt == 0 -> session = refreshAfterRejection(session)
                     response.code == 401 -> throw HermesAuthRequiredException("Hermes dashboard rejected the refreshed session")
                     response.code !in 200..299 -> throw HermesHttpException(response.code, describeFailure(url, response))
-                    else -> return parseObject(response)
+                    else -> return parseObject(response, maxBytes)
                 }
             }
         }
@@ -297,10 +334,23 @@ class HermesDashboardClient(
         .apply { if (bearer != null) header("Authorization", "Bearer $bearer") }
         .build()
 
-    private fun parseObject(response: Response): JSONObject = try {
-        JSONObject(response.body?.string().orEmpty())
+    private fun parseObject(response: Response, maxBytes: Long = Long.MAX_VALUE): JSONObject = try {
+        JSONObject(if (maxBytes == Long.MAX_VALUE) response.body?.string().orEmpty() else boundedText(response, maxBytes))
     } catch (error: JSONException) {
         throw HermesProtocolException("dashboard returned non-JSON for ${response.request.url.encodedPath}", error)
+    }
+
+    /** The body as text, refusing (before holding more than [maxBytes]) anything larger: a stored file is never read unbounded. */
+    private fun boundedText(response: Response, maxBytes: Long): String {
+        val body = response.body ?: return ""
+        if (body.contentLength() > maxBytes) throw HermesProtocolException("the response is larger than the ${maxBytes / (1024 * 1024)} MiB limit")
+        val source = body.source()
+        val buffer = okio.Buffer()
+        while (buffer.size <= maxBytes) {
+            if (source.read(buffer, 8192) == -1L) break
+        }
+        if (buffer.size > maxBytes) throw HermesProtocolException("the response is larger than the ${maxBytes / (1024 * 1024)} MiB limit")
+        return buffer.readUtf8()
     }
 
     private fun describeFailure(url: HttpUrl, response: Response): String {

@@ -7,6 +7,7 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Color as AndroidColor
 import android.media.AudioManager
+import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.os.SystemClock
@@ -77,6 +78,13 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.size
+import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.Icon
+import androidx.compose.ui.text.style.TextOverflow
+import com.rumi.hermesvoice.core.attachments.AttachmentRef
+import com.rumi.hermesvoice.core.chat.FailedSend
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
@@ -475,7 +483,7 @@ private fun PhoneScreen(model: PhoneViewModel, recognizerAvailable: Boolean, onT
             if (item != tab) model.onUserNavigated()
             tab = item
         },
-        statusLines = listOf(state.status, state.voiceStatus),
+        statusLines = listOf(state.status, state.voiceStatus, state.micNotice.orEmpty()),
         talkBar = if (!state.signedIn) null else ({
             TalkBar(state, onStopPending = model::stopPending) {
                 val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
@@ -619,8 +627,7 @@ internal fun pendingLabel(turn: PendingTurn): String {
     val to = turn.alias?.let { " to $it" }.orEmpty()
     val from = if (turn.origin == VoiceOrigin.WATCH) "Watch request" else "Request"
     return when (turn.phase) {
-        PendingPhase.TRANSMITTING -> "$from$to: sending…"
-        PendingPhase.QUEUED -> "$from$to: queued behind an earlier request to the same conversation"
+        PendingPhase.TRANSMITTING, PendingPhase.QUEUED -> "$from$to: sending…"
         PendingPhase.AWAITING -> "$from$to: waiting for the reply (no limit while it keeps working)"
         PendingPhase.SPEAKING -> "$from$to: speaking the reply"
     }
@@ -742,7 +749,7 @@ private fun ChatTab(state: PhoneUiState, model: PhoneViewModel) {
         hasOlder = state.hasOlder,
         draft = state.draft,
         attachments = state.attachments,
-        sending = state.sending,
+        failedSends = state.failedSends,
         onLoadOlder = model::loadOlder,
         onDraft = model::setDraft,
         onSend = {
@@ -750,7 +757,13 @@ private fun ChatTab(state: PhoneUiState, model: PhoneViewModel) {
         },
         onAttach = { picker.launch(arrayOf("*/*")) },
         onRemoveAttachment = model::removeAttachment,
+        onRetry = model::retryFailedSend,
+        onDismissFailed = model::dismissFailedSend,
+        onPreviewAttachment = model::previewAttachment,
+        onOpenLink = { url -> LinkOpener.open(appContext, url)?.let(model::reportStatus) },
+        onOpenAttachment = model::openAttachment,
     )
+    AttachmentViewerHost(state.viewer, model)
 }
 
 /**
@@ -805,12 +818,17 @@ internal fun ChatPane(
     hasOlder: Boolean,
     draft: String,
     attachments: List<OutgoingAttachment>,
-    sending: Boolean,
     onLoadOlder: () -> Unit,
     onDraft: (String) -> Unit,
     onSend: () -> Unit,
     onAttach: () -> Unit,
     onRemoveAttachment: (Int) -> Unit,
+    failedSends: List<FailedSend> = emptyList(),
+    onRetry: (Long) -> Unit = {},
+    onDismissFailed: (Long) -> Unit = {},
+    onPreviewAttachment: (Int) -> Unit = {},
+    onOpenLink: (String) -> Unit = {},
+    onOpenAttachment: (AttachmentRef) -> Unit = {},
 ) {
     val listState = remember(sessionKey) { LazyListState() }
     val follow = remember(sessionKey) { ChatFollow() }
@@ -837,7 +855,7 @@ internal fun ChatPane(
                             contentColor = if (mine) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
                         ),
                     ) {
-                        Text(message.text, Modifier.padding(10.dp))
+                        MessageBody(message.text, "message_text_${message.rowId}", onOpenLink, onOpenAttachment, Modifier.padding(10.dp))
                     }
                 }
             }
@@ -845,20 +863,31 @@ internal fun ChatPane(
                 TextButton(onClick = onLoadOlder, modifier = Modifier.testTag("load_older")) { Text("Load older") }
             }
         }
-        attachments.forEachIndexed { index, attachment ->
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("📎 ${attachment.name} (${attachment.bytes.size / 1024} KiB)", Modifier.weight(1f))
-                TextButton(onClick = { onRemoveAttachment(index) }) { Text("Remove") }
+        failedSends.forEach { failed ->
+            Row(Modifier.fillMaxWidth().testTag("failed_send_${failed.send.id}"), verticalAlignment = Alignment.CenterVertically) {
+                Text("Not sent: ${failed.reason}", Modifier.weight(1f), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                TextButton(onClick = { onRetry(failed.send.id) }, modifier = Modifier.heightIn(min = 48.dp).testTag("retry_${failed.send.id}")) { Text("Retry") }
+                TextButton(onClick = { onDismissFailed(failed.send.id) }, modifier = Modifier.heightIn(min = 48.dp).testTag("dismiss_${failed.send.id}")) { Text("Dismiss") }
             }
         }
-        Row(Modifier.padding(vertical = 8.dp).testTag("composer_row"), verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = onAttach, enabled = !sending) { Text("Attach") }
+        attachments.forEachIndexed { index, attachment ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = { onPreviewAttachment(index) }, modifier = Modifier.weight(1f).heightIn(min = 48.dp).testTag("attachment_$index")) {
+                    Text("📎 ${attachment.name} (${attachment.bytes.size / 1024} KiB)", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                TextButton(onClick = { onRemoveAttachment(index) }, modifier = Modifier.heightIn(min = 48.dp).testTag("remove_attachment_$index")) { Text("Remove") }
+            }
+        }
+        Row(Modifier.padding(vertical = 8.dp).testTag("composer_row"), verticalAlignment = Alignment.Bottom,
+            horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            IconButton(onClick = onAttach, modifier = Modifier.size(48.dp).testTag("attach")) {
+                Icon(ComposerIcons.Plus, contentDescription = "Attach file")
+            }
             OutlinedTextField(draft, onDraft, Modifier.weight(1f).testTag("composer").onFocusChanged { if (it.isFocused) toLatest() },
-                placeholder = { Text("Message") })
-            Button(onClick = { toLatest(); onSend() }, enabled = !sending && (draft.isNotBlank() || attachments.isNotEmpty()),
-                modifier = Modifier.testTag("send")) {
-                Text(if (sending) "…" else "Send")
+                placeholder = { Text("Message") }, minLines = 1, maxLines = 6)
+            FilledIconButton(onClick = { toLatest(); onSend() }, enabled = draft.isNotBlank() || attachments.isNotEmpty(),
+                modifier = Modifier.size(48.dp).testTag("send")) {
+                Icon(ComposerIcons.ArrowUp, contentDescription = "Send message")
             }
         }
     }
@@ -886,9 +915,22 @@ internal fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerA
         SectionTitle("Spoken replies", SettingsHelp.spokenReplies())
         SwitchRow("Play first response", state.playFirst, onChange = model::setPlayFirst)
         SwitchRow("Play middle responses", state.playMiddle, onChange = model::setPlayMiddle)
-        SwitchRow("Speak later replies (${LaterReplyWindow.describe(state.laterReplyWindowMinutes)})", state.speakLater,
+        SwitchRow("Speak later replies", state.speakLater,
             tag = "speak_later_replies", help = SettingsHelp.laterReplies(state.laterReplyWindowMinutes), onChange = model::setSpeakLaterReplies)
         LaterReplyWindowRow(state, model)
+        // Android 12+ needs the Bluetooth permission before a Bluetooth headset can be found or its microphone used; the answer only
+        // decides the Bluetooth part (a denied permission is told when a recording falls back to the Phone microphone).
+        val bluetoothPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+        SwitchRow("Use headset", state.useHeadset, tag = "use_headset", help = SettingsHelp.useHeadset(), onChange = { on ->
+            model.setUseHeadset(on)
+            if (on && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                bluetoothPermission.launch(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+        })
+        state.headsetControl?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("headset_control_status"))
+        }
 
         HorizontalDivider()
         SectionTitle("Voice routing", SettingsHelp.routing())
@@ -1194,8 +1236,8 @@ private fun HelpDialog(topic: HelpTopic, onDismiss: () -> Unit) {
 
 /**
  * How long a delivered voice request keeps being followed for later replies: a whole number in minutes, hours or days (1 minute
- * to 3 days) or a preset. Typing changes only a draft; the value is checked and saved on Done, when the field loses focus or a
- * unit/preset is chosen, and a refused entry is explained without being saved. The opt-in switch above is separate.
+ * to 3 days). Typing changes only a draft; the value is checked and saved on Done, when the field loses focus or a
+ * unit is chosen, and a refused entry is explained without being saved. The opt-in switch above is separate.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -1234,15 +1276,6 @@ private fun LaterReplyWindowRow(state: PhoneUiState, model: PhoneViewModel) {
                     FilterChip(selected = unit == choice, onClick = { unit = choice; model.commitLaterReplyWindow(text, choice) },
                         label = { Text(choice.label) }, modifier = Modifier.testTag("later_reply_unit_${choice.name.lowercase()}"))
                 }
-            }
-        }
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            LaterReplyWindow.presets.forEach { minutes ->
-                FilterChip(selected = stored == minutes, onClick = {
-                    text = LaterReplyWindow.displayValue(minutes).toString()
-                    unit = LaterReplyWindow.displayUnit(minutes)
-                    model.setLaterReplyWindowMinutes(minutes)
-                }, label = { Text(LaterReplyWindow.describe(minutes)) }, modifier = Modifier.testTag("later_reply_preset_$minutes"))
             }
         }
         state.laterReplyWindowError?.let {

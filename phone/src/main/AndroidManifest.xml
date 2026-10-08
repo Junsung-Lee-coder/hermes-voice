@@ -22,6 +22,9 @@
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- "Use headset": a Bluetooth headset's microphone needs a communication link (audio mode / SCO) and, on Android 12+, the Bluetooth permission. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
     <!-- Package visibility (Android 11+) for the platform speech recognizer used by the foreground
          wake phrase; without it SpeechRecognizer reports no recognition service. Not a permission. -->
@@ -75,8 +78,8 @@
             android:name=".StandbyAlarmReceiver"
             android:exported="false" />
 
-        <!-- Not exported: hands the user-started diagnostics report (a file in this app's cache "diag/" folder) to the
-             share sheet the user picks, as a one-time read-only grant for that one file. -->
+        <!-- Not exported: hands the user-started diagnostics report (a file in this app's cache "diag/" folder) or the one
+             attachment being viewed (cache "viewed/") to the app the user picks, as a read-only grant for that one file. -->
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.diagshare"
@@ -117,6 +120,10 @@
             <intent-filter>
                 <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
                 <data android:scheme="wear" android:host="*" android:path="/hv/v1/diag/response" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
+                <data android:scheme="wear" android:host="*" android:path="/hv/v1/private_audio" />
             </intent-filter>
         </service>
     </application>

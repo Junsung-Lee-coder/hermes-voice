@@ -42,6 +42,7 @@ import com.rumi.hermesvoice.core.watchlink.LaterPlaybackGuard
 import com.rumi.hermesvoice.core.watchlink.PlayProgress
 import com.rumi.hermesvoice.core.watchlink.PlayRequest
 import com.rumi.hermesvoice.core.watchlink.PlayedAck
+import com.rumi.hermesvoice.core.watchlink.PrivateAudioReceipt
 import com.rumi.hermesvoice.core.watchlink.ReaderKind
 import com.rumi.hermesvoice.core.watchlink.ReaderMessageRow
 import com.rumi.hermesvoice.core.watchlink.ReaderRequest
@@ -172,6 +173,22 @@ class WatchApp : Application() {
         if (result == ReplicaUpdate.APPLIED) {
             getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_SETTINGS, current.toJson()).apply()
             _settings.value = current
+            // The Phone's headset is the only output now: what plays here stops (the Phone is told it was not played).
+            if (current.privateAudio) stopPlayback(PRIVATE_HEADSET)
+        }
+        // Whatever was offered (applied, stale or invalid), the Phone is told what this Watch really holds: the revision and whether it
+        // refuses to play. A send is best effort and bounded; without a receipt the Phone claims nothing about the Watch.
+        val receipt = PrivateAudioReceipt(current.revision, current.privateAudio)
+        scope.launch {
+            val node = phoneNode() ?: return@launch
+            try {
+                withTimeoutOrNull(PROGRESS_SEND_MS) {
+                    Wearable.getMessageClient(this@WatchApp).sendMessage(node, WatchLinkPaths.PRIVATE_AUDIO, receipt.toJson().toByteArray(Charsets.UTF_8)).await()
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+            }
         }
         Log.i(TAG, "settings $result revision=${current.revision} wake_location=${current.wakeLocation} " +
             "watch_listens=${current.watchWakeEnabled} phone_standby=${current.phoneBackgroundWakeEnabled} " +
@@ -520,7 +537,8 @@ class WatchApp : Application() {
         val message = ReplyAlertMessage.decode(bytes) ?: return null
         val alert = ReplyAlert(message.identity, message.sessionId)
         if (!replyLedger.claim(alert.identity)) return ReplyAlertResult.DUPLICATE
-        return if (replyNotifier.show(alert)) ReplyAlertResult.SHOWN_HERE else ReplyAlertResult.NOT_SHOWN_HERE
+        val shown = if (replica.current.privateAudio) replyNotifier.show(alert, null, true) else replyNotifier.show(alert)
+        return if (shown) ReplyAlertResult.SHOWN_HERE else ReplyAlertResult.NOT_SHOWN_HERE
     }
 
     /** A tapped arrival alert: the conversation it names is opened like the user's own choice. */
@@ -662,6 +680,8 @@ class WatchApp : Application() {
     fun play(request: PlayRequest, nodeId: String) {
         // Reject cancelled authority before touching an unrelated player, focus, speaker or hold.
         if (request.turnId in stoppedTurns) return refusePlayback(request, nodeId, "stopped on the watch")
+        // The Phone's headset is the only output: nothing is played here, whoever asked and whatever the reply is.
+        if (replica.current.privateAudio) return refusePlayback(request, nodeId, PRIVATE_HEADSET)
         // A later reply never plays over a recording: refused as busy (not played, not failed), and what plays now goes on.
         LaterPlaybackGuard.refusal(request, recordingNow())?.let { busy -> return refusePlayback(request, nodeId, busy) }
         // Completion must not forget the authority Stop needs to revoke between utterances.
@@ -837,6 +857,8 @@ class WatchApp : Application() {
         private const val TAG = "HermesVoiceWatch"
         private const val PREFS = "hermes_voice_watch"
         private const val KEY_SETTINGS = "settings_json"
+        /** The ACK error of a clip refused or stopped because the Phone's headset is the only output (never "played"). */
+        const val PRIVATE_HEADSET = "private_headset"
         private const val ACK_HOLD_MS = 10_000L
         private const val PROGRESS_INTERVAL_MS = 5_000L
         private const val PROGRESS_SEND_MS = 4_000L

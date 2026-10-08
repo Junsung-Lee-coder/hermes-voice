@@ -143,7 +143,15 @@ class LaterReplyCompletionTest {
         }
     }
 
-    private fun phoneScenario(name: String, run: (CoreHarness, PhoneShapedSink, ExecutorService, CountDownLatch) -> Unit) {
+    /**
+     * [arm] runs BEFORE the later reply is pushed: the sink reads its hooks when the reply's audio executes, which can be right
+     * after the push, so arming afterwards raced it (the r1-full "phone - ..." failures).
+     */
+    private fun phoneScenario(
+        name: String,
+        arm: (CoreHarness, PhoneShapedSink, ExecutorService, CountDownLatch) -> Unit = { _, _, _, _ -> },
+        run: (CoreHarness, PhoneShapedSink, ExecutorService, CountDownLatch) -> Unit,
+    ) {
         val aPool = Executors.newSingleThreadExecutor()
         val playerPool = Executors.newSingleThreadExecutor()
         val scope = CoroutineScope(SupervisorJob() + aPool.asCoroutineDispatcher())
@@ -155,6 +163,7 @@ class LaterReplyCompletionTest {
                 routeTo(h, "work")
                 val sink = PhoneShapedSink(playerPool)
                 runBlocking { h.core.orchestrator.run(VoiceTurnRequest("$name-0", VoiceOrigin.PHONE, TestAudio.speechWav(), "audio/wav", sink)) }
+                arm(h, sink, aPool, gate)
                 h.fake.pushLaterTurn(work, FakeHermesDashboard.complete("Heard once."))
                 run(h, sink, aPool, gate)
             }
@@ -165,13 +174,18 @@ class LaterReplyCompletionTest {
 
     // ── R1, Phone-shaped sink through the completion seam ────────────────────────────────────
 
+    private val endedClaim = CountDownLatch(1)
+    private val endedNewer = CountDownLatch(1)
+    private val stoppedEarly = CountDownLatch(1)
+    private val earlyClaims: MutableList<com.rumi.hermesvoice.core.voice.MicrophoneClaim> = Collections.synchronizedList(mutableListOf())
+
     @Test
     fun `phone - a recording claim after the player's completion neither stops nor replays it, and opens only after the teardown`() =
-        phoneScenario("c-phone-claim") { h, sink, aPool, gate ->
-            val ended = CountDownLatch(1)
+        phoneScenario("c-phone-claim", arm = { _, sink, aPool, gate ->
             sink.beforeEnd = { block(aPool, gate) }
-            sink.afterEnd = { ended.countDown() }
-            assertTrue(ended.await(15, TimeUnit.SECONDS))
+            sink.afterEnd = { endedClaim.countDown() }
+        }) { h, sink, _, gate ->
+            assertTrue(endedClaim.await(15, TimeUnit.SECONDS))
             val claim = h.ownership.claimMicrophone(VoiceOrigin.PHONE)
             val opened = CompletableDeferred<Boolean>()
             val now = claim.whenSpeakerStopped(CoroutineScope(Dispatchers.Default)) { ok -> opened.complete(ok && !sink.active && phoneSpeaker.get() == 0) }
@@ -191,11 +205,11 @@ class LaterReplyCompletionTest {
 
     @Test
     fun `phone - a newer request at the same boundary leaves it played, and its own reply plays`() =
-        phoneScenario("c-phone-newer") { h, sink, aPool, gate ->
-            val ended = CountDownLatch(1)
+        phoneScenario("c-phone-newer", arm = { _, sink, aPool, gate ->
             sink.beforeEnd = { block(aPool, gate) }
-            sink.afterEnd = { ended.countDown() }
-            assertTrue(ended.await(15, TimeUnit.SECONDS))
+            sink.afterEnd = { endedNewer.countDown() }
+        }) { h, sink, _, gate ->
+            assertTrue(endedNewer.await(15, TimeUnit.SECONDS))
             routeTo(h, "home")
             val newer = CoroutineScope(Dispatchers.Default).async {
                 h.core.orchestrator.run(VoiceTurnRequest("c-phone-newer-1", VoiceOrigin.PHONE, TestAudio.speechWav(), "audio/wav", sink))
@@ -214,10 +228,11 @@ class LaterReplyCompletionTest {
         for (off in listOf(false, true)) {
             later.clear()
             played.clear()
-            phoneScenario("c-phone-stop-$off") { h, sink, aPool, gate ->
-                val ended = CountDownLatch(1)
+            val ended = CountDownLatch(1)
+            phoneScenario("c-phone-stop-$off", arm = { _, sink, aPool, gate ->
                 sink.beforeEnd = { block(aPool, gate) }
                 sink.afterEnd = { ended.countDown() }
+            }) { h, _, _, gate ->
                 assertTrue(ended.await(15, TimeUnit.SECONDS))
                 if (off) h.laterConsent.enabled = false
                 h.core.orchestrator.stopFollowing()
@@ -232,11 +247,11 @@ class LaterReplyCompletionTest {
 
     @Test
     fun `phone - a Stop before the player completed reports stopped, and a stale completion after it never counts`() =
-        phoneScenario("c-phone-early-stop") { h, sink, _, _ ->
-            val stopped = CountDownLatch(1)
+        phoneScenario("c-phone-early-stop", arm = { h, sink, _, _ ->
             sink.confirmEvenIfStopped = true
-            sink.beforeEnd = { h.core.orchestrator.stopFollowing(); stopped.countDown() }
-            assertTrue(stopped.await(15, TimeUnit.SECONDS))
+            sink.beforeEnd = { h.core.orchestrator.stopFollowing(); stoppedEarly.countDown() }
+        }) { _, sink, _, _ ->
+            assertTrue(stoppedEarly.await(15, TimeUnit.SECONDS))
             waitFor("reported") { later.isNotEmpty() }
             settle(800)
             assertEquals(listOf("c-phone-early-stop-0:not_played:not played: stopped"), later.toList())
@@ -246,10 +261,11 @@ class LaterReplyCompletionTest {
 
     @Test
     fun `phone - a recording that claims before the player completed stops it, and it plays again once after the recording`() =
-        phoneScenario("c-phone-early-claim") { h, sink, _, _ ->
-            val claims: MutableList<com.rumi.hermesvoice.core.voice.MicrophoneClaim> = Collections.synchronizedList(mutableListOf())
+        phoneScenario("c-phone-early-claim", arm = { h, sink, _, _ ->
             sink.confirmEvenIfStopped = true // a late completion of the stopped player must not count either
-            sink.beforeEnd = { claims += h.ownership.claimMicrophone(VoiceOrigin.PHONE) }
+            sink.beforeEnd = { earlyClaims += h.ownership.claimMicrophone(VoiceOrigin.PHONE) }
+        }) { _, sink, _, _ ->
+            val claims = earlyClaims
             waitFor("claimed") { claims.isNotEmpty() }
             settle(800)
             assertTrue("not reported: it will be played again", later.isEmpty())
@@ -489,10 +505,10 @@ class LaterReplyTruthfulTextTest {
     @Test
     fun `both production sinks confirm the end from their own signal, before resuming`() {
         val phone = source("phone/src/main/kotlin/com/rumi/hermesvoice/phone/PhoneAudio.kt")
-        val completion = phone.substringAfter("player.setOnCompletionListener {").substringBefore("player.setOnErrorListener")
+        val completion = phone.substringAfter("onCompleted = {").substringBefore("onError = {")
         assertTrue(completion, Regex("if \\(continuation\\.isActive\\) \\{\\s+finished\\(\\)\\s+continuation\\.resume\\(Unit\\)").containsMatchIn(completion))
-        assertFalse("never from the error, focus-loss or cancellation paths", phone.substringAfter("player.setOnErrorListener").contains("finished()") ||
-            phone.substringBefore("player.setOnCompletionListener").substringAfter("override suspend fun playConfirmed").contains("finished()"))
+        assertFalse("never from the error, focus-loss or cancellation paths", phone.substringAfter("onError = {").contains("finished()") ||
+            phone.substringBefore("onCompleted = {").substringAfter("override suspend fun playConfirmed").contains("finished()"))
         val watch = source("core/src/main/kotlin/com/rumi/hermesvoice/core/watchlink/PhoneWatchRelay.kt")
         assertTrue(watch.contains("val waiter = acks.expectPlayback(cue.turnId, wireSequence, transport.nodeId, played = finished)"))
         assertTrue(watch.contains("if (ack.ok) runCatching { waiter.played?.invoke() }\n        return waiter.wait.ack.complete(ack)"))

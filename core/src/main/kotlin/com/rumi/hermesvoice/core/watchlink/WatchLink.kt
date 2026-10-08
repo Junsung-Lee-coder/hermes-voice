@@ -18,6 +18,8 @@ import org.json.JSONObject
  * - `/hv/v1/state`               message, Phone → Watch: [TurnStateMessage]
  * - `/hv/v1/play/<turnId>/<seq>` channel, Phone → Watch: [LinkFrame] {play header} + audio bytes
  * - `/hv/v1/played`              message, Watch → Phone: [PlayedAck] (sent when playback ends)
+ * - `/hv/v1/private_audio`      message, Watch → Phone: [PrivateAudioReceipt] (revision applied, whether the Watch now refuses to play), sent
+ *                                after every settings snapshot the Watch applied or found stale
  * - `/hv/v1/stop`                message, Phone → Watch: stop playing this turn now (interruption)
  * - `/hv/v1/cancel`             message, Watch → Phone: the Watch's Stop: stop this Watch's own request ([TurnStateMessage]
  *                                with the turn id) wherever it is (queued, awaiting its reply, speaking); one message per request
@@ -40,6 +42,9 @@ object WatchLinkPaths {
     const val STATE = "/hv/v1/state"
     const val PLAY_PREFIX = "/hv/v1/play/"
     const val PLAYED = "/hv/v1/played"
+
+    /** Watch → Phone: what the Watch applied of the private-output flag, with the snapshot revision ([PrivateAudioReceipt]). */
+    const val PRIVATE_AUDIO = "/hv/v1/private_audio"
 
     /** Watch → Phone: the player's real position while one clip plays ([PlayProgress]). Optional: an older Watch never sends it. */
     const val PLAY_PROGRESS = "/hv/v1/play_progress"

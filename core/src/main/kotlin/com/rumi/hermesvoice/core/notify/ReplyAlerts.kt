@@ -10,7 +10,8 @@ import kotlinx.coroutines.launch
 enum class FinalReplySource { OWN, LATER, TEXT }
 
 /**
- * One actual final assistant answer the app received, with what became of its audio. Never carries the reply text.
+ * One actual final assistant answer the app received, with what became of its audio. [text] is that answer itself, used ONLY
+ * for this device's own notification preview: it never reaches the identity, the ledger, the Watch alert or any log.
  * [identity] is the positive terminal identity (turn + position, or a chat send): never derived from the body.
  */
 class FinalReply(
@@ -25,9 +26,13 @@ class FinalReply(
     val source: FinalReplySource,
     /** The target device's link, when it is another device (the Watch); null for the Phone itself. */
     val sink: PlaybackSink? = null,
+    /** The delivered final answer, exactly as received (null when unknown): never an interim, a progress line or the request. */
+    val text: String? = null,
+    /** The answer was meant for the private headset only: its alert is visual here, never a sound and never handed to the Watch. */
+    val quiet: Boolean = false,
 )
 
-/** What an alert carries to a device: identity and the conversation to open, nothing of the answer. */
+/** What an alert carries to ANOTHER device (the Watch): identity and the conversation to open, nothing of the answer. */
 data class ReplyAlert(val identity: String, val storedSessionId: String) {
     init {
         require(IDENTITY.matches(identity) && DestinationAllowlist.isValidSessionId(storedSessionId)) { "invalid reply alert" }
@@ -50,6 +55,12 @@ data class ReplyAlert(val identity: String, val storedSessionId: String) {
 /** The platform notification surface of THIS device. [show] never throws and reports whether the system accepted it. */
 fun interface ReplyAlertPort {
     fun show(alert: ReplyAlert): Boolean
+
+    /** Shows [alert] with a preview of the answer where this surface can; the default is the content-free alert. */
+    fun show(alert: ReplyAlert, preview: ReplyPreview?): Boolean = show(alert)
+
+    /** As above; [quiet] asks for a visual-only alert (no sound) where this surface can; the default ignores it. */
+    fun show(alert: ReplyAlert, preview: ReplyPreview?, quiet: Boolean): Boolean = show(alert, preview)
 }
 
 enum class ReplyAlertResult { SUPPRESSED_HEARD, SUPPRESSED_CANCELLED, DUPLICATE, INVALID, SHOWN_HERE, NOT_SHOWN_HERE, SENT_TO_WATCH }
@@ -101,17 +112,22 @@ class ReplyAlerts(
         val alert = runCatching { ReplyAlert(reply.identity, reply.storedSessionId) }.getOrNull() ?: return ReplyAlertResult.INVALID
         if (!ledger.claim(alert.identity)) return ReplyAlertResult.DUPLICATE
         val sink = reply.sink
-        if (reply.target == VoiceOrigin.WATCH && sink != null && runCatching { sink.deliverReplyAlert(alert) }.getOrDefault(false)) {
+        if (!reply.quiet && reply.target == VoiceOrigin.WATCH && sink != null && runCatching { sink.deliverReplyAlert(alert) }.getOrDefault(false)) {
             return ReplyAlertResult.SENT_TO_WATCH
         }
-        return if (runCatching { here.show(alert) }.getOrDefault(false)) ReplyAlertResult.SHOWN_HERE else ReplyAlertResult.NOT_SHOWN_HERE
+        val preview = runCatching { ReplyPreview.of(reply.text) }.getOrNull()
+        return if (runCatching { here.show(alert, preview, reply.quiet) }.getOrDefault(false)) ReplyAlertResult.SHOWN_HERE else ReplyAlertResult.NOT_SHOWN_HERE
     }
 }
 
-/** What both devices show and carry for an arrival alert: generic text only, and the conversation to open. */
+/** What both devices carry for an arrival alert: generic text (the Phone adds a preview of the answer itself) and the conversation to open. */
 object ReplyAlertContent {
     const val CHANNEL_ID = "reply_arrival"
     const val CHANNEL_NAME = "New replies"
+
+    /** The channel of an alert that must stay silent (headset-only output): low importance, no sound. */
+    const val QUIET_CHANNEL_ID = "reply_arrival_quiet"
+    const val QUIET_CHANNEL_NAME = "New replies (headset only)"
     const val TITLE = "New reply"
     const val BODY = "A new reply is ready"
     const val PUBLIC_TITLE = "Hermes Voice"

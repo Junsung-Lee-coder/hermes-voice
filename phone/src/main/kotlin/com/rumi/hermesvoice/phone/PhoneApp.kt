@@ -21,6 +21,8 @@ import com.rumi.hermesvoice.core.background.LaterReplyConsent
 import com.rumi.hermesvoice.core.background.NotificationCapability
 import com.rumi.hermesvoice.core.background.HoldReason
 import com.rumi.hermesvoice.core.background.WakeHolds
+import com.rumi.hermesvoice.core.headset.HeadsetMicRoute
+import com.rumi.hermesvoice.core.headset.HeadsetPolicy
 import com.rumi.hermesvoice.core.settings.AppSettings
 import com.rumi.hermesvoice.core.voice.AssembledRoute
 import com.rumi.hermesvoice.core.voice.AudioOwnership
@@ -93,6 +95,35 @@ class PhoneApp : Application() {
     val laterConsent: LaterReplyConsent by lazy { LaterReplyConsent(localStore) }
 
     /**
+     * "Use headset" (Phone-only, off by default): the live audio endpoints, the one policy over them and the preference, and the
+     * choice of microphone for each new recording. Nothing here polls or runs as a service; endpoint changes are watched only
+     * around one playback or one recording.
+     */
+    val headsetDevices: AndroidHeadsetDevices by lazy { AndroidHeadsetDevices(this) }
+    val headset: HeadsetPolicy by lazy { HeadsetPolicy({ settings.useHeadset }, headsetDevices) }
+    val headsetMic: HeadsetMicRoute by lazy { HeadsetMicRoute(headset, AndroidCommsLink(this)) }
+    val recordFactory: RecordFactory by lazy { AndroidRecords.factory(this) }
+
+    /**
+     * Headset play/pause as a Phone recording control, and the private recording tones: both exist only while "Use headset" is on
+     * and a personal headset output is connected, and neither touches the Watch.
+     */
+    val mediaSessions: MediaSessionFactory by lazy { AndroidMediaSessions(this) }
+    val cueOutput: CueOutput by lazy { AndroidCueOutput(this) }
+    val recordingCues: RecordingCues by lazy { RecordingCues(headset, cueOutput) }
+    val headsetMedia: HeadsetMediaControl by lazy { HeadsetMediaControl(headset, mediaSessions, { activityVisible }) }
+
+    /**
+     * Tells the core and the Watch when the headset is the private output (the setting on and a personal headset output connected),
+     * so no reply is spoken on the Watch's or the Phone's speaker then. Started with the core; the device watch exists only while the setting is on.
+     */
+    val privateAudio: PrivateAudioHub by lazy {
+        PrivateAudioHub(settings, headset, appScope,
+            publish = { snapshot -> WatchSettingsSync.publish(this, snapshot) },
+            onCore = { active -> wiring?.core?.orchestrator?.onPrivateOutputChanged(active) })
+    }
+
+    /**
      * This process's microphones and later-reply speaker: every Phone recording claims the
      * microphone here BEFORE opening it, and later replies are admitted here, under one lock.
      */
@@ -115,6 +146,7 @@ class PhoneApp : Application() {
         PhoneRelayService.createChannel(this)
         PhoneWakeService.createChannel(this)
         ReplyAlertNotifier.createChannel(this)
+        privateAudio.refresh()
         _relayStatus.value = relay.status
         if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
             // Exported so `adb shell am broadcast` reaches it; never registered in a release build.
@@ -181,11 +213,13 @@ class PhoneApp : Application() {
         _relayStatus.value = relay.onVisible(microphoneWanted = false, microphonePermission = false)
         // The app's own wake flow resumes next: the background listening gives the microphone back first.
         phoneWake.onAppShown()
+        headsetMedia.refresh()
     }
 
     fun onActivityStopped() {
         activityVisible = false
         phoneWake.onAppHidden()
+        headsetMedia.refresh()
     }
 
     private val phoneWakeLazy = lazy { PhoneBackgroundRuntime(this) }
@@ -365,7 +399,8 @@ class PhoneApp : Application() {
             wakeListening = { device -> device == VoiceOrigin.PHONE && phoneWakeListening() },
             laterEnabled = { laterConsent.enabled }, ownership = audio,
             laterSpeaker = { device, holding -> if (device == VoiceOrigin.PHONE) phoneSpeakerLater(holding) },
-            diag = diagnostics.log, replyAlerts = replyAlerts)
+            diag = diagnostics.log, replyAlerts = replyAlerts,
+            headset = headset, phoneSink = PhoneSpeakerSink(this, headsetDevices))
         val dashboard = core.speech as HermesDashboardClient
         pendingJob?.cancel()
         pendingJob = appScope.launch { core.orchestrator.pending.collect { pendingTurns.value = it } }

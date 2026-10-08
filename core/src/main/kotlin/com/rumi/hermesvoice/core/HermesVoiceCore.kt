@@ -40,13 +40,20 @@ sealed class ChatSendResult {
     data class Failed(val reason: String, val authRequired: Boolean = false) : ChatSendResult()
 }
 
-/** Text chat into an app-owned conversation. Replies are shown, not spoken. */
+/** Text chat into an app-owned conversation. Replies are shown; they are spoken only through a connected headset with "Use headset" on. */
 class ChatService(
     private val sessions: AppSessionRepository,
     private val replyTimeoutMs: Long = 15 * 60_000L,
     /** Told of each final text answer received (never spoken, so always unheard); one send, one identity. */
     private val finalReply: (com.rumi.hermesvoice.core.notify.FinalReply) -> Unit = {},
     private val newSendId: () -> String = { java.util.UUID.randomUUID().toString() },
+    /**
+     * The Phone's "Use headset": speaks a typed answer through the connected headset (see [VoiceTurnOrchestrator.speakTypedFinal]).
+     * True when it took the answer, which it then reports through its callback exactly once; false (or null): the answer is only shown.
+     */
+    private val typedFinal: ((turnId: String, text: String, done: (heard: Boolean, cancelled: Boolean, detail: String) -> Unit) -> Boolean)? = null,
+    /** The headset is the private output now: a text answer's alert is then visual only. */
+    private val privateOutput: () -> Boolean = { false },
 ) {
     suspend fun send(storedSessionId: String, text: String, attachments: List<OutgoingAttachment> = emptyList()): ChatSendResult {
         val turn: SubmittedTurn = try {
@@ -69,11 +76,18 @@ class ChatService(
             turn.collect(replyTimeoutMs) { event -> if (event is RecipientEvent.Complete) reply = event }
             reply?.let { received ->
                 if (received.text.isNotBlank() && (received.status == null || received.status == "complete")) {
-                    runCatching {
-                        finalReply(com.rumi.hermesvoice.core.notify.FinalReply(
-                            com.rumi.hermesvoice.core.notify.ReplyAlert.identityOf("chat-${newSendId()}", "reply"), storedSessionId,
-                            VoiceOrigin.PHONE, heard = false, cancelled = false, source = com.rumi.hermesvoice.core.notify.FinalReplySource.TEXT))
+                    val sendId = "chat-${newSendId()}"
+                    val identity = com.rumi.hermesvoice.core.notify.ReplyAlert.identityOf(sendId, "reply")
+                    val quiet = runCatching { privateOutput() }.getOrDefault(false)
+                    fun report(heard: Boolean, cancelled: Boolean) {
+                        runCatching {
+                            finalReply(com.rumi.hermesvoice.core.notify.FinalReply(identity, storedSessionId,
+                                VoiceOrigin.PHONE, heard = heard, cancelled = cancelled, source = com.rumi.hermesvoice.core.notify.FinalReplySource.TEXT, text = received.text, quiet = quiet))
+                        }
                     }
+                    // Spoken on the headset only when the Phone took it (setting on, headset connected); it then reports what became of the audio.
+                    val spoken = runCatching { typedFinal?.invoke(sendId, received.text) { heard, cancelled, _ -> report(heard, cancelled) } }.getOrNull() == true
+                    if (!spoken) report(heard = false, cancelled = false)
                 }
                 ChatSendResult.Replied(received.text, received.status)
             } ?: ChatSendResult.Accepted(turn.submitStatus)
@@ -82,7 +96,7 @@ class ChatService(
         } catch (error: IOException) {
             ChatSendResult.Failed("sent, but the connection dropped: ${error.javaClass.simpleName}")
         } finally {
-            // Text replies are shown, never followed or spoken.
+            // Text replies are shown and never followed; only "Use headset" speaks one (above).
             turn.release()
         }
     }
@@ -129,11 +143,15 @@ class HermesVoiceCore(
     diag: com.rumi.hermesvoice.core.diag.DiagLog? = null,
     /** The arrival alert for an unspoken final answer (see [com.rumi.hermesvoice.core.notify.ReplyAlerts]); null: none. */
     replyAlerts: com.rumi.hermesvoice.core.notify.ReplyAlerts? = null,
+    /** The Phone's "Use headset" over the live audio endpoints; null: none (no headset behavior at all). */
+    headset: com.rumi.hermesvoice.core.headset.HeadsetPolicy? = null,
+    /** The Phone's own speaker sink, used for typed chat answers read through the headset (they never go to the Watch). */
+    phoneSink: com.rumi.hermesvoice.core.voice.PlaybackSink? = null,
 ) {
     private val finalReply: (com.rumi.hermesvoice.core.notify.FinalReply) -> Unit = { reply -> replyAlerts?.onFinalReply(reply) }
     val sessions = AppSessionRepository(sessionsApi, conversations, registry, routerRuntime = routerRuntime,
         diagnostic = { line -> voiceListener.onDiagnostic("", "router", line) })
-    val chat = ChatService(sessions, finalReply = finalReply)
+    val chat: ChatService
     /** Arbitrates the wake phrase when both devices listen: one spoken wake episode, one admitted device. */
     val wakeAdmission = WakeAdmission(clock, settings::watchSettings,
         epochs = object : WakeEpochStore {
@@ -150,7 +168,12 @@ class HermesVoiceCore(
         laterScope = laterScope, laterWindowMs = laterWindowMs ?: VoiceTurnOrchestrator.LATER_WINDOW_MS,
         laterWindowProvider = if (laterWindowMs != null) null else ({ settings.laterReplyWindowMillis }), laterWork = laterWork,
         laterEnabled = laterEnabled, wakeListening = wakeListening, laterDeferMaxMs = laterDeferMaxMs,
-        ownership = ownership, laterSpeaker = laterSpeaker, finalReply = finalReply)
+        ownership = ownership, laterSpeaker = laterSpeaker, finalReply = finalReply, headset = headset, privateSink = phoneSink)
+    init {
+        chat = ChatService(sessions, finalReply = finalReply,
+            typedFinal = if (phoneSink == null) null else { turnId, text, done -> orchestrator.speakTypedFinal(turnId, phoneSink, text, done) },
+            privateOutput = { headset?.output() != null })
+    }
     val watchAcks = WatchAckRegistry()
     /** A Watch turn's routing is the Phone's switch when its upload arrives; routing off uses the Watch's selection. */
     val watchIntake = WatchTurnIntake(orchestrator, watchAcks,
@@ -189,11 +212,13 @@ class HermesVoiceCore(
             runtimeSetupLimits: RuntimeSetupLimits = RuntimeSetupLimits(),
             diag: com.rumi.hermesvoice.core.diag.DiagLog? = null,
             replyAlerts: com.rumi.hermesvoice.core.notify.ReplyAlerts? = null,
+            headset: com.rumi.hermesvoice.core.headset.HeadsetPolicy? = null,
+            phoneSink: com.rumi.hermesvoice.core.voice.PlaybackSink? = null,
         ): Pair<HermesVoiceCore, HermesGatewayConnector> {
             val dashboard = HermesDashboardClient(endpoint, http, tokens, settings.profile.ifBlank { null })
             val connector = HermesGatewayConnector(dashboard, http)
             val core = HermesVoiceCore(dashboard, dashboard, GatewayConversationPort(settings.profile.ifBlank { null }, runtimeSetupLimits) { connector.connection() }, registry, settings,
-                voiceListener, clock, laterScope, laterWindowMs, laterWork, wakeListening, laterDeferMaxMs, laterEnabled, ownership, laterSpeaker, diag = diag, replyAlerts = replyAlerts)
+                voiceListener, clock, laterScope, laterWindowMs, laterWork, wakeListening, laterDeferMaxMs, laterEnabled, ownership, laterSpeaker, diag = diag, replyAlerts = replyAlerts, headset = headset, phoneSink = phoneSink)
             return core to connector
         }
     }

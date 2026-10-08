@@ -13,6 +13,8 @@ import kotlinx.coroutines.channels.ClosedReceiveChannelException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
@@ -223,6 +225,9 @@ class GatewayConversationPort(
     /** Turns submitted here whose subscription is still open, per runtime session id. */
     private val open = ConcurrentHashMap<String, MutableSet<GatewaySubmittedTurn>>()
 
+    /** Orders this app's `prompt.submit` calls per runtime session, so the position of a queued turn is counted in submit order. Held for the RPC only, never for a reply. */
+    private val submitOrder = ConcurrentHashMap<String, Mutex>()
+
     /** Every RPC is stamped with the same `profile` the REST calls use, so both hit one session store. */
     private fun params(): JSONObject = JSONObject().apply { if (!profile.isNullOrBlank()) put("profile", profile) }
 
@@ -406,18 +411,25 @@ class GatewayConversationPort(
         open[runtimeId]?.toList()?.forEach { it.supersede() }
         val subscription = connection.subscribe(runtimeId)
         try {
-            val result = connection.call("prompt.submit",
-                params().put("session_id", runtimeId).put("text", prompt).put("queued", true))
-            val status = result.optString("status")
-            val turnsToSkip = when {
-                status == "streaming" -> 0
-                status == "queued" && !alreadyQueued -> 1
-                else -> -1
+            // No `queued` flag: the gateway's own busy-input policy (display.busy_input_mode) decides whether a
+            // submit to a running session steers, redirects or queues. The app only reports what it was told.
+            return submitOrder.getOrPut(runtimeId) { Mutex() }.withLock {
+                val waitingOfOurs = open[runtimeId]?.count { it.waitingToStart } ?: 0
+                val result = connection.call("prompt.submit", params().put("session_id", runtimeId).put("text", prompt))
+                val status = result.optString("status")
+                val turnsToSkip = when {
+                    status == "streaming" -> 0
+                    // Queued behind the turn in flight and any of this app's own queued turns. The resume snapshot shows
+                    // only the head of the gateway's queue: a queue we did not put there, or none where ours should be, is unattributable.
+                    status == "queued" && (alreadyQueued == (waitingOfOurs > 0)) -> 1 + waitingOfOurs
+                    // "steered" / "redirected" (merged into the running turn, whose reply answers it) or an unknown status.
+                    else -> -1
+                }
+                if (turnsToSkip < 0) subscription.close()
+                val turn = GatewaySubmittedTurn(subscription, status, turnsToSkip, status == "queued" && turnsToSkip >= 0) { done -> open[runtimeId]?.remove(done) }
+                if (turnsToSkip >= 0) open.getOrPut(runtimeId) { ConcurrentHashMap.newKeySet() }.add(turn)
+                turn
             }
-            if (turnsToSkip < 0) subscription.close()
-            val turn = GatewaySubmittedTurn(subscription, status, turnsToSkip) { done -> open[runtimeId]?.remove(done) }
-            if (turnsToSkip >= 0) open.getOrPut(runtimeId) { ConcurrentHashMap.newKeySet() }.add(turn)
-            return turn
         } catch (error: Throwable) {
             subscription.close()
             throw error
@@ -520,12 +532,19 @@ private class GatewaySubmittedTurn(
     private val subscription: GatewaySubscription,
     override val submitStatus: String,
     private var turnsToSkip: Int,
+    private val queuedAtSubmit: Boolean,
     private val onReleased: (GatewaySubmittedTurn) -> Unit,
 ) : SubmittedTurn {
     override val attributable: Boolean = turnsToSkip >= 0
 
     /** This turn's own reply has completed; the subscription stays open only for [collectLater]. */
     @Volatile private var ownDone = false
+
+    /** This turn's own `message.start` was seen. */
+    @Volatile private var started = false
+
+    /** Submitted while the session was busy and not started yet: a turn submitted after it has to wait for it as well. */
+    val waitingToStart: Boolean get() = queuedAtSubmit && !started && !ownDone
 
     /** A newer submit to the same session: later turns there are no longer this turn's. */
     @Volatile private var superseded = false
@@ -575,6 +594,7 @@ private class GatewaySubmittedTurn(
                 when (event.type) {
                     "message.start" -> if (turnsToSkip == 0 && !owned) {
                         owned = true
+                        started = true
                         ownedAfterMs = elapsed()
                     }
                     "message.complete" -> if (!owned) {

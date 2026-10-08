@@ -104,6 +104,10 @@ class PhoneWatchListenerService : WearableListenerService() {
                 }.getOrNull() == true
                 Log.i(TAG, "watch stop request from=${event.sourceNodeId.take(8)} stopped=$stopped")
             }
+            WatchLinkPaths.PRIVATE_AUDIO -> {
+                val confirmed = runCatching { PhoneApp.from(this).privateAudio.onReceipt(event.data) }.getOrDefault(false)
+                Log.i(TAG, "watch private-audio receipt from=${event.sourceNodeId.take(8)} confirmed=$confirmed")
+            }
             WatchLinkPaths.DIAG_RESPONSE -> PhoneApp.from(this).diagnostics.onWatchResponse(event.sourceNodeId, event.data)
             WatchLinkPaths.READER_REQUEST -> answerReader(event.sourceNodeId, event.data)
             WatchLinkPaths.WAKE_CLAIM -> answerWakeClaim(event.sourceNodeId, event.data)
