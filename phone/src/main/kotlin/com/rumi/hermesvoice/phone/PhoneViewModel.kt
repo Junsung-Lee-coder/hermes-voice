@@ -1,21 +1,38 @@
 package com.rumi.hermesvoice.phone
 
+import android.Manifest
 import android.app.Application
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.provider.OpenableColumns
 import android.util.Log
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.rumi.hermesvoice.core.ChatSendResult
 import com.rumi.hermesvoice.core.HermesAuthRequiredException
 import com.rumi.hermesvoice.core.VoiceOrigin
+import com.rumi.hermesvoice.core.attachments.AttachmentRef
+import com.rumi.hermesvoice.core.attachments.FilePreview
+import com.rumi.hermesvoice.core.attachments.PreviewKind
 import com.rumi.hermesvoice.core.audio.CaptureEnd
+import com.rumi.hermesvoice.core.chat.ComposerDispatch
+import com.rumi.hermesvoice.core.chat.ComposerDraft
+import com.rumi.hermesvoice.core.chat.DispatchedSend
+import com.rumi.hermesvoice.core.chat.FailedSend
+import com.rumi.hermesvoice.core.chat.SendAdmission
+import kotlinx.coroutines.CancellationException
 import com.rumi.hermesvoice.core.audio.PcmCaptureLoop
 import com.rumi.hermesvoice.core.audio.SilenceEndpoint
 import com.rumi.hermesvoice.core.background.BackgroundNotice
 import com.rumi.hermesvoice.core.background.BackgroundStatus
+import com.rumi.hermesvoice.core.headset.HeadsetMediaText
+import com.rumi.hermesvoice.core.headset.HeadsetText
+import com.rumi.hermesvoice.core.headset.MicPlan
+import com.rumi.hermesvoice.core.headset.MicReport
+import com.rumi.hermesvoice.core.headset.RecordingCommand
 import com.rumi.hermesvoice.core.net.AttachmentPolicy
 import com.rumi.hermesvoice.core.net.HistoryMessage
 import com.rumi.hermesvoice.core.net.HistoryPages
@@ -38,7 +55,11 @@ import com.rumi.hermesvoice.core.watchlink.VoiceOutcomeText
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -58,7 +79,12 @@ data class PhoneUiState(
     val rawLoaded: Int = 0,
     val draft: String = "",
     val attachments: List<OutgoingAttachment> = emptyList(),
-    val sending: Boolean = false,
+    /** Text requests dispatched and not yet answered or failed; never blocks the composer. */
+    val sendsInFlight: Int = 0,
+    /** Dispatched requests that did not reach Hermes, with their content, for retry; never restored over the draft. */
+    val failedSends: List<FailedSend> = emptyList(),
+    /** The attachment being viewed (loading, shown or failed); null when no viewer is open. */
+    val viewer: AttachmentViewerState? = null,
     val recording: Boolean = false,
     val voiceStatus: String = "",
     val playFirst: Boolean = false,
@@ -87,6 +113,12 @@ data class PhoneUiState(
     val chatOpenRequest: Long = 0,
     /** Speak later replies (Settings; informed opt-in, off by default). */
     val speakLater: Boolean = false,
+    /** Use headset (Settings; Phone-only, off by default): a connected headset takes the Phone's spoken answers and recordings. */
+    val useHeadset: Boolean = false,
+    /** Which microphone the current or last recording really used, when "Use headset" is on and a headset is connected (null: nothing to say). */
+    val micNotice: String? = null,
+    /** What the headset play/pause control really is now (null: nothing to say, e.g. "Use headset" is off). Never claims Android delivers the buttons. */
+    val headsetControl: String? = null,
     /** How long a delivered turn keeps being followed for later replies (Settings; Phone-owned minutes, 1–4320, default 30). */
     val laterReplyWindowMinutes: Int = com.rumi.hermesvoice.core.settings.LaterReplyWindow.DEFAULT_MINUTES,
     /** Why the last typed later-reply duration was refused (null when it was accepted or nothing was typed). */
@@ -97,9 +129,9 @@ data class PhoneUiState(
 
 enum class HandsFree { IDLE, LISTENING, GET_READY, SPEAK_NOW }
 
-class PhoneViewModel(application: Application) : AndroidViewModel(application) {
+class PhoneViewModel(application: Application) : AndroidViewModel(application), HeadsetRecordingTarget {
     private val app = PhoneApp.from(application)
-    private val recorder = WavRecorder()
+    private val recorder = WavRecorder(records = app.recordFactory)
     private val main = Handler(Looper.getMainLooper())
 
     /** The hands-free recorder of the active wake capture; its lifecycle lives in [captures]. */
@@ -115,6 +147,20 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
     /** Push-to-talk claimed the microphone and waits for a later reply it stopped to stop (a moment). */
     private var pushToTalkOpening = false
 
+    /** The private tone of the current push-to-talk (its start tone while one plays, its stop tone after), and whether this capture is gated on its start tone. */
+    private var cueHandle: AutoCloseable? = null
+    private var cueGeneration = 0
+    private var captureCued = false
+    /** The headset asked for the start that is opening / open now; only such a recording is discarded when its headset control is lost. */
+    private var headsetStart = false
+    private var captureByHeadset = false
+
+    /** The headset link a push-to-talk / hands-free capture is still bringing up, and the loss watch of a running one. */
+    private var pushToTalkPrepare: AutoCloseable? = null
+    private var pushToTalkLoss: AutoCloseable? = null
+    private var handsFreePrepare: AutoCloseable? = null
+    private var handsFreeLoss: AutoCloseable? = null
+
     /** Told when a hands-free capture ended: true if it was handed on as a request (with its claim). */
     var onHandsFreeEnded: ((sent: Boolean) -> Unit)? = null
 
@@ -123,6 +169,10 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         override fun stopRecorder(captureId: String, reason: CaptureStop): ByteArray? {
             val active = handsFreeRecorder?.takeIf { it.captureId == captureId }
             handsFreeRecorder = null
+            runCatching { handsFreePrepare?.close() }
+            handsFreePrepare = null
+            runCatching { handsFreeLoss?.close() }
+            handsFreeLoss = null
             val wav = active?.stop()
             active?.stats()?.let { stats ->
                 // Aggregates only (no audio): the configured trailing silence and what the VAD measured.
@@ -174,22 +224,41 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
     /** Unsent text and attachments of conversations switched away from, so changing conversations never loses them. */
     private val drafts = HashMap<String, Pair<String, List<OutgoingAttachment>>>()
 
+    private val sendIds = AtomicLong(0)
+
     init {
+        ViewedFiles.clear(app)
         viewModelScope.launch { app.playbackDevice.collect { device -> _state.update { it.copy(playbackDevice = device) } } }
         // "Open the routed conversation": only requests made while this screen exists (never a replayed old one).
         viewModelScope.launch { app.routedOpen.collect { storedSessionId -> openRouted(storedSessionId) } }
+        // A tapped arrival alert: open exactly that conversation once this screen is signed in (kept until then; not the routed preference).
+        viewModelScope.launch {
+            combine(app.pendingOpen, _state.map { it.signedIn }.distinctUntilChanged()) { id, signedIn -> id.takeIf { signedIn } }
+                .collect { id -> if (id != null) openFromReplyAlert(id) }
+        }
         // A voice turn (from the Phone or the Watch) created a conversation: show it.
         viewModelScope.launch { app.conversationsCreated.collect { count -> if (count > 0 && _state.value.signedIn) refresh() } }
         viewModelScope.launch { app.relayStatus.collect { relay -> _state.update { it.copy(relay = relay) } } }
         viewModelScope.launch { app.phoneWake.status.collect { wake -> _state.update { it.copy(phoneWake = wake, watch = app.settings.watchSettings()) } } }
         // A request heard with the app closed: its result shows here when the app is opened.
         viewModelScope.launch { app.phoneWake.notice.collect { line -> if (line != null) _state.update { it.copy(voiceStatus = line) } } }
+        viewModelScope.launch { app.phoneWake.micNotice.collect { line -> if (line != null) _state.update { it.copy(micNotice = line) } } }
         // A later reply of a delivered request (a background completion) was spoken, or couldn't be.
         viewModelScope.launch { app.laterReplies.collect { line -> if (line != null) _state.update { it.copy(voiceStatus = line) } } }
         // Phone voice turns run in the application, so one started before this screen was (re)created still counts as busy.
         viewModelScope.launch { app.phoneTurns.collect { running -> _state.update { it.copy(voiceBusy = running > 0) } } }
         viewModelScope.launch { app.pendingTurns.collect { list -> _state.update { it.copy(pending = list) } } }
+        viewModelScope.launch { app.headsetMedia.status.collect { status -> _state.update { it.copy(headsetControl = headsetControlLine(status)) } } }
         refreshWatchStatus()
+        app.headsetMedia.attach(this)
+    }
+
+    private fun headsetControlLine(status: MediaControlStatus): String? = when (status) {
+        MediaControlStatus.OFF -> null
+        MediaControlStatus.NO_HEADSET -> HeadsetMediaText.WAITING_FOR_HEADSET
+        MediaControlStatus.APP_CLOSED -> HeadsetMediaText.APP_CLOSED
+        MediaControlStatus.UNAVAILABLE -> HeadsetMediaText.UNAVAILABLE
+        MediaControlStatus.REGISTERED -> HeadsetMediaText.REGISTERED
     }
 
     private fun initialState() = PhoneUiState(
@@ -203,6 +272,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         routingEnabled = app.settings.routingEnabled,
         autoNavigate = app.settings.autoNavigateToRouted,
         speakLater = app.laterConsent.enabled,
+        useHeadset = app.settings.useHeadset,
         laterReplyWindowMinutes = app.settings.laterReplyWindowMinutes,
     )
 
@@ -366,6 +436,16 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(chatOpenRequest = it.chatOpenRequest + 1) }
     }
 
+    /** A tapped arrival alert's conversation: opened if it is one of this app's own (anything else is dropped), then forgotten. */
+    private fun openFromReplyAlert(storedSessionId: String) {
+        val wiring = wiringOrStatus() ?: return
+        app.consumePendingOpen(storedSessionId)
+        val owned = wiring.core.sessions.activeConversation(storedSessionId) ?: return
+        Log.i(TAG, "reply alert conversation opened alias=${owned.alias}")
+        if (_state.value.selected?.storedSessionId != storedSessionId) open(owned) else reloadSelected()
+        _state.update { it.copy(chatOpenRequest = it.chatOpenRequest + 1) }
+    }
+
     // ── text chat & attachments ──────────────────────────────────────────────────────────────
 
     fun setDraft(text: String) = _state.update { it.copy(draft = text) }
@@ -394,32 +474,148 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
 
     fun removeAttachment(index: Int) = _state.update { it.copy(attachments = it.attachments.filterIndexed { i, _ -> i != index }) }
 
+    /**
+     * Sends what the composer holds. The text, attachments and conversation are captured and the composer is cleared in
+     * ONE atomic step before any backend work; later callbacks only touch the status and [PhoneUiState.failedSends],
+     * never the draft, so text typed after the tap (or another conversation's draft) is never erased or overwritten.
+     * Nothing waits for an earlier request: Hermes decides what to do with a message sent while it is working.
+     */
     fun send() {
-        val current = _state.value
-        val selected = current.selected ?: return
-        if (current.sending || (current.draft.isBlank() && current.attachments.isEmpty())) return
-        launchGuarded { wiring ->
-            _state.update { it.copy(sending = true, status = "Sending…") }
-            try {
-                val result = wiring.core.chat.send(selected.storedSessionId, current.draft, current.attachments)
-                val status = when (result) {
-                    is ChatSendResult.Replied -> ""
-                    is ChatSendResult.Accepted -> "Queued in Hermes; the reply will appear after refresh"
-                    is ChatSendResult.Failed -> result.reason.also { if (result.authRequired) _state.update { s -> s.copy(signedIn = false) } }
+        val wiring = wiringOrStatus() ?: return
+        while (true) {
+            val current = _state.value
+            if (!current.signedIn) {
+                _state.update { it.copy(status = "Sign in to Hermes first") }
+                return
+            }
+            val admission = ComposerDispatch.admit(current.selected?.storedSessionId, ComposerDraft(current.draft, current.attachments), sendIds.incrementAndGet())
+            when (admission) {
+                is SendAdmission.Refused -> {
+                    admission.reason?.let { reason -> _state.update { it.copy(status = reason) } }
+                    return
                 }
-                val delivered = result !is ChatSendResult.Failed || result.reason.startsWith("sent,")
-                _state.update {
-                    // Only the conversation the message went to loses its draft (the user may have switched meanwhile).
-                    if (it.selected?.storedSessionId != selected.storedSessionId) it.copy(status = status)
-                    else it.copy(status = status, draft = if (delivered) "" else it.draft,
-                        attachments = if (delivered) emptyList() else it.attachments)
+                is SendAdmission.Admitted -> {
+                    val cleared = current.copy(draft = admission.remaining.text, attachments = admission.remaining.attachments,
+                        sendsInFlight = current.sendsInFlight + 1, status = "Sending…")
+                    if (_state.compareAndSet(current, cleared)) {
+                        dispatch(wiring, admission.send)
+                        return
+                    }
                 }
-                if (delivered) reloadSelected()
-            } finally {
-                _state.update { it.copy(sending = false) }
             }
         }
     }
+
+    /** Sends a failed request again from the content kept for it; the composer is not involved. */
+    fun retryFailedSend(id: Long) {
+        val wiring = wiringOrStatus() ?: return
+        val failed = _state.value.failedSends.firstOrNull { it.send.id == id } ?: return
+        _state.update { it.copy(failedSends = it.failedSends.filterNot { f -> f.send.id == id }, sendsInFlight = it.sendsInFlight + 1, status = "Sending…") }
+        dispatch(wiring, failed.send)
+    }
+
+    fun dismissFailedSend(id: Long) = _state.update { it.copy(failedSends = it.failedSends.filterNot { f -> f.send.id == id }) }
+
+    private fun dispatch(wiring: PhoneApp.Wiring, send: DispatchedSend) {
+        viewModelScope.launch {
+            val result = try {
+                wiring.core.chat.send(send.sessionId, send.text, send.attachments)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                Log.w(TAG, "send failed", error)
+                ChatSendResult.Failed(error.message ?: error.javaClass.simpleName)
+            }
+            val failed = ComposerDispatch.failure(send, result)
+            val status = ComposerDispatch.status(result)
+            _state.update {
+                val inFlight = maxOf(0, it.sendsInFlight - 1)
+                it.copy(
+                    sendsInFlight = inFlight,
+                    status = if (status.isEmpty() && inFlight > 0) it.status else status,
+                    signedIn = if (result is ChatSendResult.Failed && result.authRequired) false else it.signedIn,
+                    failedSends = if (failed != null) ComposerDispatch.withFailed(it.failedSends, failed) else it.failedSends,
+                )
+            }
+            if (failed == null && _state.value.selected?.storedSessionId == send.sessionId) reloadSelected()
+        }
+    }
+
+    // ── viewing attachments ──────────────────────────────────────────────────────────────────
+
+    private var viewerJob: Job? = null
+    private val viewerSerial = AtomicLong(0)
+
+    /** Shows an attachment the user has not sent yet, from the bytes already in the composer. */
+    fun previewAttachment(index: Int) {
+        val item = _state.value.attachments.getOrNull(index) ?: return
+        showViewer(item.name) { materialize(item.name, item.mimeType, item.bytes) }
+    }
+
+    /** Fetches the stored file a message names (through the signed-in dashboard client only) and shows it; stale results are dropped. */
+    fun openAttachment(ref: AttachmentRef) {
+        val wiring = wiringOrStatus() ?: return
+        showViewer(ref.name) {
+            val stored = wiring.dashboard.fetchStoredFile(ref)
+            materialize(ref.name.ifBlank { stored.name }, stored.mimeType, stored.bytes)
+        }
+    }
+
+    private fun showViewer(title: String, load: suspend () -> ViewedAttachment) {
+        val serial = viewerSerial.incrementAndGet()
+        viewerJob?.cancel()
+        ViewedFiles.clear(app)
+        _state.update { it.copy(viewer = AttachmentViewerState(title, ViewerPhase.LOADING)) }
+        viewerJob = viewModelScope.launch {
+            val next = try {
+                AttachmentViewerState(title, ViewerPhase.READY, load())
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: HermesAuthRequiredException) {
+                _state.update { it.copy(signedIn = false) }
+                AttachmentViewerState(title, ViewerPhase.FAILED, error = "Sign in to Hermes again to view this file")
+            } catch (error: Exception) {
+                Log.w(TAG, "attachment not shown: ${error.javaClass.simpleName}")
+                AttachmentViewerState(title, ViewerPhase.FAILED, error = viewerFailure(error))
+            }
+            if (viewerSerial.get() == serial) _state.update { it.copy(viewer = next) } else ViewedFiles.clear(app)
+        }
+    }
+
+    private fun viewerFailure(error: Exception): String = when {
+        error is com.rumi.hermesvoice.core.HermesHttpException && error.status == 404 -> "Hermes no longer has this file"
+        error is com.rumi.hermesvoice.core.HermesHttpException && (error.status == 401 || error.status == 403) -> "Hermes did not allow this file to be shown"
+        error is com.rumi.hermesvoice.core.HermesProtocolException -> error.message ?: "This file can't be shown"
+        else -> "Could not load this file. Check the connection and try again"
+    }
+
+    private suspend fun materialize(name: String, declaredMime: String, bytes: ByteArray): ViewedAttachment = withContext(Dispatchers.IO) {
+        val decision = FilePreview.classify(name, declaredMime, bytes)
+        val text = if (decision.kind == PreviewKind.TEXT) FilePreview.textPreview(bytes) else null
+        val kind = if (decision.kind == PreviewKind.TEXT && text == null) PreviewKind.OTHER else decision.kind
+        ViewedAttachment(name, decision.mimeType, kind, bytes.size, text, ViewedFiles.write(app, name, bytes), bytes)
+    }
+
+    fun closeViewer() {
+        viewerSerial.incrementAndGet()
+        viewerJob?.cancel()
+        viewerJob = null
+        ViewedFiles.clear(app)
+        _state.update { it.copy(viewer = null) }
+    }
+
+    /** Copies the viewed file to a place the user picked (the system "Save as" result) and reports whether that worked. */
+    fun saveViewed(target: Uri, done: (Boolean) -> Unit) {
+        val viewed = _state.value.viewer?.file ?: return done(false)
+        viewModelScope.launch {
+            val saved = withContext(Dispatchers.IO) {
+                runCatching { getApplication<Application>().contentResolver.openOutputStream(target)!!.use { it.write(viewed.bytes) } }.isSuccess
+            }
+            done(saved)
+        }
+    }
+
+    fun reportStatus(text: String) = _state.update { it.copy(status = text) }
 
     // ── phone push-to-talk ───────────────────────────────────────────────────────────────────
 
@@ -428,40 +624,180 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         if (captures.tap()) return
         if (pushToTalkOpening) return
         if (!recorder.isRecording) {
+            // A tone still playing from the last recording never overlaps the next one.
+            cancelCue()
             // Claimed BEFORE the microphone opens: no later reply starts on this Phone any more, and one
             // playing now is stopped; the recorder opens only once it has really stopped.
             val microphone = app.audio.claimMicrophone(VoiceOrigin.PHONE)
             pushToTalkOpening = true
+            _state.update { it.copy(micNotice = null) }
             microphone.whenSpeakerStopped(viewModelScope) { stopped ->
-                pushToTalkOpening = false
                 if (!stopped) {
+                    pushToTalkOpening = false
+                    headsetStart = false
                     _state.update { it.copy(voiceStatus = "Microphone busy. Tap Talk again") }
                     return@whenSpeakerStopped
                 }
-                runCatching { recorder.start() }
-                    .onSuccess {
-                        pushToTalkMicrophone = microphone
-                        _state.update { it.copy(recording = true, voiceStatus = "Listening… tap to send") }
-                    }
-                    .onFailure { error ->
-                        microphone.release()
-                        _state.update { it.copy(voiceStatus = error.message ?: "Microphone unavailable") }
-                    }
+                // The microphone is chosen now, for this recording only (a Bluetooth headset microphone may take a moment to connect).
+                var settled = false
+                val preparing = app.headsetMic.prepare { plan ->
+                    settled = true
+                    pushToTalkPrepare = null
+                    pushToTalkOpening = false
+                    openPushToTalk(microphone, plan)
+                }
+                if (!settled) pushToTalkPrepare = preparing
             }
             return
         }
+        finishPushToTalk(inputLost = false)
+    }
+
+    /**
+     * The headset's play/pause (amendment K) goes through the same push-to-talk controller as the Talk button: it can only start or
+     * stop THIS Phone's recording, never a Watch one. Pending requests do not matter; the microphone and speaker rules are the
+     * ordinary ones (a reply this app is speaking is stopped first, a refused microphone stays refused). A hidden app (screen off,
+     * another app in front) accepts a command only for a Phone recording that is ALREADY open, so the headset can still finish it;
+     * it never opens a new one, and a Watch capture or an accepted request is not touched.
+     */
+    override fun onHeadsetCommand(command: RecordingCommand): HeadsetOutcome {
+        if (!app.headset.enabled || app.headset.output() == null) return HeadsetOutcome.REFUSED
+        if (!app.activityVisible && !recorder.isRecording) return HeadsetOutcome.REFUSED
+        val recording = recorder.isRecording || captures.activeId != null
+        if (pushToTalkOpening) return HeadsetOutcome.IGNORED
+        if (recording) {
+            if (command == RecordingCommand.START) return HeadsetOutcome.IGNORED
+            toggleRecording()
+            return HeadsetOutcome.STOPPED
+        }
+        if (command == RecordingCommand.STOP) return HeadsetOutcome.IGNORED
+        if (ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            _state.update { it.copy(micNotice = HeadsetMediaText.PERMISSION, voiceStatus = HeadsetMediaText.PERMISSION) }
+            return HeadsetOutcome.REFUSED
+        }
+        headsetStart = true
+        toggleRecording()
+        // Still opening: the flag is read (and cleared) when the recorder opens; anything else means nothing was started.
+        if (!pushToTalkOpening) headsetStart = false
+        return if (pushToTalkOpening || recorder.isRecording) HeadsetOutcome.STARTED else HeadsetOutcome.IGNORED
+    }
+
+    /**
+     * The headset can no longer finish a recording it started while the app is hidden (setting off / output gone): nothing else
+     * could stop it, so it ends here and its audio is thrown away. Anything not started by the headset, or a visible app, is untouched.
+     */
+    override fun onHeadsetControlLost() {
+        if (Looper.myLooper() == Looper.getMainLooper()) discardOrphanCapture() else main.post { discardOrphanCapture() }
+    }
+
+    private fun discardOrphanCapture() {
+        if (!captureByHeadset || !recorder.isRecording || app.activityVisible) return
+        cancelCue()
+        runCatching { pushToTalkLoss?.close() }
+        pushToTalkLoss = null
+        captureCued = false
+        captureByHeadset = false
+        runCatching { recorder.stop() }
+        app.headsetMedia.recording(false)
+        pushToTalkMicrophone?.release()
+        pushToTalkMicrophone = null
+        _state.update { it.copy(recording = false, micNotice = HeadsetText.LOST) }
+    }
+
+    private fun cancelCue() {
+        cueGeneration++
+        val handle = cueHandle
+        cueHandle = null
+        runCatching { handle?.close() }
+    }
+
+    private fun openPushToTalk(microphone: MicrophoneClaim, plan: MicPlan) {
+        val viaHeadset = headsetStart
+        headsetStart = false
+        // The app was hidden while the start was still opening: no new recording is opened (and no headset session is held) for it.
+        if (!app.activityVisible) {
+            plan.release()
+            microphone.release()
+            return
+        }
+        // With a private headset output the recording is announced with one tone to the headset; the microphone opens first and
+        // keeps nothing until that tone has ended, so the tone is never part of what is sent.
+        val cued = app.recordingCues.available()
+        runCatching { recorder.start(plan, admitted = !cued) { report -> main.post { onMicSource(report) } } }
+            .onSuccess {
+                pushToTalkMicrophone = microphone
+                captureCued = cued
+                captureByHeadset = viaHeadset
+                _state.update { it.copy(recording = true, voiceStatus = if (cued) "Getting ready…" else "Listening… tap to send") }
+                if (plan.preferred != null) {
+                    pushToTalkLoss = app.headsetMic.watchLoss(plan) { main.post { finishPushToTalk(inputLost = true) } }
+                }
+                app.headsetMedia.recording(true)
+                if (cued) playStartCue()
+            }
+            .onFailure { error ->
+                microphone.release()
+                _state.update { it.copy(voiceStatus = error.message ?: "Microphone unavailable") }
+            }
+    }
+
+    private fun playStartCue() {
+        val generation = ++cueGeneration
+        val handle = app.recordingCues.play(CueKind.START) { result -> main.post { onStartCueEnded(generation, result) } }
+        if (handle == null) {
+            onStartCueEnded(generation, CueResult.NO_HEADSET)
+            return
+        }
+        if (generation == cueGeneration) cueHandle = handle else runCatching { handle.close() }
+    }
+
+    private fun onStartCueEnded(generation: Int, result: CueResult) {
+        if (generation != cueGeneration || !recorder.isRecording) return
+        cueHandle = null
+        // The headset went away during the tone: the recording ends as an input loss. Turning the setting off keeps it going.
+        if (result == CueResult.LOST && app.headset.enabled) {
+            finishPushToTalk(inputLost = true)
+            return
+        }
+        recorder.admit()
+        _state.update {
+            it.copy(
+                voiceStatus = "Listening… tap to send",
+                micNotice = if (result == CueResult.PLAYED || result == CueResult.LOST) it.micNotice else HeadsetMediaText.CUE_SKIPPED,
+            )
+        }
+    }
+
+    /** Ends the push-to-talk recording once and sends it: by the user's tap, or because its headset microphone disconnected. */
+    private fun finishPushToTalk(inputLost: Boolean) {
+        if (!recorder.isRecording) return
+        cancelCue()
+        runCatching { pushToTalkLoss?.close() }
+        pushToTalkLoss = null
+        val cued = captureCued
+        captureCued = false
+        captureByHeadset = false
         val wav = recorder.stop()
+        app.headsetMedia.recording(false)
         val microphone = pushToTalkMicrophone
         pushToTalkMicrophone = null
-        _state.update { it.copy(recording = false) }
+        _state.update { it.copy(recording = false, micNotice = if (inputLost) HeadsetText.LOST else it.micNotice) }
         if (wav == null) {
             microphone?.release()
             _state.update { it.copy(voiceStatus = "Too short") }
             return
         }
-        Log.i(TAG, "phone mic captured bytes=${wav.size} peak=${WavRecorder.peak(wav)}")
+        Log.i(TAG, "phone mic captured bytes=${wav.size} peak=${WavRecorder.peak(wav)} inputLost=$inputLost")
+        // Two tones for a recording that really ended by the user's stop and is being sent; the microphone is already closed.
+        if (cued && !inputLost && app.recordingCues.available()) cueHandle = app.recordingCues.play(CueKind.STOP) { }
         // The claim goes with the request: later replies keep waiting until it has been answered.
         submitVoice(wav, microphone = microphone)
+    }
+
+    /** What Android's readback said the recording uses (headset, or the Phone microphone with the reason). */
+    private fun onMicSource(report: MicReport) {
+        val text = report.text ?: return
+        _state.update { if (it.recording || it.handsFree != HandsFree.IDLE) it.copy(micNotice = text) else it }
     }
 
     /**
@@ -576,12 +912,13 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
         // The wake episode's claim (taken when the phrase was heard), or a new one: BEFORE the microphone opens.
         val microphone = held ?: app.audio.claimMicrophone(VoiceOrigin.PHONE)
         handsFreeMicrophone = microphone
+        _state.update { it.copy(micNotice = null) }
         val capture = PhoneCapture(id, SilenceEndpoint(sampleRate = PhoneCapture.SAMPLE_RATE, silenceMs = silenceMs),
             object : PcmCaptureLoop.Listener {
                 override fun onLive() = Unit
                 override fun onCalibrated() { main.post { captures.onCalibrated(id) } }
                 override fun onEnd(reason: CaptureEnd) { main.post { captures.stop(id, CaptureStop.of(reason)) } }
-            })
+            }, app.recordFactory)
         handsFreeRecorder = capture
         Log.i(TAG, "phone hands-free capture turn=${id.take(12)} vad_silence_ms=$silenceMs")
         // Opened only once a later reply it stopped has stopped; null: that happens in a moment (or it ends as START_FAILED).
@@ -591,9 +928,43 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
     private fun openHandsFree(id: String, capture: PhoneCapture, stopped: Boolean): Boolean {
         // Cancelled meanwhile (pause, opt-out, a tap): nothing to open.
         if (captures.activeId != id || handsFreeRecorder !== capture) return false
-        if (!stopped || !capture.start()) {
+        if (!stopped) {
             captures.stop(id, CaptureStop.START_FAILED)
             return false
+        }
+        var settled = false
+        var opened = false
+        val preparing = app.headsetMic.prepare { plan ->
+            settled = true
+            handsFreePrepare = null
+            opened = startHandsFreeCapture(id, capture, plan)
+        }
+        if (!settled) {
+            // A Bluetooth headset microphone is connecting (bounded); a cancel closes it through the capture's stop.
+            handsFreePrepare = preparing
+            return true
+        }
+        return opened
+    }
+
+    private fun startHandsFreeCapture(id: String, capture: PhoneCapture, plan: MicPlan): Boolean {
+        if (captures.activeId != id || handsFreeRecorder !== capture) {
+            plan.release()
+            return false
+        }
+        if (!capture.start(plan) { report -> main.post { onMicSource(report) } }) {
+            captures.stop(id, CaptureStop.START_FAILED)
+            return false
+        }
+        if (plan.preferred != null) {
+            handsFreeLoss = app.headsetMic.watchLoss(plan) {
+                main.post {
+                    if (captures.activeId == id) {
+                        _state.update { it.copy(micNotice = HeadsetText.LOST) }
+                        captures.stop(id, CaptureStop.INPUT_LOST)
+                    }
+                }
+            }
         }
         _state.update { it.copy(handsFree = HandsFree.GET_READY, voiceStatus = "Get ready…") }
         return true
@@ -700,6 +1071,18 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
+     * "Use headset" (off by default; Phone-only). It governs new spoken answers and new recordings; an accepted
+     * recording or a playback already on the headset is never changed by toggling it.
+     */
+    fun setUseHeadset(on: Boolean) {
+        app.settings.useHeadset = on
+        app.privateAudio.refresh()
+        app.headsetMedia.refresh()
+        app.recordingCues.recheck()
+        _state.update { it.copy(useHeadset = on) }
+    }
+
+    /**
      * Commits a typed later-reply duration (on Done or when the field loses focus). A refused entry is not saved and is explained;
      * the stored value is unchanged. Never touches the later-reply opt-in: the duration is not consent.
      */
@@ -784,7 +1167,17 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
+        viewerJob?.cancel()
+        ViewedFiles.clear(app)
+        runCatching { pushToTalkPrepare?.close() }
+        pushToTalkPrepare = null
+        runCatching { pushToTalkLoss?.close() }
+        pushToTalkLoss = null
+        cancelCue()
+        captureByHeadset = false
         recorder.stop()
+        app.headsetMedia.recording(false)
+        app.headsetMedia.detach(this)
         pushToTalkMicrophone?.release()
         pushToTalkMicrophone = null
         app.foregroundWakeListening = false

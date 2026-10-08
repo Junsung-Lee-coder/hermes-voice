@@ -1,5 +1,8 @@
 package com.rumi.hermesvoice.core.voice
 
+import com.rumi.hermesvoice.core.notify.FinalReply
+import com.rumi.hermesvoice.core.notify.FinalReplySource
+import com.rumi.hermesvoice.core.notify.ReplyAlert
 import com.rumi.hermesvoice.core.HermesAuthRequiredException
 import com.rumi.hermesvoice.core.HermesException
 import com.rumi.hermesvoice.core.HermesPlaybackBusyException
@@ -59,6 +62,11 @@ data class PlaybackCue(
     val deferrable: Boolean = false,
     /** Which chunk of a long reply this is (0 for the first or only one; see [TtsBatcher]); [text] is then that chunk's text. */
     val part: Int = 0,
+    /**
+     * The headset output this answer was admitted to (the Phone's "Use headset"): the sink plays on THAT device only, and fails
+     * rather than fall back to the speaker when it is gone. Null: the ordinary route, whatever Android picks.
+     */
+    val headset: com.rumi.hermesvoice.core.headset.AudioEndpoint? = null,
 )
 
 /**
@@ -79,6 +87,12 @@ fun interface PlaybackSink {
     suspend fun playConfirmed(audio: SpokenAudio, cue: PlaybackCue, finished: () -> Unit) {
         play(audio, cue)
     }
+
+    /**
+     * Hands a reply-arrival alert to the device this sink plays on, for that device to show itself. True only when the link took
+     * it. The Phone's own sink (and any sink without a separate device) returns false: the Phone shows its own alerts.
+     */
+    suspend fun deliverReplyAlert(alert: com.rumi.hermesvoice.core.notify.ReplyAlert): Boolean = false
 }
 
 class VoiceTurnRequest(
@@ -119,7 +133,7 @@ class VoiceTurnRequest(
 enum class VoiceTurnStage {
     TRANSCRIBING, ROUTING, CREATING, ACKNOWLEDGING,
 
-    /** Acknowledged, but an earlier request to the same conversation is not answered yet: nothing was sent, and it can be stopped. */
+    /** No longer entered (a request to a busy conversation is sent at once); kept for the Phone/Watch wire format. */
     QUEUED,
     DELIVERING, RESPONDING,
 }
@@ -269,8 +283,9 @@ private fun monotonicMs(): Long = System.nanoTime() / 1_000_000
  * arrival order, by the speaker arbiter below (a reply that is ready while another request is
  * recorded, or another reply plays, waits, and is never played over a recording nor dropped
  * silently); an acknowledgement waits for the reply that is playing and stops only a LATER reply.
- * Requests to the same destination session are queued (one original reply outstanding per
- * session, bounded), because the gateway's events carry no per-prompt id. Only a user's Stop
+ * Requests to the same destination session are NOT held back: each is sent at once and Hermes' own busy-input
+ * policy decides whether it steers, queues or interrupts the running turn (the app never picks one). A finite
+ * per-session count ([SESSION_QUEUE_MAX]) only refuses overload visibly. Only a user's Stop
  * ([stopTurn], or cancelling [run]) ends a pending turn early.
  * Deduplication: a replayed turn id is ignored; duplicate responses are filtered by
  * [RecipientResponseTracker].
@@ -330,8 +345,22 @@ class VoiceTurnOrchestrator(
     private val ackSynthesisMaxMs: Long = ACK_SYNTHESIS_MAX_MS,
     /** Most voice requests pending at once (transmitting, queued, awaiting or speaking); a request beyond it is refused visibly. */
     private val maxPendingTurns: Int = MAX_PENDING_TURNS,
-    /** Most requests per destination session, the one awaiting its reply included; a request beyond it is refused visibly. */
+    /** Most requests pending per destination session, the one awaiting its reply included; a request beyond it is refused visibly (overload guard only, nothing waits). */
     private val maxPerSession: Int = SESSION_QUEUE_MAX,
+    /** Told of each actual final answer received (own or later), with what became of its audio: the arrival alert's only input. */
+    private val finalReply: (com.rumi.hermesvoice.core.notify.FinalReply) -> Unit = {},
+    /**
+     * The Phone's "Use headset" (null: none, the behavior is exactly as without it). With the setting on and a personal headset
+     * connected, a final answer that plays on the Phone is bound to that headset when it is admitted, and later answers and the
+     * typed chat answers are spoken there too, whatever the later-reply option says. See [com.rumi.hermesvoice.core.headset.HeadsetPolicy].
+     */
+    private val headset: com.rumi.hermesvoice.core.headset.HeadsetPolicy? = null,
+    /**
+     * The Phone's speaker sink, which plays to the connected headset. With "Use headset" on and a headset output connected, EVERY
+     * spoken reply (whoever asked, whichever device is the playback target) goes through this sink and nowhere else; null: while
+     * that is the case nothing is spoken (the Watch and the loudspeaker are never used instead).
+     */
+    private val privateSink: PlaybackSink? = null,
 ) {
     private val deliveryLock = Mutex()
     private val floorLock = ownership.lock
@@ -369,12 +398,18 @@ class VoiceTurnOrchestrator(
      * Stops following every delivered turn's later replies, and every later reply that arrived and
      * waits or plays (each reported as not played). A Stop, or the option switched off. Safe to repeat.
      */
+    fun onPrivateOutputChanged(active: Boolean) {
+        // A reply that plays on the Watch when the headset takes over is stopped (the link sends the Watch its STOP) and spoken again
+        // on the headset from the first chunk not confirmed played; queued replies are resolved to the headset when they are admitted.
+        if (active) ownership.withdrawLater(VoiceOrigin.WATCH)
+    }
+
     fun stopFollowing() {
         followers.toList().forEach { it.cancel(LaterStopped()) }
     }
 
     /**
-     * Stops ONE pending turn wherever it is (being transmitted, queued behind an earlier request, waiting for
+     * Stops ONE pending turn wherever it is (being transmitted, waiting for
      * its reply, or speaking it): [run] returns [VoiceTurnOutcome.Stopped], its queue place, pending entry and
      * playback are released and nothing more is sent or played for it. False when no such turn is running.
      */
@@ -483,7 +518,7 @@ class VoiceTurnOrchestrator(
                     else -> error("unexpected preparation result")
                 }
             }
-            val delivered = when (val result = send(request, prepared, held[0]!!, transmission)) {
+            val delivered = when (val result = send(request, prepared)) {
                 is Delivered -> result
                 is VoiceTurnOutcome -> return result
                 else -> error("unexpected delivery result")
@@ -501,7 +536,7 @@ class VoiceTurnOrchestrator(
             val (outcome, nextSequence) = respond(request, delivered)
             sessionGate.release(held[0]!!)
             unreleased = null
-            follow(request, delivered.turn, nextSequence)
+            follow(request, delivered.turn, nextSequence, delivered.route.destination.storedSessionId)
             return outcome
         } finally {
             // Stopped or failed before the reply was followed: the destination subscription is released here, once.
@@ -593,22 +628,13 @@ class VoiceTurnOrchestrator(
     }
 
     /**
-     * After the acknowledgement: waits (cancellably, with a "queued" status) until the earlier request to the same
-     * session has been answered, then submits the ORIGINAL transcript. Not under [deliveryLock]: waiting never blocks others.
+     * After the acknowledgement: submits the ORIGINAL transcript at once, even while an earlier request to the same
+     * session is still being answered. Not under [deliveryLock].
      */
-    private suspend fun send(request: VoiceTurnRequest, prepared: Prepared, ticket: SessionGate.Ticket, transmission: Transmission): Any {
-        var stage = VoiceTurnStage.DELIVERING
+    private suspend fun send(request: VoiceTurnRequest, prepared: Prepared): Any {
+        val stage = VoiceTurnStage.DELIVERING
         val route = prepared.route
         try {
-            if (!ticket.ready.isCompleted) {
-                stage = VoiceTurnStage.QUEUED
-                transmission.end()
-                notifyStage(request, stage)
-                pendingTurns.update(request.turnId, PendingPhase.QUEUED)
-                ticket.ready.await()
-                stage = VoiceTurnStage.DELIVERING
-                pendingTurns.update(request.turnId, PendingPhase.TRANSMITTING)
-            }
             notifyStage(request, stage)
             // After the acknowledgement, which can take a while: the destination must still be deliverable.
             recipientCreator?.requireDeliverable(route.destination.storedSessionId)
@@ -637,15 +663,22 @@ class VoiceTurnOrchestrator(
         var sequence = 1
         notifyStage(request, VoiceTurnStage.RESPONDING)
         val tracker = RecipientResponseTracker(delivered.settings)
+        var finalDecision: ResponseDecision? = null
+        var finalComplete = false
+        val privateSeen = java.util.concurrent.atomic.AtomicBoolean(false)
         try {
             // Waiting for the next event is bounded by the destination's SILENCE only ([responseTimeoutMs]); a reply being
             // synthesized or played is not waiting, and events that arrive meanwhile are kept in order.
             delivered.turn.collect(responseTimeoutMs) { event ->
                 val decision = tracker.onEvent(event) ?: return@collect
+                if (decision.role == SpokenRole.FINAL) {
+                    finalDecision = decision
+                    finalComplete = event is RecipientEvent.Complete && (event.status == null || event.status == "complete")
+                }
                 notifyResponse(request, decision)
                 val text = decision.speakText ?: return@collect
                 try {
-                    speakOwn(request, decision.role, sequence++, text)
+                    speakOwn(request, decision.role, sequence++, text, privateSeen)
                     spoken += decision.role
                 } catch (error: HermesException) {
                     // A lost FIRST/MIDDLE response must not prevent the FINAL from playing.
@@ -660,6 +693,12 @@ class VoiceTurnOrchestrator(
             failure = error.message ?: error.javaClass.simpleName
         } catch (error: IOException) {
             failure = "network: ${error.javaClass.simpleName}"
+        }
+        // A real, non-empty final answer was received (never an interim, empty or errored completion): its audio decides the alert.
+        finalDecision?.takeIf { finalComplete && it.text.isNotEmpty() }?.let { final ->
+            val heard = SpokenRole.FINAL in spoken ||
+                (final.reason == "final_already_spoken" && (SpokenRole.FIRST in spoken || SpokenRole.MIDDLE in spoken))
+            emitFinalReply(request, ReplyAlert.identityOf(request.turnId, "final"), route.destination.storedSessionId, FinalReplySource.OWN, heard, false, final.text, quiet = privateSeen.get())
         }
         val outcome = when {
             failure != null && SpokenRole.FINAL !in spoken -> VoiceTurnOutcome.DeliveredResponseFailed(route, spoken.toList(), failure!!)
@@ -679,13 +718,13 @@ class VoiceTurnOrchestrator(
      * latest accepted voice request at its handoff, never elsewhere instead, and reported exactly
      * once. Why arrivals ended is reported too ([VoiceTurnListener.onLaterFollowEnded]).
      */
-    private fun follow(request: VoiceTurnRequest, turn: SubmittedTurn, firstSequence: Int) {
+    private fun follow(request: VoiceTurnRequest, turn: SubmittedTurn, firstSequence: Int, storedSessionId: String) {
         val scope = laterScope
-        if (scope == null || !laterEnabled()) return turn.release()
+        if (scope == null || !(laterEnabled() || headset?.enabled == true)) return turn.release()
         val windowMs = laterWindowProvider?.let { provider -> provider().takeIf { it in LATER_WINDOW_MIN_MS..LATER_WINDOW_MAX_MS } ?: LATER_WINDOW_MS } ?: laterWindowMs
         val job = scope.launch(start = CoroutineStart.LAZY) {
             // A reply dropped from the queue by a Stop (or the option switched off) is reported as such.
-            val arrived = Channel<LaterReply>(LATER_QUEUE_MAX) { it.report(false, stoppedDetail()) }
+            val arrived = Channel<LaterReply>(LATER_QUEUE_MAX) { it.report(false, stoppedDetail(), cancelled = !it.admitting) }
             val speaker = launch {
                 try {
                     for (reply in arrived) speakLater(reply)
@@ -698,10 +737,15 @@ class VoiceTurnOrchestrator(
             var reason = "released"
             try {
                 reason = when (turn.collectLater(windowMs) { event ->
-                    // Switched off meanwhile: this reply and every later one are not spoken.
-                    if (!laterEnabled()) throw LaterStopped()
+                    // Switched off meanwhile: this reply and every later one are not spoken (a headset answer is the exception, below).
+                    val optedIn = laterEnabled()
+                    val forcedByHeadset = !optedIn && headset?.output() != null
+                    if (!optedIn && headset?.enabled != true) throw LaterStopped()
                     val text = event.text.trim()
-                    if (text.isNotEmpty()) admit(arrived, LaterReply(request, text, sequence++, monotonicMs() + laterDeferMaxMs))
+                    // Use headset on, but no headset connected now and no opt-in: exactly as if neither were on (nothing is spoken or alerted).
+                    if (text.isNotEmpty() && (optedIn || forcedByHeadset)) {
+                        admit(arrived, LaterReply(request, storedSessionId, text, sequence++, monotonicMs() + laterDeferMaxMs, headsetOnly = forcedByHeadset))
+                    }
                 }) {
                     LaterEnd.WINDOW -> "window"
                     LaterEnd.SUPERSEDED -> "superseded"
@@ -709,7 +753,7 @@ class VoiceTurnOrchestrator(
                     LaterEnd.RELEASED -> "released"
                 }
             } catch (stopped: CancellationException) {
-                reason = if (laterEnabled()) "stopped" else "off"
+                reason = if (laterEnabled() || headset?.enabled == true) "stopped" else "off"
                 throw stopped
             } finally {
                 arrived.close()
@@ -740,34 +784,69 @@ class VoiceTurnOrchestrator(
 
         /** The device its sink confirmed it played to the end on ([markPlayed]); written under the floor lock. */
         @Volatile var playedOn: VoiceOrigin? = null
+
+        /** Where this reply plays regardless of the playback route (the typed chat answer: always the Phone); null: the route's target. */
+        open val fixedTarget: PlaybackTarget? get() = null
+
+        /** Spoken only because "Use headset" forced it (the later-reply option is off): it plays on the headset or not at all. */
+        open val headsetOnly: Boolean get() = false
+
+        /** The headset this reply was bound to when its first clip was admitted; [bindingDecided] says the (possibly null) decision was made. */
+        @Volatile var binding: com.rumi.hermesvoice.core.headset.AudioEndpoint? = null
+        @Volatile var bindingDecided = false
     }
 
     /** One later reply that arrived: spoken (or not) and reported exactly once. */
-    private inner class LaterReply(request: VoiceTurnRequest, text: String, sequence: Int, deadlineMs: Long) :
+    private inner class LaterReply(request: VoiceTurnRequest, val storedSessionId: String, text: String, sequence: Int, deadlineMs: Long, headsetOnly: Boolean = false) :
         Utterance(request, SpokenRole.FINAL, sequence, text, deadlineMs, own = false) {
+        override val headsetOnly: Boolean = headsetOnly
+
         private val reported = java.util.concurrent.atomic.AtomicBoolean(false)
 
-        fun report(played: Boolean, detail: String) {
+        /** True only while [admit] tries to queue it: a refusal then is not a Stop's drop. */
+        @Volatile var admitting = false
+
+        /** [cancelled]: the user's Stop (or switching later replies off) ended it, so it is no arrival to alert about. */
+        fun report(played: Boolean, detail: String, cancelled: Boolean = false) {
             if (!reported.compareAndSet(false, true)) return
             laterPending.decrementAndGet()
             listener.onLaterReply(request.turnId, played, detail)
             request.listener?.onLaterReply(request.turnId, played, detail)
+            emitFinalReply(request, ReplyAlert.identityOf(request.turnId, "later$sequence"), storedSessionId, FinalReplySource.LATER, played, cancelled && !played, text,
+                quiet = binding != null || headsetOnly)
         }
 
         /** Not played for [detail], unless its sink already confirmed it played to the end: then that is the truth. */
-        fun reportNotPlayed(detail: String) {
+        fun reportNotPlayed(detail: String, cancelled: Boolean = false) {
             val device = playedOn
-            if (device != null) report(true, device.name.lowercase()) else report(false, detail)
+            if (device != null) report(true, device.name.lowercase()) else report(false, detail, cancelled)
+        }
+    }
+
+    /**
+     * [quiet]: the answer was meant for the headset only (or the headset is the private output now): its arrival alert is visual only
+     * here, never a sound on the Phone and never handed to the Watch to sound there.
+     */
+    private fun emitFinalReply(request: VoiceTurnRequest, identity: String, storedSessionId: String, source: FinalReplySource, heard: Boolean, cancelled: Boolean, text: String, quiet: Boolean = false) {
+        val silent = quiet || privateOutputNow()
+        val target = playbackRoute.current()
+        runCatching {
+            finalReply(FinalReply(identity, storedSessionId, target?.device ?: request.origin, heard, cancelled, source, if (silent) null else target?.sink, text, quiet = silent))
         }
     }
 
     /** Queues [reply] for this follow's speaker; too many waiting (here or over all follows) is reported at once. */
     private fun admit(arrived: Channel<LaterReply>, reply: LaterReply) {
-        val queued = laterPending.incrementAndGet() <= LATER_PENDING_MAX && arrived.trySend(reply).isSuccess
+        reply.admitting = true
+        val queued = try {
+            laterPending.incrementAndGet() <= LATER_PENDING_MAX && arrived.trySend(reply).isSuccess
+        } finally {
+            reply.admitting = false
+        }
         if (!queued) reply.report(false, "not played: too many later replies waiting")
     }
 
-    private fun stoppedDetail(): String = if (laterEnabled()) "not played: stopped" else "not played: switched off"
+    private fun stoppedDetail(): String = if (laterEnabled() || headset?.enabled == true) "not played: stopped" else "not played: switched off"
 
     private sealed class LaterAttempt {
         class Played(val device: VoiceOrigin) : LaterAttempt()
@@ -816,7 +895,7 @@ class VoiceTurnOrchestrator(
             reply.reportNotPlayed("network: ${error.javaClass.simpleName}")
         } catch (stopped: CancellationException) {
             // A Stop (or off) that lands after the sink confirmed the end reports what happened: played.
-            reply.reportNotPlayed(stoppedDetail())
+            reply.reportNotPlayed(stoppedDetail(), cancelled = true)
             throw stopped
         }
     }
@@ -826,7 +905,7 @@ class VoiceTurnOrchestrator(
      * a later reply, so it waits (never plays over a recording or another reply, never cancels one, and is not dropped
      * silently) and an acknowledgement waits for it. Throws [HermesPlaybackException] when it can't be spoken.
      */
-    private suspend fun speakOwn(request: VoiceTurnRequest, role: SpokenRole, sequence: Int, text: String) = coroutineScope {
+    private suspend fun speakOwn(request: VoiceTurnRequest, role: SpokenRole, sequence: Int, text: String, privateSeen: java.util.concurrent.atomic.AtomicBoolean) = coroutineScope {
         val chunked = chunkedFor(request, role, text, this)
         val utterance = Utterance(request, role, sequence, text, monotonicMs() + laterDeferMaxMs, own = true)
         try {
@@ -841,6 +920,7 @@ class VoiceTurnOrchestrator(
             // Confirmed played to the end by its sink: that is the truth, whatever failed after.
             if (utterance.playedOn == null) throw error
         } finally {
+            if (utterance.binding != null) privateSeen.set(true)
             chunked.close()
         }
     }
@@ -892,8 +972,102 @@ class VoiceTurnOrchestrator(
         return replyQueue.firstOrNull { it.own || turnsInFlight == 0 } === u
     }
 
+    private sealed class HeadsetBinding {
+        object None : HeadsetBinding()
+        class Bound(val endpoint: com.rumi.hermesvoice.core.headset.AudioEndpoint) : HeadsetBinding()
+        class Refused(val detail: String) : HeadsetBinding()
+    }
+
+    /** "Use headset" is on and a personal headset OUTPUT is connected now: replies are private (the Phone's headset or nowhere). */
+    private fun privateOutputNow(): Boolean = headset?.output() != null
+
+    /** [u] is spoken privately: it is bound to a headset already, or the headset output is connected now. */
+    private fun privateFor(u: Utterance): Boolean = u.binding != null || u.headsetOnly || privateOutputNow()
+
+    /**
+     * "Use headset" for one clip of [u] about to be admitted. Whatever the role, the device that asked and the playback target, a
+     * reply is bound to the headset output connected when its clip is admitted (an unbound reply is evaluated again at each clip),
+     * and from its first bound clip on it must find that same device still connected, else the rest is not played: never on the
+     * Watch or the loudspeaker instead. Switching the setting off meanwhile does not unbind it. A reply that only the headset made
+     * speakable ([Utterance.headsetOnly]) is not played at all without a connected headset.
+     */
+    private fun bindHeadset(u: Utterance): HeadsetBinding {
+        val policy = headset
+        if (policy == null) return if (u.headsetOnly) HeadsetBinding.Refused(com.rumi.hermesvoice.core.headset.HeadsetText.NO_HEADSET) else HeadsetBinding.None
+        if (u.binding == null) {
+            u.binding = policy.output()
+            u.bindingDecided = true
+        }
+        val bound = u.binding
+        return when {
+            bound == null -> if (u.headsetOnly) HeadsetBinding.Refused(com.rumi.hermesvoice.core.headset.HeadsetText.NO_HEADSET) else HeadsetBinding.None
+            policy.connected(bound) -> HeadsetBinding.Bound(bound)
+            else -> HeadsetBinding.Refused(com.rumi.hermesvoice.core.headset.HeadsetText.PLAYBACK_LOST)
+        }
+    }
+
+    private inner class TypedFinal(request: VoiceTurnRequest, text: String, deadlineMs: Long) :
+        Utterance(request, SpokenRole.FINAL, 1, text, deadlineMs, own = false) {
+        override val fixedTarget: PlaybackTarget? = PlaybackTarget(VoiceOrigin.PHONE, request.sink)
+        override val headsetOnly: Boolean get() = true
+    }
+
+    /**
+     * Speaks a typed chat answer ([text], Phone-owned, never moved to the Watch) through the connected headset: true when it was
+     * taken (the headset setting is on, a headset output is connected now, the follow scope exists), after which [done] is called
+     * exactly once with whether it was heard to the end and whether a Stop ended it. False: nothing is spoken and [done] is never
+     * called (the answer is only shown, as before). The speech uses the same speaker arbiter and the same sink as a later reply,
+     * so it never plays over a recording, is stopped by [stopFollowing], and is never replayed.
+     */
+    fun speakTypedFinal(turnId: String, sink: PlaybackSink, text: String, done: (heard: Boolean, cancelled: Boolean, detail: String) -> Unit): Boolean {
+        val scope = laterScope ?: return false
+        val policy = headset ?: return false
+        if (text.isBlank() || policy.output() == null) return false
+        val request = VoiceTurnRequest(turnId, VoiceOrigin.PHONE, ByteArray(0), "", sink)
+        val reply = TypedFinal(request, text.trim(), monotonicMs() + laterDeferMaxMs)
+        val reported = java.util.concurrent.atomic.AtomicBoolean(false)
+        fun finish(detail: String, cancelled: Boolean) {
+            if (!reported.compareAndSet(false, true)) return
+            val played = reply.playedOn
+            done(played != null, cancelled && played == null, if (played != null) played.name.lowercase() else detail)
+        }
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            try {
+                coroutineScope {
+                    val chunked = chunkedFor(request, reply.role, reply.text, this)
+                    try {
+                        when (val result = speakDeferred(reply, chunked)) {
+                            is LaterAttempt.Played -> finish("", false)
+                            is LaterAttempt.Failed -> finish(result.detail, false)
+                            LaterAttempt.Superseded -> finish("stopped: a newer request took the speaker", false)
+                            LaterAttempt.Busy -> finish("not played: the speaker or microphone stayed busy", false)
+                            LaterAttempt.ClipPlayed -> error("a clip is not a reply result")
+                        }
+                    } finally {
+                        chunked.close()
+                    }
+                }
+            } catch (error: HermesException) {
+                finish((error.message ?: error.javaClass.simpleName).take(160), false)
+            } catch (error: IOException) {
+                finish("network: ${error.javaClass.simpleName}", false)
+            } catch (stopped: CancellationException) {
+                finish("not played: stopped", true)
+                throw stopped
+            }
+        }
+        followers += job
+        job.invokeOnCompletion { followers -= job }
+        job.start()
+        return true
+    }
+
+    /** The device whose speaker [u] needs: the Phone (its headset) when private, else the fixed target or the playback route's. */
+    private fun speakerDevice(u: Utterance): VoiceOrigin? =
+        u.fixedTarget?.device ?: if (privateFor(u)) VoiceOrigin.PHONE else playbackRoute.current()?.device
+
     private fun replySpeakerFree(u: Utterance): Boolean {
-        val target = playbackRoute.current()?.device ?: return true
+        val target = speakerDevice(u) ?: return true
         return synchronized(floorLock) { replyFreeLocked(u, target) }
     }
 
@@ -914,12 +1088,19 @@ class VoiceTurnOrchestrator(
      * [LaterAttempt.ClipPlayed] when an earlier one was.
      */
     private suspend fun playClip(u: Utterance, chunked: ChunkedSpeech): LaterAttempt = coroutineScope {
-        val target = playbackRoute.current() ?: return@coroutineScope LaterAttempt.Busy
+        val bound = bindHeadset(u)
+        if (bound is HeadsetBinding.Refused) return@coroutineScope LaterAttempt.Failed(bound.detail)
+        val viaHeadset = u.fixedTarget == null && bound is HeadsetBinding.Bound
+        val target = if (viaHeadset) {
+            PlaybackTarget(VoiceOrigin.PHONE, privateSink ?: return@coroutineScope LaterAttempt.Failed(com.rumi.hermesvoice.core.headset.HeadsetText.NO_PRIVATE_SINK))
+        } else {
+            u.fixedTarget ?: playbackRoute.current() ?: return@coroutineScope LaterAttempt.Busy
+        }
         val device = target.device
         val index = chunked.next
         val last = index == chunked.size - 1
         val fullCue = PlaybackCue(u.request.turnId, u.request.origin, u.role, u.sequence, u.text, device,
-            later = !u.own, deferrable = u.own)
+            later = !u.own, deferrable = u.own, headset = (bound as? HeadsetBinding.Bound)?.endpoint)
         lateinit var slot: LaterSlot
         val play = launch(start = CoroutineStart.LAZY) {
             // An open wake window closes now that it was told a reply holds this speaker; it is never spoken over.
@@ -943,7 +1124,7 @@ class VoiceTurnOrchestrator(
         }
         slot = LaterSlot(device, play, own = u.own)
         val admitted = synchronized(floorLock) {
-            (playbackRoute.current() === target && replyFreeLocked(u, device)).also { if (it) ownership.later = slot }
+            ((u.fixedTarget != null || viaHeadset || playbackRoute.current() === target) && replyFreeLocked(u, device)).also { if (it) ownership.later = slot }
         }
         if (!admitted) {
             play.cancel()
@@ -1068,7 +1249,7 @@ class VoiceTurnOrchestrator(
     /** [handOff], with the device and how long it took to be confirmed (or how it failed) as a diagnostic. */
     private suspend fun timedHandOff(request: VoiceTurnRequest, audio: SpokenAudio, role: SpokenRole, sequence: Int, text: String) {
         val started = System.nanoTime()
-        val device = playbackRoute.current()?.device?.name?.lowercase() ?: "none"
+        val device = if (privateOutputNow()) "phone" else playbackRoute.current()?.device?.name?.lowercase() ?: "none"
         try {
             handOff(request, audio, role, sequence, text)
             diagnostic(request, "handoff", "role=$role seq=$sequence device=$device ms=${(System.nanoTime() - started) / 1_000_000} confirmed=true")
@@ -1081,6 +1262,21 @@ class VoiceTurnOrchestrator(
 
     /** Resolves the playback device now, not when the turn started, and plays there. */
     private suspend fun handOff(request: VoiceTurnRequest, audio: SpokenAudio, role: SpokenRole, sequence: Int, text: String) {
+        val endpoint = headset?.output()
+        if (endpoint != null) {
+            // Private: the acknowledgement is heard on the headset or not at all (it never reaches the Watch or the loudspeaker, and
+            // missing it never fails the request).
+            val sink = privateSink ?: return
+            val cue = PlaybackCue(request.turnId, request.origin, role, sequence, text, VoiceOrigin.PHONE, headset = endpoint)
+            try {
+                sink.play(audio, cue)
+            } catch (skipped: HermesPlaybackException) {
+                return
+            }
+            listener.onPlayed(cue)
+            request.listener?.onPlayed(cue)
+            return
+        }
         val target = checkNotNull(playbackRoute.current()) { "no playback target after an accepted voice request" }
         val cue = PlaybackCue(request.turnId, request.origin, role, sequence, text, target.device)
         target.sink.play(audio, cue)
@@ -1118,17 +1314,14 @@ class VoiceTurnOrchestrator(
         /** [VoiceTurnOutcome.NotAdmitted] reason: too many voice requests are pending ([MAX_PENDING_TURNS]); nothing was sent. */
         const val PENDING_LIMIT = "pending_limit"
 
-        /** [VoiceTurnOutcome.NotDelivered] reason: too many requests wait for this conversation ([SESSION_QUEUE_MAX]); nothing was sent. */
+        /** [VoiceTurnOutcome.NotDelivered] reason: too many requests are pending for this conversation ([SESSION_QUEUE_MAX]); nothing was sent. */
         const val QUEUE_FULL = "queue_full"
 
         /** Voice requests pending at once (all conversations); more are refused visibly. */
         const val MAX_PENDING_TURNS = 16
 
-        /**
-         * Requests per conversation, the one awaiting its reply included: one active and ONE queued behind it, because a
-         * conversation's events carry no per-prompt id. A third is refused visibly before anything is sent.
-         */
-        const val SESSION_QUEUE_MAX = 2
+        /** Requests pending per conversation, the one awaiting its reply included. More are refused visibly before anything is sent; none waits for another. */
+        const val SESSION_QUEUE_MAX = 8
 
         /** How long a delivered turn's destination is followed for later replies unless the user picked another window (1 minute to 3 days). */
         const val LATER_WINDOW_MS = 30 * 60_000L

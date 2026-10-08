@@ -67,9 +67,6 @@ object LaterReplyWindow {
     const val DEFAULT_MINUTES = 30
     private const val MILLIS_PER_MINUTE = 60_000L
 
-    /** Quick choices shown next to the numeric entry; every one is inside the valid range. */
-    val presets: List<Int> = listOf(30, 60, 6 * 60, 24 * 60, MAX_MINUTES)
-
     enum class Unit(val label: String, val minutes: Int) {
         MINUTES("minutes", 1), HOURS("hours", 60), DAYS("days", 1440)
     }
@@ -153,6 +150,12 @@ data class WatchSettings(
      * next visible visit. Effective only while voice routing is on (the Phone applies that gate); retained while routing is off. Default OFF.
      */
     val watchAutoNavigateToRouted: Boolean = false,
+    /**
+     * The Phone's headset is the private output now ("Use headset" on and a personal headset connected): the Watch speaks no reply
+     * (it plays nothing and refuses any clip) while this is set. Written only by the Phone's headset state, never by the user's
+     * settings form; default OFF.
+     */
+    val privateAudio: Boolean = false,
 ) {
     init {
         require(VadSilence.validOrNull(vadSilenceSeconds) == vadSilenceSeconds) { "invalid trailing silence" }
@@ -171,24 +174,24 @@ data class WatchSettings(
     }
 
     /**
-     * Whether [device] waits for the wake phrase hidden (background): its standby switch, and while ITS OWN screen is not
-     * interactive also its screen-off preference. [screenInteractive] is that device's own screen only.
+     * Whether [device] waits for the wake phrase hidden (background): "Listen on" selects it, its standby switch is on, and while
+     * ITS OWN screen is not interactive also its screen-off preference. [screenInteractive] is that device's own screen only.
      */
     fun standbyListens(device: VoiceOrigin, screenInteractive: Boolean): Boolean =
-        backgroundWakeEnabled(device) && (screenInteractive || backgroundScreenOffEnabled(device))
+        wakeLocation.listensOn(device) && backgroundWakeEnabled(device) && (screenInteractive || backgroundScreenOffEnabled(device))
 
-    /** Whether [device] waits for the wake phrase under [gate]: the foreground location alone, or its own standby switch alone. */
+    /** Whether [device] waits for the wake phrase under [gate]: "Listen on" selects it, and in the standby its own standby switch is on too. */
     fun listensIn(device: VoiceOrigin, gate: WakeGate): Boolean = when (gate) {
         WakeGate.FOREGROUND -> wakeLocation.listensOn(device)
-        WakeGate.STANDBY -> backgroundWakeEnabled(device)
+        WakeGate.STANDBY -> wakeLocation.listensOn(device) && backgroundWakeEnabled(device)
     }
 
     /**
-     * Whether [device] may wait for the wake phrase in EITHER mode (on screen under [wakeLocation], or hidden under its
-     * standby switch). Only for deciding whether two devices could hear one phrase, so a claim is needed (arbitration);
-     * it is never the gate that opens a window (that is [listensIn] for the device's current mode).
+     * Whether [device] may wait for the wake phrase at all: "Listen on" ([wakeLocation]) selects it, the master gate in the
+     * foreground and in the background alike. Only for deciding whether two devices could hear one phrase, so a claim is needed
+     * (arbitration); it is never the gate that opens a window (that is [listensIn] for the device's current mode).
      */
-    fun mayListen(device: VoiceOrigin): Boolean = wakeLocation.listensOn(device) || backgroundWakeEnabled(device)
+    fun mayListen(device: VoiceOrigin): Boolean = wakeLocation.listensOn(device)
 
     /** Both devices may hear one spoken phrase, so a wake episode must be admitted from one of them (see WakeAdmission). */
     val arbitrationRequired: Boolean get() = mayListen(VoiceOrigin.PHONE) && mayListen(VoiceOrigin.WATCH)
@@ -212,6 +215,7 @@ data class WatchSettings(
         .put("phone_background_wake_screen_off_enabled", phoneBackgroundWakeScreenOffEnabled)
         .put("watch_background_wake_screen_off_enabled", watchBackgroundWakeScreenOffEnabled)
         .put("watch_auto_navigate_to_routed", watchAutoNavigateToRouted)
+        .put("private_audio", privateAudio)
         .toString()
 
     companion object {
@@ -277,7 +281,12 @@ data class WatchSettings(
                 is Boolean -> value
                 else -> return null
             }
-            return WatchSettings(location, patterns, haptics, silence, revision, phoneStandby, watchStandby, phoneScreenOff, watchScreenOff, watchNavigate)
+            val privateAudio = when (val value = json.opt("private_audio")) {
+                null -> false
+                is Boolean -> value
+                else -> return null
+            }
+            return WatchSettings(location, patterns, haptics, silence, revision, phoneStandby, watchStandby, phoneScreenOff, watchScreenOff, watchNavigate, privateAudio)
         }
 
         /** The Watch's own stored copy; a missing or unreadable one is the safe default (wake OFF). */
@@ -397,7 +406,16 @@ class AppSettings(private val store: KeyValueStore) {
 
     /** Saves all shared voice settings as one snapshot with a strictly increasing revision, and returns it. */
     @Synchronized
-    fun saveWatchSettings(settings: WatchSettings, nowMs: Long = System.currentTimeMillis()): WatchSettings {
+    fun saveWatchSettings(settings: WatchSettings, nowMs: Long = System.currentTimeMillis()): WatchSettings =
+        persistWatchSettings(settings, watchSettings().privateAudio, nowMs)
+
+    /** Saves the private-output state ([WatchSettings.privateAudio]) as a new revisioned snapshot, everything else unchanged; returns it. */
+    @Synchronized
+    fun savePrivateAudio(active: Boolean, nowMs: Long = System.currentTimeMillis()): WatchSettings =
+        persistWatchSettings(watchSettings(), active, nowMs)
+
+    private fun persistWatchSettings(settings: WatchSettings, privateAudio: Boolean, nowMs: Long): WatchSettings {
+        val before = watchSettings()
         wakeLocation = settings.wakeLocation
         watchWakePatterns = settings.wakePatterns
         watchHapticsEnabled = settings.hapticsEnabled
@@ -412,11 +430,15 @@ class AppSettings(private val store: KeyValueStore) {
                 phoneBackgroundWakeScreenOffEnabled = settings.phoneBackgroundWakeScreenOffEnabled,
                 watchBackgroundWakeScreenOffEnabled = settings.watchBackgroundWakeScreenOffEnabled,
                 watchAutoNavigateToRouted = settings.watchAutoNavigateToRouted,
+                privateAudio = privateAudio,
             ).toJson(),
         )
         store.putString(KEY_WATCH_REVISION, revision.toString())
-        return watchSettings()
+        return watchSettings().also { onWatchSettingsSaved(before, it) }
     }
+
+    /** Told after every [saveWatchSettings] with the snapshot it replaced and the one it saved (the Phone's wake arbitration reads the change). */
+    @Volatile var onWatchSettingsSaved: (before: WatchSettings, after: WatchSettings) -> Unit = { _, _ -> }
 
     /** Phone appearance; DARK unless the user picks another mode. Unknown stored values read as DARK. */
     var themeMode: ThemeMode
@@ -440,6 +462,15 @@ class AppSettings(private val store: KeyValueStore) {
         set(value) = store.putBoolean(KEY_AUTO_NAVIGATE, value)
 
     val autoNavigationApplies: Boolean get() = routingEnabled && autoNavigateToRouted
+
+    /**
+     * "Use headset" (Phone-owned, off by default and when missing): on, a connected personal headset takes this Phone's spoken
+     * answers and, when it has a microphone, this Phone's recordings. Never part of the Watch snapshot: the Watch's own
+     * microphone and speaker are unaffected. See [com.rumi.hermesvoice.core.headset.HeadsetPolicy].
+     */
+    var useHeadset: Boolean
+        get() = store.getBoolean(KEY_USE_HEADSET, false)
+        set(value) = store.putBoolean(KEY_USE_HEADSET, value)
 
     /**
      * Select the routed conversation on the Watch after a delivered Watch-originated routed request (off by default). Stored in the
@@ -476,6 +507,7 @@ class AppSettings(private val store: KeyValueStore) {
             record?.phoneBackgroundWakeScreenOffEnabled ?: false,
             record?.watchBackgroundWakeScreenOffEnabled ?: false,
             record?.watchAutoNavigateToRouted ?: false,
+            record?.privateAudio ?: false,
         )
     }
 
@@ -498,6 +530,7 @@ class AppSettings(private val store: KeyValueStore) {
         const val KEY_THEME_MODE = "theme_mode"
         const val KEY_ROUTING_ENABLED = "voice_routing_enabled"
         const val KEY_AUTO_NAVIGATE = "open_routed_conversation"
+        const val KEY_USE_HEADSET = "use_headset"
         const val KEY_LATER_REPLY_WINDOW_MINUTES = "later_reply_window_minutes"
     }
 }

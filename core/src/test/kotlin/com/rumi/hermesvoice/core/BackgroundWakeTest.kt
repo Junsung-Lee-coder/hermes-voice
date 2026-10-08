@@ -342,7 +342,7 @@ class BackgroundWakeTest {
     }
 
     @Test
-    fun `settings that exclude the device stop everything at once, and the mode changing mid-request cancels it unsent`() {
+    fun `settings that exclude the device stop the listening at once, and the mode changing mid-request leaves it to finish`() {
         val d = Device(WakeLocation.BOTH, arbitrated = true)
         d.startArmed()
         d.presence.onActivityPaused()
@@ -350,8 +350,13 @@ class BackgroundWakeTest {
         d.controller.onClaimVerdict("claim-1", ClaimVerdict.GRANTED)
         d.controller.onHandoffDue(captureIdle = true)
         d.controller.onSettings(WatchSettings(WakeLocation.WATCH, "루미", revision = 2))
-        assertTrue(d.calls.contains("cancel_capture:wake_mode_changed"))
+        assertFalse("an accepted request is not cut by the mode", d.calls.any { it.startsWith("cancel_capture:") })
+        d.presence.onBusy()
+        d.controller.onRequestCaptureEnded(sent = true)
+        d.busy = false
+        d.presence.onIdle()
         d.rearmDue()
+        assertTrue("listening again under the new mode once the request is over: ${d.calls}", d.controller.listening)
         d.controller.onSettings(WatchSettings(WakeLocation.PHONE, "루미", revision = 3))
         assertEquals("closed:opt_out", d.calls.last { it.startsWith("closed:") })
         // The runtime disarms the session for an excluded device; its timers then do nothing.

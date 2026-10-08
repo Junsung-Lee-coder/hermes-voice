@@ -1,0 +1,105 @@
+diff --git a/phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneReplyAlertSurfaceTest.kt b/phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneReplyAlertSurfaceTest.kt
+new file mode 100644
+index 0000000..42fddf3
+--- /dev/null
++++ b/phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneReplyAlertSurfaceTest.kt
+@@ -0,0 +1,99 @@
++package com.rumi.hermesvoice.phone
++
++import android.Manifest
++import android.app.NotificationChannel
++import android.app.NotificationManager
++import android.content.Intent
++import android.os.Looper
++import com.rumi.hermesvoice.core.notify.ReplyAlert
++import com.rumi.hermesvoice.core.notify.ReplyAlertContent
++import java.time.Duration
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNotEquals
++import org.junit.Assert.assertTrue
++import org.junit.Before
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.Robolectric
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.RuntimeEnvironment
++import org.robolectric.Shadows.shadowOf
++import org.robolectric.annotation.Config
++import org.robolectric.annotation.LooperMode
++
++/**
++ * SCRATCH HARNESS (never packaged): the Phone's notifier and tap-intake seams that exist only with the feature (they need its new
++ * types, so this file is not part of the baseline run). The platform notification service is Robolectric's, not a device's.
++ */
++@RunWith(RobolectricTestRunner::class)
++@LooperMode(LooperMode.Mode.PAUSED)
++@Config(sdk = [34])
++class PhoneReplyAlertSurfaceTest {
++    private lateinit var app: PhoneApp
++    private lateinit var manager: NotificationManager
++
++    private val work = "20260101_130000_work0001"
++    private val home = "20260101_130000_home0001"
++
++    @Before
++    fun setUp() {
++        FakeAndroidKeyStore.install()
++        app = RuntimeEnvironment.getApplication() as PhoneApp
++        manager = app.getSystemService(NotificationManager::class.java)
++        shadowOf(app).grantPermissions(Manifest.permission.POST_NOTIFICATIONS)
++    }
++
++    private fun shown() = manager.activeNotifications.filter { it.notification.channelId == ReplyAlertContent.CHANNEL_ID }
++
++    @Test fun S01_distinctIdentitiesOfOneConversationAreTwoAlerts_andTheSameIdentityIsOne() {
++        val notifier = ReplyAlertNotifier(app)
++        assertTrue(notifier.show(ReplyAlert("turn-1#final", work)))
++        assertTrue(notifier.show(ReplyAlert("turn-2#final", work)))
++        assertTrue(notifier.show(ReplyAlert("turn-1#final", work)))
++        assertEquals(setOf("turn-1#final", "turn-2#final"), shown().map { it.tag }.toSet())
++        assertEquals(2, shown().size)
++    }
++
++    @Test fun S02_theTapIntentIsExplicitAndBindsTheConversationAndAnswer() {
++        val a = ReplyAlertNotifier.openIntent(app, ReplyAlert("turn-1#final", work))
++        val b = ReplyAlertNotifier.openIntent(app, ReplyAlert("turn-1#final", home))
++        val c = ReplyAlertNotifier.openIntent(app, ReplyAlert("turn-2#final", work))
++        assertEquals(MainActivity::class.java.name, a.component?.className)
++        assertEquals(ReplyAlertContent.ACTION_OPEN_REPLY, a.action)
++        assertEquals(work, a.getStringExtra(ReplyAlertContent.EXTRA_SESSION_ID))
++        assertEquals("turn-1#final", a.getStringExtra(ReplyAlertContent.EXTRA_IDENTITY))
++        assertNotEquals("the conversation is part of the intent's identity", a.data, b.data)
++        assertNotEquals("the answer is part of the intent's identity", a.data, c.data)
++    }
++
++    @Test fun S03_aMissingPermissionOrADisabledAppOrChannelShowsNothing() {
++        val notifier = ReplyAlertNotifier(app)
++        shadowOf(app).denyPermissions(Manifest.permission.POST_NOTIFICATIONS)
++        assertFalse(notifier.show(ReplyAlert("turn-1#final", work)))
++        shadowOf(app).grantPermissions(Manifest.permission.POST_NOTIFICATIONS)
++        shadowOf(manager).setNotificationsEnabled(false)
++        assertFalse(notifier.show(ReplyAlert("turn-1#final", work)))
++        shadowOf(manager).setNotificationsEnabled(true)
++        manager.deleteNotificationChannel(ReplyAlertContent.CHANNEL_ID)
++        manager.createNotificationChannel(NotificationChannel(ReplyAlertContent.CHANNEL_ID, ReplyAlertContent.CHANNEL_NAME, NotificationManager.IMPORTANCE_NONE))
++        assertFalse(notifier.show(ReplyAlert("turn-1#final", work)))
++        assertTrue(shown().isEmpty())
++    }
++
++    @Test fun S04_thePermissionIsAskedOnceAndOnlyWhileMissing() {
++        assertFalse("granted: never asked", app.askReplyAlertsOnce())
++        shadowOf(app).denyPermissions(Manifest.permission.POST_NOTIFICATIONS)
++        assertTrue(app.askReplyAlertsOnce())
++        assertFalse("asked once only", app.askReplyAlertsOnce())
++    }
++
++    @Test fun S05_aTapBeforeSignInIsKeptForTheScreenAndNotLost() {
++        val tap = Intent(app, MainActivity::class.java).setAction(ReplyAlertContent.ACTION_OPEN_REPLY)
++            .putExtra(ReplyAlertContent.EXTRA_SESSION_ID, work)
++        val controller = Robolectric.buildActivity(MainActivity::class.java, tap).create()
++        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(300))
++        assertEquals("kept until a signed-in screen opens it", work, app.pendingOpen.value)
++        controller.destroy()
++    }
++}

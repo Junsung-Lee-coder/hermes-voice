@@ -56,11 +56,12 @@ class SettingsScreenContractTest {
         val settings = block(main, "internal fun SettingsTab(", "private fun SwitchRow")
         for (call in listOf("SettingsHelp.spokenReplies()", "SettingsHelp.laterReplies(state.laterReplyWindowMinutes)", "SettingsHelp.routing()",
             "SettingsHelp.phoneNavigation()", "SettingsHelp.watchNavigation()", "SettingsHelp.watch()", "SettingsHelp.backgroundRelay()",
-            "SettingsHelp.wakePhrase()", "SettingsHelp.wakePatterns()", "SettingsHelp.standby()", "SettingsHelp.vad()")) {
+            "SettingsHelp.wakePhrase()", "SettingsHelp.wakePatterns()", "SettingsHelp.standby()", "SettingsHelp.vad()", "SettingsHelp.useHeadset()")) {
             assertEquals("exactly one ⓘ for $call", 1, Regex(Regex.escape(call)).findAll(main).count())
             assertTrue("$call is on the settings screen", settings.contains(call) || main.contains(call))
         }
-        assertTrue("later-reply label shows the configured duration", main.contains("\"Speak later replies (\${LaterReplyWindow.describe(state.laterReplyWindowMinutes)})\""))
+        assertTrue("the later-reply label is exactly the plain name", main.contains("SwitchRow(\"Speak later replies\", state.speakLater,"))
+        assertFalse("the label no longer carries a duration", main.contains("Speak later replies (") || main.contains("\"Speak later replies \$"))
         assertFalse("no fixed 30-minute label", main.contains("Speak later replies (30 minutes)"))
         assertFalse("no fixed 30 minutes claim remains on the screen", Regex("within\\s+30 minutes|after 30 minutes").containsMatchIn(main))
     }
@@ -78,18 +79,19 @@ class SettingsScreenContractTest {
     }
 
     @Test
-    fun `the later-reply duration row has the specified controls and commits on Done, focus loss and unit or preset choice`() {
+    fun `the later-reply duration row has only the number and unit controls and commits on Done, focus loss and unit choice`() {
         val row = block(main, "private fun LaterReplyWindowRow(", "\n}\n")
-        for (tag in listOf("later_reply_window_value", "later_reply_unit_", "later_reply_preset_", "later_reply_window_error")) {
+        for (tag in listOf("later_reply_window_value", "later_reply_unit_", "later_reply_window_error")) {
             assertTrue("tag $tag", row.contains(tag))
         }
+        assertFalse("the preset chips (30 min, 1 h, 6 h, 1 d, 3 d) are gone", row.contains("later_reply_preset_") || row.contains("presets"))
+        assertFalse("nothing else on the screen offers presets", main.contains("later_reply_preset_") || main.contains("LaterReplyWindow.presets"))
         assertTrue(row.contains("KeyboardType.Number") && row.contains("ImeAction.Done"))
         assertTrue("typing only changes a draft", Regex("onValueChange = \\{ value ->\\s+text = value.filter \\{ it.isDigit\\(\\) \\}").containsMatchIn(row))
         assertFalse("no save inside onValueChange", block(row, "onValueChange =", "label =").contains("commitLaterReplyWindow"))
         assertTrue(row.contains("KeyboardActions(onDone = { commit(); focus.clearFocus() })"))
         assertTrue(row.contains("if (wasFocused && !focusState.isFocused) commit()"))
         assertTrue(row.contains("model.commitLaterReplyWindow(text, choice)"))
-        assertTrue(row.contains("model.setLaterReplyWindowMinutes(minutes)"))
         assertTrue("the error is shown without a dialog", row.contains("state.laterReplyWindowError?.let"))
         assertTrue(main.contains("LaterReplyWindowRow(state, model)"))
     }

@@ -28,6 +28,7 @@ import com.google.android.gms.wearable.DataMapItem
 import com.google.android.gms.wearable.PutDataRequest
 import com.google.android.gms.wearable.Wearable
 import com.rumi.hermesvoice.core.audio.QaAudio
+import com.rumi.hermesvoice.core.notify.ReplyAlertContent
 import com.rumi.hermesvoice.core.audio.QaLaunchGuard
 import com.rumi.hermesvoice.core.wake.WakeContract
 import com.rumi.hermesvoice.core.watchlink.HapticEvent
@@ -147,6 +148,7 @@ class WatchActivity : ComponentActivity() {
                 }
             }
         }
+        if (savedInstanceState == null) handleReplyAlertIntent(intent)
         handleQaIntent(intent, restored = savedInstanceState != null)
         // The screen stays on while recording and while a foreground-only window listens; never for a whole background session.
         lifecycleScope.launch {
@@ -164,7 +166,15 @@ class WatchActivity : ComponentActivity() {
             askedMicrophone = false
             askedNotifications = false
         }
+        handleReplyAlertIntent(intent)
         handleQaIntent(intent, restored = false)
+    }
+
+    /** A tapped arrival alert names one conversation; it is opened like the user's own choice, then the intent is spent. */
+    private fun handleReplyAlertIntent(intent: Intent?) {
+        val session = ReplyAlertContent.sessionOf(intent?.action, intent?.getStringExtra(ReplyAlertContent.EXTRA_SESSION_ID)) ?: return
+        app.openFromReplyAlert(session)
+        intent?.action = null
     }
 
     override fun onSaveInstanceState(outState: Bundle) {

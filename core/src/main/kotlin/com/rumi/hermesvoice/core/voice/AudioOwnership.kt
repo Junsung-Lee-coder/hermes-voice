@@ -49,6 +49,19 @@ class AudioOwnership {
         return claim
     }
 
+    /**
+     * Stops the reply admitted to [device]'s speaker now (not one its sink already confirmed played to the end) and marks it to be
+     * played again from the first chunk not confirmed, like a recording's claim does: the private-output switch moves a reply that
+     * plays on the Watch to the headset. True when one was stopped.
+     */
+    internal fun withdrawLater(device: VoiceOrigin): Boolean {
+        val stopping = synchronized(lock) {
+            later?.takeIf { it.device == device && !it.completed }?.also { it.yielded = true }
+        }
+        stopping?.job?.cancel(LaterYielded())
+        return stopping != null
+    }
+
     /** Whether something records (or is about to) on [device]. */
     fun microphoneClaimed(device: VoiceOrigin): Boolean = synchronized(lock) { claimedLocked(device) }
 

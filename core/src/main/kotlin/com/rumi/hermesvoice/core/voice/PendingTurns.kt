@@ -1,7 +1,6 @@
 package com.rumi.hermesvoice.core.voice
 
 import com.rumi.hermesvoice.core.VoiceOrigin
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -10,7 +9,7 @@ enum class PendingPhase {
     /** Being transcribed, routed, acknowledged or sent: the microphone/transfer work is still going on. */
     TRANSMITTING,
 
-    /** Waiting for the earlier request to the same conversation to be answered; nothing was sent yet. */
+    /** No longer entered: a request to a busy conversation is sent at once and Hermes decides what to do with it. Kept for the Phone/Watch wire format. */
     QUEUED,
 
     /** Delivered; waiting for the destination's reply. Nothing is held on the device meanwhile. */
@@ -55,39 +54,30 @@ class PendingTurns {
 }
 
 /**
- * One original reply outstanding per destination session. Events of a conversation carry no
- * per-prompt id, so a second request to a conversation whose earlier request is not answered yet
- * could take that one's reply. Requests to the same session therefore wait in a bounded FIFO
- * ([Ticket.ready]); requests to different sessions never wait for each other.
+ * A finite overload guard per destination session: at most [maxPerSession] of this app's requests may be pending for one
+ * conversation at once. It never makes a request wait for an earlier one: whether a request sent while Hermes works steers,
+ * queues or interrupts is Hermes' own busy-input policy, and the app only sends the content.
  */
 internal class SessionGate(private val maxPerSession: Int) {
-    class Ticket(val session: String) {
-        /** Completed when every earlier ticket of the session was released. */
-        val ready = CompletableDeferred<Unit>()
-    }
+    class Ticket(val session: String)
 
-    private val queues = HashMap<String, ArrayList<Ticket>>()
+    private val lines = HashMap<String, ArrayList<Ticket>>()
 
-    /** The place in line, or null when the session's line is full (the request is refused visibly, not dropped silently). */
+    /** A place for the request, or null when the session already has [maxPerSession] pending (refused visibly, not dropped silently). */
     @Synchronized
     fun enter(session: String): Ticket? {
-        val line = queues.getOrPut(session) { ArrayList() }
+        val line = lines.getOrPut(session) { ArrayList() }
         if (line.size >= maxPerSession) return null
-        val ticket = Ticket(session)
-        line += ticket
-        if (line.size == 1) ticket.ready.complete(Unit)
-        return ticket
+        return Ticket(session).also { line += it }
     }
 
-    /** Leaves the line (answered, failed, stopped or never delivered); the next ticket of the session may go. Safe to repeat. */
+    /** Leaves (answered, failed, stopped or never delivered). Safe to repeat. */
     @Synchronized
     fun release(ticket: Ticket) {
-        val line = queues[ticket.session] ?: return
-        val wasHead = line.firstOrNull() === ticket
-        if (!line.remove(ticket)) return
-        if (line.isEmpty()) queues.remove(ticket.session) else if (wasHead) line.first().ready.complete(Unit)
+        val line = lines[ticket.session] ?: return
+        if (line.remove(ticket) && line.isEmpty()) lines.remove(ticket.session)
     }
 
     @Synchronized
-    fun waiting(session: String): Int = (queues[session]?.size ?: 0)
+    fun pending(session: String): Int = (lines[session]?.size ?: 0)
 }

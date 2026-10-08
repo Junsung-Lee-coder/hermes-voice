@@ -131,7 +131,9 @@ class AndroidWiringGateTest {
         assertTrue(model.contains("SilenceEndpoint(sampleRate = PhoneCapture.SAMPLE_RATE, silenceMs = silenceMs)"))
         assertTrue("the same capture lifecycle as the Watch", model.contains("private val captures = CaptureCoordinator(") &&
             model.contains("captures.stop(id, CaptureStop.of(reason))"))
-        assertTrue(source("$phone/PhoneCapture.kt").contains("PcmCaptureLoop({ recorder.read(it, 0, it.size) }, LIMIT_BYTES, endpoint, listener"))
+        val captureSource = source("$phone/PhoneCapture.kt")
+        assertTrue(captureSource.contains("PcmCaptureLoop({") && captureSource.contains("val n = recorder.read(it, 0, it.size)") &&
+            captureSource.contains("}, LIMIT_BYTES, endpoint, listener, chunkBytes = CHUNK_BYTES)"))
     }
 
     @Test
@@ -220,7 +222,7 @@ class AndroidWiringGateTest {
         val phoneManifest = source("phone/src/main/AndroidManifest.xml")
         val watchManifest = source("watch/src/main/AndroidManifest.xml")
         assertEquals(listOf("INTERNET", "RECORD_AUDIO", "VIBRATE", "FOREGROUND_SERVICE", "FOREGROUND_SERVICE_CONNECTED_DEVICE",
-            "FOREGROUND_SERVICE_MICROPHONE", "FOREGROUND_SERVICE_MEDIA_PLAYBACK", "CHANGE_NETWORK_STATE", "POST_NOTIFICATIONS", "WAKE_LOCK"),
+            "FOREGROUND_SERVICE_MICROPHONE", "FOREGROUND_SERVICE_MEDIA_PLAYBACK", "CHANGE_NETWORK_STATE", "POST_NOTIFICATIONS", "WAKE_LOCK", "MODIFY_AUDIO_SETTINGS", "BLUETOOTH_CONNECT"),
             permissions(phoneManifest))
         assertEquals(listOf("RECORD_AUDIO", "VIBRATE", "FOREGROUND_SERVICE", "FOREGROUND_SERVICE_MICROPHONE", "FOREGROUND_SERVICE_MEDIA_PLAYBACK",
             "POST_NOTIFICATIONS", "WAKE_LOCK"), permissions(watchManifest))
@@ -565,22 +567,26 @@ class AndroidWiringGateTest {
         // Push-to-talk: claim, then the recorder opens only inside the "speaker stopped" callback.
         val ptt = body(model, "fun toggleRecording()")
         assertBefore("push-to-talk", ptt, "app.audio.claimMicrophone(VoiceOrigin.PHONE)", "microphone.whenSpeakerStopped(viewModelScope) { stopped ->")
-        assertBefore("push-to-talk", ptt, "microphone.whenSpeakerStopped(viewModelScope) { stopped ->", "runCatching { recorder.start() }")
-        assertEquals("the recorder opens in one place only", 1, Regex("recorder\\.start\\(\\)").findAll(model).count())
+        assertBefore("push-to-talk", ptt, "microphone.whenSpeakerStopped(viewModelScope) { stopped ->", "openPushToTalk(microphone, plan)")
+        assertTrue("the recorder opens only in the function that callback reaches", body(model, "private fun openPushToTalk(").contains("runCatching { recorder.start(plan, admitted = !cued) {"))
+        assertEquals("the recorder opens in one place only", 1, Regex("recorder\\.start\\(").findAll(model).count())
         // Hands-free (foreground) and background capture: the episode's claim or a new one, then open*() only from the callback.
         val handsFree = body(model, "fun startHandsFree(")
         assertBefore("hands-free", handsFree, "val microphone = held ?: app.audio.claimMicrophone(VoiceOrigin.PHONE)", "PhoneCapture(")
         assertTrue(handsFree.contains("microphone.whenSpeakerStopped(viewModelScope) { stopped -> openHandsFree(id, capture, stopped) }"))
         assertFalse(handsFree.contains("capture.start()"))
-        assertTrue(body(model, "private fun openHandsFree(").contains("!capture.start()"))
-        assertEquals(1, Regex("capture\\.start\\(\\)").findAll(model).count())
+        // The headset-or-Phone microphone is chosen first (a plan), still only inside the callback; the one open site follows it.
+        assertTrue(body(model, "private fun openHandsFree(").contains("startHandsFreeCapture(id, capture, plan)"))
+        assertTrue(body(model, "private fun startHandsFreeCapture(").contains("!capture.start(plan)"))
+        assertEquals(1, Regex("capture\\.start\\(").findAll(model).count())
         assertEquals(1, Regex("openHandsFree\\(id, capture, stopped\\)").findAll(model).count())
         val background = body(runtime, "private fun startCapture(")
         assertBefore("background", background, "val microphone = held ?: app.audio.claimMicrophone(VoiceOrigin.PHONE)", "PhoneCapture(")
         assertTrue(background.contains("microphone.whenSpeakerStopped(app.mainScope) { stopped -> openCapture(id, capture, stopped) }"))
-        assertFalse(background.contains("capture.start()"))
-        assertTrue(body(runtime, "private fun openCapture(").contains("!capture.start()"))
-        assertEquals(1, Regex("capture\\.start\\(\\)").findAll(runtime).count())
+        assertFalse(background.contains("capture.start("))
+        assertTrue(body(runtime, "private fun openCapture(").contains("beginCapture(id, capture, plan)"))
+        assertTrue(body(runtime, "private fun beginCapture(").contains("!capture.start(plan)"))
+        assertEquals(1, Regex("capture\\.start\\(").findAll(runtime).count())
         // The claim goes with the request (the orchestrator takes it over) and is given back if the turn never ran.
         assertEquals(2, Regex("routing = routing, microphone = microphone\\)").findAll(model).count())
         assertEquals(2, Regex("routing = routing, microphone = microphone\\)").findAll(runtime).count())
