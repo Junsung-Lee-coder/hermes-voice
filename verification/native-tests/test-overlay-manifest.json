@@ -1,0 +1,1602 @@
+{
+  "archive_sha256": "ca0a8e315b269938e6742cd5f743c74c40ae8aa1440c6b54d7922601c4fa40b5",
+  "count": 399,
+  "files": {
+    ".gitignore": {
+      "bytes": 528,
+      "sha256": "d55746927e3f8923b94b452a09f58b24be1fcb522585cbc8967102649a549047"
+    },
+    "README.md": {
+      "bytes": 156259,
+      "sha256": "ea1a7a889d4dccff417e3d71d772922219497f60f31e6764a4e7f4e535b0c1ad"
+    },
+    "android-test-harness/README.md": {
+      "bytes": 2253,
+      "sha256": "83fe2d99601f4d241415a647138d9a8b48d045a379262b184e208a63b65e7a75"
+    },
+    "android-test-harness/phone.append.gradle.kts": {
+      "bytes": 1466,
+      "sha256": "7b8db42f4792f847078d9897acb2b2f9d2b6147dd3a5d1dd6e938ad25e9792f5"
+    },
+    "android-test-harness/watch.append.gradle.kts": {
+      "bytes": 1511,
+      "sha256": "012d42d1ff48280f67aa3f6e7f534597ab8eda717a78c97e54e31822d28ae61e"
+    },
+    "build.gradle.kts": {
+      "bytes": 207,
+      "sha256": "65785431c4b39c02937c32fb93b0e3e0ad4eff74edee41a0d31b1e62455cfe0a"
+    },
+    "core/build.gradle.kts": {
+      "bytes": 580,
+      "sha256": "f316165341147401c8e057c3d92fa898227a44eb7a0401a539fab6fbeb9ef032"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/HermesVoiceCore.kt": {
+      "bytes": 22471,
+      "sha256": "a4ac8ff5cf8116bfc04bd91d1d8ccba5a59661d11bb951c83623b12f89e7f5dc"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/Models.kt": {
+      "bytes": 3339,
+      "sha256": "5dbdd9ffc7c0dc4d961660ff3cf2e52233e83dc26f64f1ba85767ca74bcfb08b"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/Storage.kt": {
+      "bytes": 1594,
+      "sha256": "a1e99b35b55e9630f5e4ace24e0032638c62f7ff87d5d2242137e2775fe67208"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/activity/Activity.kt": {
+      "bytes": 4707,
+      "sha256": "81ef7645972e28869121e5e535141ab896993eda48562aec63db3b0b8274617d"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/activity/ActivityLabels.kt": {
+      "bytes": 4696,
+      "sha256": "6ac14a96a5e921e9d65c99d5d2b498780b49498d5c013bdb6a311c4093b6b661"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/attachments/AttachmentRefs.kt": {
+      "bytes": 3228,
+      "sha256": "a5d127d34dbf49d40b34674f599ded0f61a00f17936cc20ec2380bb8a14235e5"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/attachments/FilePreview.kt": {
+      "bytes": 4043,
+      "sha256": "6f0524f88cd91ebf36d51b44cddff81448e699a2f68d260b46b95c3048db940e"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/audio/AudioInputGate.kt": {
+      "bytes": 8775,
+      "sha256": "1c497208e39ba052e28d19f0dbedd7ef116b12d227d02b8b8aa8a15cbd5d99a4"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/audio/EnergyVad.kt": {
+      "bytes": 17792,
+      "sha256": "0d3311f54cb187c8bc3c2f7ff64fff223f95228cc27ac68daa227b8dd14542c2"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/audio/PcmCaptureLoop.kt": {
+      "bytes": 5639,
+      "sha256": "264cd53cf5547e94251fa00149b173c8a92b115ddeb5a7609a892d5e38262c44"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/audio/QaAudio.kt": {
+      "bytes": 1446,
+      "sha256": "f9fdfc737b151cf809ba3d171e8b332d7cdc51bb7903f9140edb2dce505f312f"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/audio/SilenceEndpoint.kt": {
+      "bytes": 8806,
+      "sha256": "8f024a6d662f94fde28989ce032a9d4839f96ba744d1556a5c3fd48c83e81c8d"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/auth/HermesNativeSignIn.kt": {
+      "bytes": 11226,
+      "sha256": "9381faac358430b93ae38cc7a67e9a26dc3d7015aa0640d719239865e5dc822f"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/background/BackgroundSession.kt": {
+      "bytes": 10546,
+      "sha256": "20e64d5ee6accc37ffb6c380c4598fe15be8fb6bbbe845603a3df94d696e9e48"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/background/BackgroundText.kt": {
+      "bytes": 7195,
+      "sha256": "1ffd784c84ad4922dbe1c1fcbb208c030e8d2b0f2a1a81ab92b0bb9e44dd3aed"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/background/DeviceLocalFlags.kt": {
+      "bytes": 3528,
+      "sha256": "a62658446bac3192ba7076cc32c2bc2ac27dc0ce130b607e2b7b49ec3e6731d9"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/background/PhoneBackgroundWake.kt": {
+      "bytes": 16092,
+      "sha256": "6abeab6e127d8fef45f8e93a011b1b3f3516b4e71c863161098b3f01859ca7a3"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/background/WakeHolds.kt": {
+      "bytes": 3171,
+      "sha256": "177d74a8bdbbfd23036c0ad3f2bf89e2607140435ee99a9fad40f696f879d82b"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/background/WatchVoiceCoordinator.kt": {
+      "bytes": 22031,
+      "sha256": "785b42cf920c411fd7da26a018e132d57771647dfceb14eba44c1b3b7bbb1d6f"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/chat/ComposerDispatch.kt": {
+      "bytes": 5255,
+      "sha256": "661b9d969c898fac359df373224dc38751fa5b12ba3a1e02f4e991cce59ad8a5"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/chat/PendingSends.kt": {
+      "bytes": 3401,
+      "sha256": "26d9ec6f3ea5a6a764e37a2da807164704fcd35b7330e73e5f1554997e32facb"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/diag/Diag.kt": {
+      "bytes": 17999,
+      "sha256": "d722778628949ec4fa4c2a6cd7440b615d525a5eb9686c323871c74effc6c6dc"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/diag/DiagExport.kt": {
+      "bytes": 6556,
+      "sha256": "6db073fd3f3ebd5aeb5f46b243b40aef835636ce79813c425773b77fda780f10"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/diag/DiagIdentity.kt": {
+      "bytes": 6655,
+      "sha256": "9d26a9cc0fd2cbba98fdae6fdc21967e101881cd04fd38719f6072f7699045d3"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/diag/DiagJournal.kt": {
+      "bytes": 15115,
+      "sha256": "5a80a13df0adde840a9e4adf9ee382edbbe4e37d7a8d04016aa034797d45c0d6"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/diag/DiagReport.kt": {
+      "bytes": 14181,
+      "sha256": "6e01758b85043df6460d49ba4b225efc187ee4b359675ad032e637665901dae2"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/diag/DiagReportV2.kt": {
+      "bytes": 15006,
+      "sha256": "7944ebd1a54bc623655499952e2434d50ff9fc245438f688b15731e644815157"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/diag/DiagShare.kt": {
+      "bytes": 1108,
+      "sha256": "80e3503600e2e33fd9477929ea069401f320db9c216983613fa25210e9e64ece"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/diag/DiagSpeechError.kt": {
+      "bytes": 1582,
+      "sha256": "e8149904c3ce8f7197f9cd02228b5c7ffa741e92b0483b7b8b5bfdd0e228acae"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/diag/DiagStages.kt": {
+      "bytes": 9524,
+      "sha256": "5803fbf783b57856ec4a3ea515abc82e5a9a261277d4bfd59d90dbf01e6a87d7"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/diag/DiagVoiceListener.kt": {
+      "bytes": 8702,
+      "sha256": "1f68e6038ffbbce5af6ee05537cd1547b11dbeccbdb02dedd920fe9a96ba4b64"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/diag/DiagWatchSide.kt": {
+      "bytes": 3133,
+      "sha256": "4b12ef5e780922ee50ebd830801a4fb95e793bce5545092ab60d3cc95f9ae393"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/headset/Headset.kt": {
+      "bytes": 8801,
+      "sha256": "4786a00eb02cb5e5f16bdbf892ec87ed206d5d268f414dfedd954b20114103cf"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/headset/HeadsetBackground.kt": {
+      "bytes": 3623,
+      "sha256": "ca34c08615559427419c25a402e3e8addbc40e2271ef9fc19e4fb3b7d7e03b95"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/headset/MediaButton.kt": {
+      "bytes": 4668,
+      "sha256": "70c2b910b65a79e4513c0e97b4b2e8fc00d47968c384ce8b458150c6952e5d2b"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/headset/MicRoute.kt": {
+      "bytes": 6184,
+      "sha256": "9834506e667d4793cf7b0c46d47f6be80315b0bf1bd04e0b1326eb2c750634e5"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/headset/PrivateAudioMonitor.kt": {
+      "bytes": 1490,
+      "sha256": "bfbbf6eeb57bcfcaa0fe51eb9262fec00463e2ab7624edc9e9f872d4d3452440"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/net/Conversations.kt": {
+      "bytes": 41603,
+      "sha256": "8b9eeaa186ea839341bd172a32c83eededdf9a72a72e47f5defd322fd6741082"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/net/HermesDashboardClient.kt": {
+      "bytes": 24493,
+      "sha256": "55a69025bdc5a08d0e057efa4e27cfeffc32398d94e79b23205882d63fdef793"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/net/HermesGatewayConnection.kt": {
+      "bytes": 9040,
+      "sha256": "28790b9c37dbb99a2c721114b143b65ce494194be6cb752384cb298a0a594f07"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/net/HistoryPages.kt": {
+      "bytes": 809,
+      "sha256": "fb7ba07d1224b65d7ca71271fdd3586e0f5daa8c5cd97b965d891b1dc3a873b6"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/net/StoredFiles.kt": {
+      "bytes": 945,
+      "sha256": "85baa0d3bdbc52aa4c5de3bcd919335bcf2380988a0c8067960bda7f29ad29a6"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/net/SttSafeCode.kt": {
+      "bytes": 5590,
+      "sha256": "fda460770bfc5211bb8f91d1b695535669a4e756c8c40abc900ce0ebf3c2e393"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/notify/ConversationPresence.kt": {
+      "bytes": 1507,
+      "sha256": "b47cfe71166217d1edd965c6d8f1bef538cc82a6e77cfeed2f03d82188d5318a"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/notify/ReplyAlerts.kt": {
+      "bytes": 8075,
+      "sha256": "e6c17377d094ce806195a812ca2f60d9ee5757b789cd479c4454263a6713dc8c"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/notify/ReplyPreview.kt": {
+      "bytes": 5117,
+      "sha256": "2731970454914b5b0e0d06ae06fc409bb0978dec8c617514e1ad7e23047a953c"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/sessions/AppSessions.kt": {
+      "bytes": 40205,
+      "sha256": "bee2ef561ce23d8512b1303c6ccd53d19568a6ebc307dcda9017ec807843d354"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/settings/AppSettings.kt": {
+      "bytes": 33454,
+      "sha256": "5f361c60a8fee95734dc7a135f047db569ea415ede0fd62c15900c81bc879bbe"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/settings/SettingsHelp.kt": {
+      "bytes": 23616,
+      "sha256": "c64d808661892374cc2666a6976d182ac16f303d6a5fde7e8c5dca0a17b71c2c"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/text/Markdown.kt": {
+      "bytes": 29916,
+      "sha256": "d21ffd82cccd5e30c59c6daf68ed40bb2fac0002a86ffd8b961b0c3b1aecf373"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/text/MarkdownLines.kt": {
+      "bytes": 2951,
+      "sha256": "9847ab4fdb7bae367f926917bf09fa656ab8164a03a3e29d8b974e077339ea47"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/text/MessageLinks.kt": {
+      "bytes": 3579,
+      "sha256": "3aedcd0a9b92c975c6b260fb6de4793a2376483aa84e0bcc408c93490c48df71"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/voice/AudioOwnership.kt": {
+      "bytes": 8137,
+      "sha256": "95b39577df26a37c0bd8f370df9cee2f43276df24ce1d21e169d16311969c1b0"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/voice/AudioRecovery.kt": {
+      "bytes": 4113,
+      "sha256": "fe2dd932cc6c6a1a001fc50ca3956b62703352c3228f408f8524d2f4323d2f5d"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/voice/DestinationAllowlist.kt": {
+      "bytes": 3191,
+      "sha256": "38fb4f36fcde5740baf18267098d02d51d6e8bd24fa2a01dd9ffbfbbf5dcd2a2"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/voice/PendingTurns.kt": {
+      "bytes": 3457,
+      "sha256": "c353cb5d397364cbb1fdfc648f28189f84cd2ee4483e7af93c91c86b0e7dc0df"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/voice/PlaybackRoute.kt": {
+      "bytes": 1965,
+      "sha256": "330780bfb137730c62d1e2af6236af2108ffb88a2ef43bee18ccae50095ee2c6"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/voice/RecipientResponsePolicy.kt": {
+      "bytes": 3847,
+      "sha256": "98229b43324e3da445feb1bb10f63b1f9b8f42d5c9d5edae7c55a5a44a247974"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/voice/RoutingContract.kt": {
+      "bytes": 11459,
+      "sha256": "8955e7ea8f12efd5adaf037acd680c7edeaded2a06f071260572733a5aa91d87"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/voice/RoutingPreferences.kt": {
+      "bytes": 3789,
+      "sha256": "d331c8db63baec0381648e8d6084f3f56c18c7def3a51c5d1e0e0b3bca18eba7"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/voice/SttRecovery.kt": {
+      "bytes": 3136,
+      "sha256": "7a1ea6b417e9bafd7657d6fe827bf8fccc31f6ba20712dc144bc02d0d0ceebd2"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/voice/TtsBatcher.kt": {
+      "bytes": 8166,
+      "sha256": "0040bd785f2610e1163889c3a68ca5d2d85fd7496843a76e9258ccaaf6715e8b"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/voice/UnplayedReplyStore.kt": {
+      "bytes": 3997,
+      "sha256": "bb278f859f98a02211e14f1cfc6142c7f58d7a2fcf01aa28daadbc1945f7ee84"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/voice/VoiceTurnOrchestrator.kt": {
+      "bytes": 106001,
+      "sha256": "5aef52fb07ff9f506030aa211871001d4b35e34a641579c4d5ce0f4a86b4dbe7"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/voice/VoiceTurnPrompt.kt": {
+      "bytes": 798,
+      "sha256": "b51884c9ae123306d0e247c753eed08a323213502b6aa3cd17e0369d132d9b2b"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/wake/ScreenActivationBudget.kt": {
+      "bytes": 1675,
+      "sha256": "d65e25a47b841966a95201c90ea63bc41cd6746e8a8bf2086bc3fb9d0dfd19a6"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/wake/WakeAdmission.kt": {
+      "bytes": 14450,
+      "sha256": "85619cbd518782d585d6159549bf48c556f9975d8814ee4139f6f60f00f0ecab"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/wake/WakeClaimLink.kt": {
+      "bytes": 7001,
+      "sha256": "19f2807aaf56d1d0bc7c18e48a95be5bfc3478ed6b06e378c562495900aec6ab"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/wake/WakeContract.kt": {
+      "bytes": 16654,
+      "sha256": "408dadfac383b3ef396b5d3ddbddc3db20700847fb69ac8d52002db3085ca134"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/wake/WakeDevice.kt": {
+      "bytes": 30534,
+      "sha256": "75505ea74b78cf57a4c6241b413929b645e62ec81c0067c3a5c098d1b42932bc"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/wake/WakePresence.kt": {
+      "bytes": 16121,
+      "sha256": "428b9e005869ed440147d5c4b06bff54facedad3a81204bdff9f00d4c0633e08"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/watchlink/CaptureCoordinator.kt": {
+      "bytes": 5236,
+      "sha256": "d0de80be96d842f517c5042bda64e6057502f667768f2ae664a92d5291a988cf"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/watchlink/PhoneWatchRelay.kt": {
+      "bytes": 23397,
+      "sha256": "cbea9b218a15118ae724568e2dffc03f1d3d1d03ea4263774f429cad03c750fd"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/watchlink/PrivateAudio.kt": {
+      "bytes": 2652,
+      "sha256": "bacc704555261ecfc9e7a50451a3a9b3506ab4b14c010556a644de440d6a23d4"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/watchlink/WatchHaptics.kt": {
+      "bytes": 5061,
+      "sha256": "9fc7b7a98819e193e7c2f5f65833ebe64a1b5921fcaefe165bf68484141ec437"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/watchlink/WatchLink.kt": {
+      "bytes": 26374,
+      "sha256": "5d6849687ce8af1d6bee2c5c90c15d205759309a7a36076dde94a8ba8a726050"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/watchlink/WatchReader.kt": {
+      "bytes": 23916,
+      "sha256": "ded707481e08e3df5d34a379931ada7d336ed654cc7c18885557ecc0faf91b7a"
+    },
+    "core/src/main/kotlin/com/rumi/hermesvoice/core/watchlink/WatchTalkState.kt": {
+      "bytes": 8589,
+      "sha256": "684d2f44ccfaa957bea8c45a00eae867beba3cb152d810cc6802e4593aa3f079"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/AcceptedCaptureSelectionTest.kt": {
+      "bytes": 26837,
+      "sha256": "536e81f3ec6753efa1f543c2d56f9a19226d3587f1f02e1569a897d55f76d1b3"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ActivityLabelsTest.kt": {
+      "bytes": 6840,
+      "sha256": "df1ab9b34a9f95169642a126e66622544ac1ffe5448087941e8a161008ce442f"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ActivityReducerTest.kt": {
+      "bytes": 6657,
+      "sha256": "01dfffca4cd89d21b6c739f21f822252d0aa84b47bc4a83e7d17af530b8c6167"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ActivityVoiceTurnTest.kt": {
+      "bytes": 10876,
+      "sha256": "09303e547e615bf80fe1f95e275ffda8ee18283d81f439b9b9910d36e667edbb"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ActivityWireTest.kt": {
+      "bytes": 13298,
+      "sha256": "fe57cf943582a03f99f13d6720c6de09c8c7d401a2e035c2eb4867cbab3eb4c9"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/AlertRig.kt": {
+      "bytes": 824,
+      "sha256": "3331e79483aeb74d907a99044ba835346c2438683e680bb96717d7eef7be964a"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/AndroidWiringGateTest.kt": {
+      "bytes": 59339,
+      "sha256": "93b462a49329c8329823353e6b3e48f439cf5775e224b5d09beca11c2eec1e05"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/AppSessionRepositoryTest.kt": {
+      "bytes": 6404,
+      "sha256": "7a5e7ef07e14979305a0f207018a92dfcb8f3bd6262cc5125cb543c1816edcdf"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/AppSettingsTest.kt": {
+      "bytes": 3560,
+      "sha256": "889f25d946987e674d0448a2a1b2b1922b3e9cfd9e28111b20fdb32ff64ba5c6"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/AttachmentViewingTest.kt": {
+      "bytes": 8503,
+      "sha256": "d6497bd125b6e69ad3e9e7fd41ffb752b98083d5a9dc04b7e7f40bd44bbaae57"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/AudioInputGateTest.kt": {
+      "bytes": 3437,
+      "sha256": "f24bee97aaf98b06286e23ba697748f7f1419ef768839b7e13e1278548082198"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/AudioRecoveryPlaybackTest.kt": {
+      "bytes": 15051,
+      "sha256": "16a57540d3a6da781bd9d6802d192bda60e6bd5b32378391a23fc2c84198a093"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/AudioRecoveryPolicyTest.kt": {
+      "bytes": 3443,
+      "sha256": "2663050a30ff2fab25633ba464c2d3c19fc20927d4fd3c15b57569cef64b0ac3"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/AudioRecoverySynthesisTest.kt": {
+      "bytes": 5172,
+      "sha256": "a91cb4f239214871158a35453856b8cd81b451058c67f0810e17affa0eaa4a0f"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/AudioRecoveryWindowTest.kt": {
+      "bytes": 10341,
+      "sha256": "1423c100103c86a2c627dae5352d4347632707822d7b6b07130384420bd86b8d"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/BackgroundReviewRegressionTest.kt": {
+      "bytes": 5043,
+      "sha256": "355f2940c2e8ca265152da9335a07b217f3585cba5ef40e479a49943b14c925f"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/BackgroundSessionTest.kt": {
+      "bytes": 13846,
+      "sha256": "c6b154454ae249db592a544dfad92b54e19ba6ffa02190a5194323cc8b8e2389"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/BackgroundStandbyLifecycleTest.kt": {
+      "bytes": 15015,
+      "sha256": "99bf573f534280ed10cdf9388e4b800c161792378e74a9b22fa6a60e0da941e9"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/BackgroundStandbySettingsTest.kt": {
+      "bytes": 8570,
+      "sha256": "7fc937d0bf621db16d69acab3e8f8c91dc5f3e5ce5bf0e54031cb583a4baa199"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/BackgroundWakeTest.kt": {
+      "bytes": 19596,
+      "sha256": "c001ddfc52287a7b27cc5dafa5e0bf4559336515a56fd7dc221dbb06e615d50d"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/BehavioralRegressionHarnessTest.kt": {
+      "bytes": 3109,
+      "sha256": "dce565de16d89934dfae57dfd30e75f86bac78e37df198443095f3b5f44bff84"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/BusyInputPassThroughTest.kt": {
+      "bytes": 10362,
+      "sha256": "36f652f32974fc6aea79879073b83dc91841da038c3272af6f2922e50c485be2"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/CaptureBufferReuseTest.kt": {
+      "bytes": 3618,
+      "sha256": "c38eccf653434cedbddbb96ab729b65f7af0b619f4195aee4d23b432e2aa93f6"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/CaptureLoopTest.kt": {
+      "bytes": 7646,
+      "sha256": "558e720d27759f7514ccf01647b030a83f16d66302ac90db40e8807a2260a173"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ChargingWakeR7ControllerTest.kt": {
+      "bytes": 10408,
+      "sha256": "9d68450fc76fe44b9857d6067163a433789c4cd2019a96a9b0c6aa58e3267b51"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ChargingWakeR7SettingsTest.kt": {
+      "bytes": 7555,
+      "sha256": "01cf117c6fa9e402d8c9083ddf831fba0a4b29acdf039b74329cfc5ac287c098"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ChatAndAttachmentTest.kt": {
+      "bytes": 4501,
+      "sha256": "86747f9bf704cec76638d4d4ed42b3a49faa419e821bc6094c30026b7274f50f"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ChunkedReplyGapTest.kt": {
+      "bytes": 22521,
+      "sha256": "07de39a8785b1473af1acc381be3fe397beb4006f0a88468047f8167b45f0fb2"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ComposedWatch.kt": {
+      "bytes": 13792,
+      "sha256": "aca7fc4121b9984677a4a3d77d64e0cf9750fa900dae994e8d0b8df217f3f5c8"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ComposerDispatchTest.kt": {
+      "bytes": 4604,
+      "sha256": "1dc30985588e136eeac8a745349a38db39b47a8ffcb99ffbe3e39f6d70fbdd00"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ComposerScreenContractTest.kt": {
+      "bytes": 7196,
+      "sha256": "0264f02befcc16004b6c53b618647df7d56091f9686168af2d884687196aa580"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ConversationPresenceTest.kt": {
+      "bytes": 2378,
+      "sha256": "2e35eed1a1555c5d59087ae1cc93e444cca6a29b45b3ada32618fca03cc2996c"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/CoreHarness.kt": {
+      "bytes": 3991,
+      "sha256": "793eb5385255230c3bbf31f345143d28675edf95463768246ce4401a0a0427b5"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/DeviceLocalFlagsTest.kt": {
+      "bytes": 6443,
+      "sha256": "1f4f97a630f76290c8625deb6ee3d61bf7f4a1f9bbcb871e5177d788e60864ea"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/DeviceSideDiagnosticsTest.kt": {
+      "bytes": 11012,
+      "sha256": "b16fa8b43c70589b4628e0ef4196640bcb7fa1a579f386ad97445720251e04ac"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/DiagCorrelationTest.kt": {
+      "bytes": 7683,
+      "sha256": "787ba9a41be84edbcdf95d8191d4f67c4cd720a680df5b68c4c6e9c9214198ac"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/DiagJournalTest.kt": {
+      "bytes": 14149,
+      "sha256": "11d2adaf9081756d43932ca2d5306e1ef8f5e0abe6607d6fbba54281f726e461"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/DiagWireFallbackTest.kt": {
+      "bytes": 5037,
+      "sha256": "b15e825b2b4ee544ed9e7b889e66b1720ef9e7f45e1aff7fb6d7b6cbddad138b"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/DiagnosticsExportTest.kt": {
+      "bytes": 19805,
+      "sha256": "63d1a41015a7888453b18a8a214d90ebc02872e108f963e01d96f51de081d184"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/DiagnosticsManifestTest.kt": {
+      "bytes": 3963,
+      "sha256": "856874253cd2508851e36364ecc1f0d1bd6f5ee34ae86a4b36f682302c96ee17"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/DurableReplayTest.kt": {
+      "bytes": 5260,
+      "sha256": "b79c3e13cc7dffa2ff6cde01fdd235de5844fa5219fa8b51f67ce5880d059cb1"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/FakeHermesDashboard.kt": {
+      "bytes": 43267,
+      "sha256": "146db6e31b2b987a28ab9b53865ae22efc92991cd0e33c6795bd6ce54b06d642"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ForegroundBackgroundSeparationTest.kt": {
+      "bytes": 22491,
+      "sha256": "8d4746d1751f4a85bc3fcb0b1ed16f63ad992ab8264dd6110b2423b274c7230a"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/HeadsetGear.kt": {
+      "bytes": 2541,
+      "sha256": "f536ab470a77654c21e463201ec8d52adee5d9f2c129079de322bc3195c23614"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/HeadsetMediaHelpTest.kt": {
+      "bytes": 2287,
+      "sha256": "f6ac5a33e6b5abb8a7f6521751dafe89b3bfc6cf57a8a6067c0beec171ed35b3"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/HeadsetMediaWiringContractTest.kt": {
+      "bytes": 5312,
+      "sha256": "1b4d47a0730d5d0488dab38d0c07036df22cb3f74d66ea521d84eb50a70256c3"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/HeadsetMicRouteTest.kt": {
+      "bytes": 9202,
+      "sha256": "d7e2e7cf209189bb4a4161cc5bb35daa614defca34f23394a4376939610d5368"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/HeadsetPlaybackTest.kt": {
+      "bytes": 15253,
+      "sha256": "66fc6b2d5d4410fdae02c3f9a1e7b7e40f781f5707ca1a2454e2d8aa2d9c5b2a"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/HeadsetPolicyTest.kt": {
+      "bytes": 6245,
+      "sha256": "5b9eb8d35ce811c693f8b6811cad56460a285923e4611a17862158e882e28388"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/HeadsetRig.kt": {
+      "bytes": 7620,
+      "sha256": "901c9de122e89d1b55de7ac7c3f96e5acf13f465b6c63a73d26760f48a6ecb2c"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/HeadsetSettingsTest.kt": {
+      "bytes": 2260,
+      "sha256": "1a4e825255a5bc21aee28478bcff4a2728dc887f6df32c2fb9d765ddc8a210ef"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/HeadsetTypedFinalTest.kt": {
+      "bytes": 5344,
+      "sha256": "822729a78589b0839cf8d547738a8508345320f040be2c253f1cd17dbd18d7e2"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/HeadsetWiringContractTest.kt": {
+      "bytes": 6513,
+      "sha256": "420b872c9ad5d8bcc4856f56346dec6487501b99036799d460108c79cefbc246"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/HelpTimeoutSemanticsTest.kt": {
+      "bytes": 3523,
+      "sha256": "8bf52ee59f5ad01642834a4feed6d81407794b8e74c5039644a1a643e93388fb"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/HermesDashboardClientTest.kt": {
+      "bytes": 3615,
+      "sha256": "8f8d6e7fc5f2cff55b66e97040abebcab16ca137e64bec8eaa12d7c61aeede9a"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/HermesGatewayClientTest.kt": {
+      "bytes": 4910,
+      "sha256": "72a37c50341fd0b18e38cecbac6044f3358fe67eb8195ed03a105d2e58fac6ba"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/HermesNativeSignInTest.kt": {
+      "bytes": 5662,
+      "sha256": "490441bbc204b02adf7a2539006f41b15a5d8f48bdee6063b31bcce584ea0700"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/HoldAndHistoryTest.kt": {
+      "bytes": 3069,
+      "sha256": "75e684b0d66d61fc986669664cd05ab0b12fea5e8eebf2a2fa405a800a57962f"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/IdleGapNoHoldTest.kt": {
+      "bytes": 2438,
+      "sha256": "1af5d6eaca58b7e86fa1ff98566a0cf1ee1360fac832b107d85afb82d2434e57"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/LaterFollowCutoffOrchestratorTest.kt": {
+      "bytes": 5855,
+      "sha256": "de1d0606c76c6ecf7aefc97413e74d505de5706a7ca0f31d211df8a41ba392ef"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/LaterFollowCutoffTest.kt": {
+      "bytes": 12988,
+      "sha256": "3b844f030689534f03f1755b52eca0c0ba7b66082b07e793dee179030322776a"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/LaterReplyCompletionArmingTest.kt": {
+      "bytes": 1613,
+      "sha256": "7308834198576aee606a85b780dfba551d90e3a0dbe576826aba14d6f00fbc14"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/LaterReplyCompletionTest.kt": {
+      "bytes": 28660,
+      "sha256": "c2db507962f520503d70ed6d1d04887b9f8b36e77ade68b28efa3b100f5f7fe1"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/LaterReplyMicrophoneTest.kt": {
+      "bytes": 19556,
+      "sha256": "4a6aa838341a0d630f75a700688d97b13b0277fc6175da524cb84379f396b04f"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/LaterReplyOwnershipTest.kt": {
+      "bytes": 31984,
+      "sha256": "786a37e9b2797e5c1a16249cf42c3582a0d1385fae851609881e6d631d82dee5"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/LaterReplyReviewTest.kt": {
+      "bytes": 8892,
+      "sha256": "643309ff2d80009ece7b53ff3f060d56716da43c74040ff9cfd4dd328e9c7903"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/LaterReplyTest.kt": {
+      "bytes": 17752,
+      "sha256": "07e5e4a907c6d93af4934bbaa8321719d6d3793fdca7798e128f115e446eeb32"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/LaterReplyWindowFollowTest.kt": {
+      "bytes": 10882,
+      "sha256": "dcfdf6683eeb2e125913db09d645608eb8d5122710c241eccc7abd2ab52285ac"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/LaterReplyWindowSettingTest.kt": {
+      "bytes": 8966,
+      "sha256": "447ff3a90ac16f8ba181461f349e926ee55c3f54989a97afbea70c2512f9c157"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/LaterReplyWindowWiringTest.kt": {
+      "bytes": 5906,
+      "sha256": "ac4a2ba034a58fe7f05b879e00117b3c1ccfe390140b5d5cb4df6006b542ac8a"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ListenOnSelectorGateTest.kt": {
+      "bytes": 21958,
+      "sha256": "38f220a614c339da31c2dcdfb7f09885c4a325b0b7a71843e804c0361c822bb7"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ListenOnSelectorStatusTest.kt": {
+      "bytes": 3543,
+      "sha256": "5a17c12e2602825451ddcedfd0b7b832336b7134c148466f68dbd0c96507a39f"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/LongAudioAckTest.kt": {
+      "bytes": 4926,
+      "sha256": "2ef4cf0d92cb7d421c43448e8bab586a0108e606124b70512f5070681c8274c9"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ManifestMessagePathParityTest.kt": {
+      "bytes": 6416,
+      "sha256": "cda6bd50c679bfa1fad610f0124a234ef685049768c6a7f3cd7ba2a03bb93c8d"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/MarkdownTest.kt": {
+      "bytes": 14362,
+      "sha256": "b1305a10db1c924752ad1272f2c9f1f41a683837001c33cb473a0700e5dd053f"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/MediaButtonDecoderTest.kt": {
+      "bytes": 3819,
+      "sha256": "2428cbf98a4437b1c3efff86c0702f7597da8525e6d3ce7c69422ebdcf807c97"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/MessageLinksTest.kt": {
+      "bytes": 4393,
+      "sha256": "380dfab5fd8a3869b583558c425ce79e9be6cc96d7a4692c64bd66cdd7cc631b"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/MessageSelectionContractTest.kt": {
+      "bytes": 3516,
+      "sha256": "39da1f4f3c0d8966a74d2be3bad916e4583198799e7e7f53453ca2335569d288"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/NetworkDiagnosticsBoundaryTest.kt": {
+      "bytes": 7494,
+      "sha256": "0dfab9eff6a4053c072bb4f8c04be6d0609885daf9a62c02597cdec366b90462"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/NetworkDiagnosticsContractTest.kt": {
+      "bytes": 22727,
+      "sha256": "68f3e526a479b4f49a8cd142dddfc8bdc41fbc0aed002751fdfbfd1000894048"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/NetworkOffCallerThreadTest.kt": {
+      "bytes": 2258,
+      "sha256": "5d11459e2be6db53848a9b8fe5766eb09bd213b03371068105c2a830ad07d983"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/OffTimerContractTest.kt": {
+      "bytes": 20429,
+      "sha256": "2797f3199648bfbecd76a75fe411acedb8c96e498cae5b1668a1d7990899c379"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/PendingSendsTest.kt": {
+      "bytes": 5974,
+      "sha256": "65f088a7a811cfb20df311f6ce6bc1b89322882a9ba91d2c729c68344920021d"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/PhoneBackgroundWakeTest.kt": {
+      "bytes": 21421,
+      "sha256": "1ddcccdba065484f48dae742504c0a4e371ac4d1ea3fbb21bf23893dbf1ee38b"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/PlayProgressWireTest.kt": {
+      "bytes": 2071,
+      "sha256": "698e2ab070d873ba14507a39641421e59ca55cefa3ee57504d4cbbcf5da05708"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/PredecessorRedProbeTest.kt": {
+      "bytes": 2735,
+      "sha256": "24552ec1d7445c4dc88de69d591dd8fb269fdccd37f1066f0e5fd0a7c0b0ad09"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/PreviewRig.kt": {
+      "bytes": 2016,
+      "sha256": "aceec5be8bb7329192f43b539c97632b2084733b6bb95509ccdc946571d26ab0"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/PrivateAudioHelpTest.kt": {
+      "bytes": 1717,
+      "sha256": "eb52ed9e74ef9bf713ef64f3dd471fff94c1f418e7c0e742528314c4198ee51f"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/PrivateAudioRig.kt": {
+      "bytes": 6887,
+      "sha256": "79c6831283c24c5c66b6920583a8453a28c322f8ed4710a3fe63c0b418e37b16"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/PrivateAudioRoutingTest.kt": {
+      "bytes": 11558,
+      "sha256": "9805e1e34ef6ff8e0fb5a9973a23162b4bd62780acaf87b661966a8573c0045b"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/PrivateAudioStateTest.kt": {
+      "bytes": 14292,
+      "sha256": "ae6c1e8fd1766dc5ee5e5db3903d4931ea42f7c70d67fe67a63f5ee1fc2af021"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/PrivateAudioWiringContractTest.kt": {
+      "bytes": 3681,
+      "sha256": "8231c7485820c55e79f23782fbc88c35197ee813cd4e3fee144cd57c1372c97b"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/QaAudioTest.kt": {
+      "bytes": 1058,
+      "sha256": "4d7f4f0dc586dbe1142770631d3fd0c715cbecc2d76032a55b46c5f00bd35a38"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/R5RestoredPrivateReplayTest.kt": {
+      "bytes": 10133,
+      "sha256": "25a78c992d409fe54ddf5b289449995bf273fa6ea4bd80cfce8f8d061a9ad11f"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/R5UnplayedRevocationTest.kt": {
+      "bytes": 9877,
+      "sha256": "f05e3447effab0ea3f98250492a42c78e216df16d27a3d44437310b8008c6f33"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/R5UnplayedStorePhysicalPurgeTest.kt": {
+      "bytes": 5163,
+      "sha256": "e2488757898713d0cfaff62f5b08e354004abbc0ccdf7c60966a290ce53f6b0c"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ReaderGestureTest.kt": {
+      "bytes": 2527,
+      "sha256": "6d32aea2409eade1c99620f5d64bdfed9d4040a39060eb6402c226b0a1e41df0"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/RecipientResponseTrackerTest.kt": {
+      "bytes": 5328,
+      "sha256": "5775f8633a280a92dfd2f3b466ab86247d9151695549233b14be570b29ae3d8f"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/RecordingCueToneTest.kt": {
+      "bytes": 2613,
+      "sha256": "b26c3d5b54cd1e0de7d49c63105879cc67f065fa56e54f2a1c706ae7a2c57c05"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ReplayWireTest.kt": {
+      "bytes": 5897,
+      "sha256": "2acae8fcb6ff9383040e37cb68429a0e61490e0f7213481e4fb98b71b2c0be50"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ReplayWiringContractTest.kt": {
+      "bytes": 3626,
+      "sha256": "810b2381a5e86a038c2bbcb04eda84d2db65746e6602eb42fd5eedb007eba9a3"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ReplyAlertDismissalTest.kt": {
+      "bytes": 7395,
+      "sha256": "5b5dfeec5882a490afff9d8e97afbb2366db38e06fc367804fe8f2ba2f402c38"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ReplyArrivalAlertTest.kt": {
+      "bytes": 5254,
+      "sha256": "4ead785fd453c7d1d0ee9e3704830184d8f61fc21c96565c944721ac9132b4b2"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ReplyArrivalObservedTest.kt": {
+      "bytes": 16105,
+      "sha256": "245f6d44378e567c9927f0d8d01e98c5a7bc197dcec4c1d036ead173234987dc"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ReplyPreviewObservedTest.kt": {
+      "bytes": 9679,
+      "sha256": "fc08ccbc18e3c2f27f738ddf13c93663da0dc76671c4530a50c2d5e4918b33e2"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ReplyPreviewTest.kt": {
+      "bytes": 3823,
+      "sha256": "335e9cbf1da98b69dda480764928896f53de672fa4f96a96c577c91041037a66"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ResponseInactivityTest.kt": {
+      "bytes": 6075,
+      "sha256": "b3d7e3add94a9e5468702b0486360c6dc64bb2a480f605990e9287b04230ac8f"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/RouterColdStartTest.kt": {
+      "bytes": 24035,
+      "sha256": "17364d89557d680670880421f03feefb1bb5e979069c121a273605acd68e54d1"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/RouterCreatePrivacyTest.kt": {
+      "bytes": 10960,
+      "sha256": "6b3ac18db2496b893374a9fab3132f919e9d868a975c661e311eb984def8e2db"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/RouterFailedBuildTest.kt": {
+      "bytes": 35760,
+      "sha256": "36c988bb7ffe97eead1fe610e1ee8397b3cd6968553da93a9ddfb08e100c656c"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/RouterModelAndNewSessionTest.kt": {
+      "bytes": 17614,
+      "sha256": "d86114c7c89ad0a954398a35277c6df4208fc70237f416699f05d048a4270d64"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/RoutingContractTest.kt": {
+      "bytes": 4683,
+      "sha256": "481163403197d9aec76f076da5ef66ecf1d4ab6ed80e61f61e743630d223e7d8"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/RoutingCreateTest.kt": {
+      "bytes": 23623,
+      "sha256": "c5bb09b78e322b80e41d3e7d9a4157f2ec048a7e77a8cdf085c4c75a3feed9f0"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/RoutingPreferencesTest.kt": {
+      "bytes": 21164,
+      "sha256": "14cce1657b90004c9c336e06b02c632002fab370159a8a52fde5898ab0d08fc6"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/RoutingReviewRepairTest.kt": {
+      "bytes": 39427,
+      "sha256": "1848a602d8f804755bfd4e10df0ce27fd7a363ad1a5f354e3eee4e7abfe33805"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ScreenOffArbitrationTest.kt": {
+      "bytes": 5817,
+      "sha256": "11498582ac132a190430829e5a4d07e56c9e288e250dba0131677520de593af7"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ScreenOffPhoneTest.kt": {
+      "bytes": 21634,
+      "sha256": "1d47719755d1015c2a4651d9b04bf9d56b48d741b747da8674f0cb72899b631b"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ScreenOffSettingsTest.kt": {
+      "bytes": 12923,
+      "sha256": "7e01031117879ffcecfa7454323dfa1ea401d82efde65029b4935ad99f1f265a"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ScreenOffTestSupport.kt": {
+      "bytes": 1197,
+      "sha256": "0d12750f471f52eeac96b027e58fa14c0508986cbee75f6883ac235da1dc6e9d"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ScreenOffWatchPolicyTest.kt": {
+      "bytes": 23399,
+      "sha256": "8aaf6ccce1f4d01e20a7b8e60082169bd831360c4edcd20237eece24b735ddb4"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/ScreenOnFiveSecondBudgetTest.kt": {
+      "bytes": 30616,
+      "sha256": "8beeb5a0221ea7fd92b2bfbed97c0f4f4a8124873235c7461fef65095150f26f"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/SettingsHelpTest.kt": {
+      "bytes": 6760,
+      "sha256": "ff318e74b8ea6657d3f6499d450c206b57056b5990f78c5ef34488fd99869249"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/SettingsScreenContractTest.kt": {
+      "bytes": 8535,
+      "sha256": "304b11bd9d8edae8979ad6e689b0494ecdeed2f9594f822ada5f3d3981cb7230"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/SharedVadTest.kt": {
+      "bytes": 12307,
+      "sha256": "c978bf3ba2fa303ca69ba4bec46c999d46824eeca7e065a551876da79fd222de"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/Signals.kt": {
+      "bytes": 6094,
+      "sha256": "a012fb070d9e7f5b93b9c72d9c4ba1c7f47d9f45b733ae08aff9e537fdb659e8"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/SilenceEndpointTest.kt": {
+      "bytes": 11769,
+      "sha256": "2f2697be7dd17672c3f8dbe3aa43bce602a5ddf0409ae6fac0950950cb973bc8"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/SilentInputIntakeTest.kt": {
+      "bytes": 7778,
+      "sha256": "265aac39bc1afe741398353573f7f8780b485f4f3c75f5b13820961fb089d499"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/StandbyArbitrationTest.kt": {
+      "bytes": 4406,
+      "sha256": "6208466fc51508741a0e429af4c2097a0b1d33a8680f661480f6b5e28e23be48"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/StandbySchedulingGateTest.kt": {
+      "bytes": 3519,
+      "sha256": "0fcfd2743240766a879b7376131de2dd900c3b9fa8dbd84322ee33edd405fbf1"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/SttBodyPhaseCancellationTest.kt": {
+      "bytes": 29333,
+      "sha256": "06a2fc2a83a11c359efce0f79de7acc7f4ca0adeb7919b65cc5d01a723b0ffa5"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/SttDiagnosticsTest.kt": {
+      "bytes": 12344,
+      "sha256": "cce423ceb21b86da3ab46568d18f54d2c7dfed07be9ea9fef808f24ad5a4a211"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/SttRecoveryBehaviorTest.kt": {
+      "bytes": 5983,
+      "sha256": "8b6f570602e0f863cf7fbe03ed42b2720a5ce2e6fc0fc3861dbb61d0b555383d"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/SttRecoveryTest.kt": {
+      "bytes": 15862,
+      "sha256": "0fd5e22b6c56c777932ee33d2cf813301513d1960cd3edd011842e0ff28d44c6"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/SttTransportRecoveryTest.kt": {
+      "bytes": 30335,
+      "sha256": "5d7bc24b8fdeaf834576dac474ee8242d3635728d6b7b35769a1329a8b021fe7"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/SynthesisClientTest.kt": {
+      "bytes": 3096,
+      "sha256": "43d4775da353e8bf6b781f4dcdd62694f20b979d15e2e19ef48bfb1268b7f0b0"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/SynthesisNoCutoffTest.kt": {
+      "bytes": 12495,
+      "sha256": "dbd1fcad17f0631066daa50cd638fbe5a4dd1366c4f74f4dcda0ad9727a4940d"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/TestAudio.kt": {
+      "bytes": 2846,
+      "sha256": "a88405de4038385d0b6c11fdcf5c4b014f59ab23ffa95f6c70574b50e905953b"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/TtsBatcherTest.kt": {
+      "bytes": 7807,
+      "sha256": "91931b0c71360fcf0ed6b50439c1f62410872ed8b4f29e2d6504c36ae99b5bd0"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/UnplayedReplyStoreTest.kt": {
+      "bytes": 2711,
+      "sha256": "e4efe4b66d20f59d46f5debd625a457caf42d5bb5da835e5a8aeec558c40238d"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/VadReviewMatrixTest.kt": {
+      "bytes": 16546,
+      "sha256": "cf9068d1a940f4b89620866e03d63f2bac3068ec4b210672aec88142ea19758f"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/VadUnsteadyBackgroundTest.kt": {
+      "bytes": 28776,
+      "sha256": "1c34033b8faf46c468ef1c816eef1c728c33d311c038e65f800d97e486393fb0"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/VoiceEndToEndTest.kt": {
+      "bytes": 4967,
+      "sha256": "368b4c0b94f78a01a7410e4ac5014130135a52a8a36bf2b6c6bd53736eb0a86d"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/VoiceMarkerHistoryTest.kt": {
+      "bytes": 11655,
+      "sha256": "4d13c9fcac758420a9873858a280b091e82d138dce2f4ed996dbeaa160291de6"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/VoiceMarkerTestSupport.kt": {
+      "bytes": 861,
+      "sha256": "6c3e0c2aba797bb4f9892178d89840623aaec6f68a1cf4a36adfff16e1a6d888"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/VoiceMarkerWireTest.kt": {
+      "bytes": 11100,
+      "sha256": "14063fabda5a63679e964fecd889dad7bba118ae9991fb5c12f66efcd33e3b30"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/VoiceSettingsTest.kt": {
+      "bytes": 8763,
+      "sha256": "5a8b823653d865ef4b03b216be6602b9ad9cab7dbfc9af1ef73ce120ccaf0050"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/VoiceTurnOrchestratorTest.kt": {
+      "bytes": 18915,
+      "sha256": "8d784a4d54253d362ab6c784fea8297e220f7668e372cded8aed5633422f0bdc"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WaitWhilePendingTest.kt": {
+      "bytes": 22326,
+      "sha256": "04eaac35e94b4d4636404bc036f75285ddcd120cbcfeff84e00b072faa5129ce"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WakeArbitrationTest.kt": {
+      "bytes": 28703,
+      "sha256": "5a0c0e79f73c34b4ab9cf26e31a0ff9251de7a26f0a3df9755984104d4a0ec59"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WakeClaimTransferTest.kt": {
+      "bytes": 37130,
+      "sha256": "3c78ae698c1b62151956059e3e5ba336232ad899cb93b1a2cc0742df184e9e8e"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WakeContractTest.kt": {
+      "bytes": 13956,
+      "sha256": "36f9e1391908f47513241f10937ca103a11b17b6139443c5bde5f6562848037e"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WakeCueTest.kt": {
+      "bytes": 10666,
+      "sha256": "78da5cd67cf7bdd10decc234cab2aef1255cf4f46702b1259ccb028ffc1dc0ec"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WakeDeviceControllerTest.kt": {
+      "bytes": 11235,
+      "sha256": "5599f370a719843a95b230f6137a751036e883c8dea0a70b284713bc941e3fe5"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WakeEpisodeMicrophoneTest.kt": {
+      "bytes": 10068,
+      "sha256": "1a90d23a96c9aceb2b358f2662498a49c522d07bafa511c7190a50bc6c685b84"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WatchAdaptersTest.kt": {
+      "bytes": 14111,
+      "sha256": "c38682cfa0798ae78bc10a423648e3868ea4897c1da29173396bd741abe28551"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WatchBackgroundDefaultTest.kt": {
+      "bytes": 8421,
+      "sha256": "5b437077eb2706233c120ab209a9cb738a739ed5d5194bba928cfcff8197483d"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WatchHapticsTest.kt": {
+      "bytes": 4062,
+      "sha256": "5db6cc88edae701113d7f5dceb75406fc1cba0935e4ee9b13ce16be32dd0df3c"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WatchInputIndependenceTest.kt": {
+      "bytes": 4142,
+      "sha256": "f2eeb3c5a6880534d46fb55bf6694a892c5873ee97dace694b69060bf7e4bb00"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WatchIntakeRegressionTest.kt": {
+      "bytes": 10709,
+      "sha256": "32bfca7bcfaeae9ec129ae54db27733a3fc9f560b9d0ba2a81c30c3bb1880768"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WatchLinkTest.kt": {
+      "bytes": 15066,
+      "sha256": "665f4d029437802a4e44a7607e2c056494fac4052f8627cfe932a6f7e2695b47"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WatchNavigationGuardTest.kt": {
+      "bytes": 4548,
+      "sha256": "3115840ca892cbd77eea1051f26e5887ac538dbd71cc5881231264ef707ee7fc"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WatchNavigationIntakeTest.kt": {
+      "bytes": 16031,
+      "sha256": "13ea8319f0f0ae0b7db5e31e34d9bcd5acf250d25e3b7a7e10aac5c39c24b8bb"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WatchNavigationWiringTest.kt": {
+      "bytes": 4855,
+      "sha256": "17197bd78a4c779e2e9805db7cd170ffbe6c17f3b752b872fa63852bdca86593"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WatchPlaybackProgressTest.kt": {
+      "bytes": 15084,
+      "sha256": "504437d557da71ac5c811a8f4fd82544345cfe5a92d7f109b644cba9b10db013"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WatchReaderHistoryR6Test.kt": {
+      "bytes": 5289,
+      "sha256": "e0118494e701f6636aa2863109ac8957ba6039a342a775adbf0c4842b6019e10"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WatchReaderStateTest.kt": {
+      "bytes": 9009,
+      "sha256": "2334a6a393ded7c4c7430a4166a84bf352e9bbca032fd7b6ced5d8e4a60ac59e"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WatchReaderTest.kt": {
+      "bytes": 7991,
+      "sha256": "16b66c955946c5d45b19f45528d587ce6e973e1940a0b479fdd893949aafd814"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WatchSttRecoveryTest.kt": {
+      "bytes": 7805,
+      "sha256": "d492743507ac0613eda6ac9982c3042a28b699b520b665c03aeace1f6b348e20"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WatchTalkStateTest.kt": {
+      "bytes": 4711,
+      "sha256": "1a09ddadccb7f4caa1b7ecdb235467a894dec2a830bbae2ef6f5baa714618cc7"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WatchTalkWhileWaitingTest.kt": {
+      "bytes": 5230,
+      "sha256": "8a585066860bae52409973ce552348901288cff7b31b98038959bc3aacaf6291"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WatchTransientEndpointR6Test.kt": {
+      "bytes": 8564,
+      "sha256": "09a427022589cba5845c393cdf1a5b697fd480368f2ba65b9d139dbd40a8be12"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WatchVoiceCoordinatorTest.kt": {
+      "bytes": 21028,
+      "sha256": "262c7528e9f21d69ca3ccc79ac548fb3cf5b4d413b49bd6556c1cdd9f332a9d0"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WatchVoiceN1Test.kt": {
+      "bytes": 10207,
+      "sha256": "73dfbd5fde6f5132b9e73ca31651be1f460e1d628946e744b7fec1fa1ef93e88"
+    },
+    "core/src/test/kotlin/com/rumi/hermesvoice/core/WatchVoiceSettingsPendingTest.kt": {
+      "bytes": 4391,
+      "sha256": "42e3707abd89607c94392b9b712e06c4718d227ee630c73d379319eed32a6ae7"
+    },
+    "gradle.properties": {
+      "bytes": 136,
+      "sha256": "5ff4359bb22b9436ec644207f9240f4e47b9a733fe03ba402c77944a05283574"
+    },
+    "phone/build.gradle.kts": {
+      "bytes": 4046,
+      "sha256": "cddc5f2469e00d718d69fd73cfd6f330f0edf3ffceb860d52ba00c67b4a181fa"
+    },
+    "phone/src/androidTest/kotlin/com/rumi/hermesvoice/phone/ChatPaneUiTest.kt": {
+      "bytes": 15631,
+      "sha256": "7954abaff9ddaf5a5d7849045b0e9bb57a62be2a238a569e596933c0682e55a1"
+    },
+    "phone/src/androidTest/kotlin/com/rumi/hermesvoice/phone/RoutingSettingsUiTest.kt": {
+      "bytes": 4167,
+      "sha256": "aab18cef83f73deb1174ac6c40bed62e1878fbe99db97c01673c224122bde25d"
+    },
+    "phone/src/main/AndroidManifest.xml": {
+      "bytes": 7593,
+      "sha256": "656eedf55f166dbcd16b029f01bb8085be7207b49e340b1bc74c866c415f024c"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/AndroidStores.kt": {
+      "bytes": 5245,
+      "sha256": "fa8b93241bbb826190fe9ac3e53fef6457c2df65d7b46756d6d7485a8ef28d35"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/AttachmentViewer.kt": {
+      "bytes": 12678,
+      "sha256": "b3c937a371037af2c83081c836708237b31a4d0632ec8221e4336e33f6813724"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/ChatContent.kt": {
+      "bytes": 7126,
+      "sha256": "6c70fa600b646694ce47546fedc8187ab7f9f284ac4a69ca26284bf64b72b366"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/ComposerIcons.kt": {
+      "bytes": 873,
+      "sha256": "dd4e6ac3a92b485484a763de5844b15e27ce8d3f7fdee5434d30d1bd04a9aca3"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/HeadsetAndroid.kt": {
+      "bytes": 13447,
+      "sha256": "9bc826d550ec177da5ef0f71f05a704aa71f5f691fa06255a14cd03d8b4b33ba"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/HeadsetMedia.kt": {
+      "bytes": 9898,
+      "sha256": "43eb0a2c7b3b0c85efcbd9de16690018aa59f3964b60230b35f39c893b14d1f5"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/LocalChargingObserver.kt": {
+      "bytes": 2275,
+      "sha256": "351e838e1dafb31126f5498bfa89ac2e79c2556a4507772f3db22ab82fe3030d"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/MainActivity.kt": {
+      "bytes": 80454,
+      "sha256": "4b5bbe452d99720f75630a691eb2fca3964820a452f3ea342b0cce1fc579d18c"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/MarkdownView.kt": {
+      "bytes": 10367,
+      "sha256": "cddafbd63580a20ec304b148ef3d809d6975cd938fc10cc8e9281bf0e63d0228"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/PhoneApp.kt": {
+      "bytes": 39399,
+      "sha256": "cfbf87264a6207714430d87e621bdc9057c211c734fd0c2980daa2f1b2d5f33c"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/PhoneAudio.kt": {
+      "bytes": 17912,
+      "sha256": "5f24f145a38cfd66b1f89d4e2a4d7a5ae40f2fac85986ee1f7d739a71c010321"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/PhoneBackgroundRuntime.kt": {
+      "bytes": 32050,
+      "sha256": "0ccd69186ba31d32bb27a6eddfcf3edc11b1c68c24fda81aab02fe551afd928b"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/PhoneCapture.kt": {
+      "bytes": 3789,
+      "sha256": "6633e3422ca0884e8162d3297d309a27e46ec3f7ad7b008e7bf6c75d9b767d64"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/PhoneDiagnostics.kt": {
+      "bytes": 6763,
+      "sha256": "37c9bc8bf4f4e240103297d365c0a1bc0b340f89bf51850446e9c0977bddc361"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/PhoneHaptics.kt": {
+      "bytes": 2242,
+      "sha256": "ad65f1eb9bc34628f2fe40e5f18958c2649aa130fc67569fd96c81316c283a93"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/PhoneNetworkSnapshot.kt": {
+      "bytes": 2441,
+      "sha256": "ab8dbb522d60f51e42fc0127c5daf7a5b1c25400b7ba7b1d681dcbc8b305dd64"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/PhoneRelayService.kt": {
+      "bytes": 7799,
+      "sha256": "e92c8b80ddca2e719b4e9fa2fe67e5050ebeceecdc19d29fef5e98312ef6046f"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/PhoneViewModel.kt": {
+      "bytes": 73073,
+      "sha256": "67bc897ad46d0e8fbb655873f3cfdb031f88b4e9efe4bd40cf682d717ca6df64"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/PhoneWakeController.kt": {
+      "bytes": 14704,
+      "sha256": "b4281d4eaa7f4e52c12d1f5c290a1c820b84dada1651072106432bc2b7f73aa1"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/PhoneWakeService.kt": {
+      "bytes": 8359,
+      "sha256": "f048d218ec0a77c55c7fb7cd7e47658ab7188f982a0315d1a216e2ed7432a7b7"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/PhoneWatchBridge.kt": {
+      "bytes": 11320,
+      "sha256": "60ed6e4d77a870293263cbd3e70ca31353a6bd2bfc622e68800ab286c15fabb4"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/PrivateAudioHub.kt": {
+      "bytes": 2823,
+      "sha256": "e03fcba38f7d3aa2a8e9d76e7862abf52e00a2f60bedd8782a6033412d44af71"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/RecordingCues.kt": {
+      "bytes": 13120,
+      "sha256": "c669a3d62e7012d71109c539d98518fc92028e01ff88a70ca6fd3819ce027fcc"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/ReplyAlertNotifier.kt": {
+      "bytes": 9666,
+      "sha256": "59c6b6e162ab7d000b5ce2f12c670eba00113767fad60815e4f2f3152caeb344"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/SignIn.kt": {
+      "bytes": 2074,
+      "sha256": "501ef16ecc6efe50de8ee39aaf15a772b01f55796a78e98e076e4b5a18767c2b"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/StandbyScheduler.kt": {
+      "bytes": 2336,
+      "sha256": "7d6875b5b62b8e7c347c1dc0e8960f0babd569a39b7aaf030d719c52a9d7f072"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/Theme.kt": {
+      "bytes": 2426,
+      "sha256": "985f1900a8a522b5e8ebcc8f3f529fe211621098fa7e1aa97511e3fa1bec1bbb"
+    },
+    "phone/src/main/kotlin/com/rumi/hermesvoice/phone/ViewedFiles.kt": {
+      "bytes": 3011,
+      "sha256": "f95421ec45fe77d3ca87a17341c2ebfac963146ca68c82ba58d6ddec36add907"
+    },
+    "phone/src/main/res/drawable/ic_launcher_background.xml": {
+      "bytes": 791,
+      "sha256": "57ed9663eec7b797b724e20f69a08e69c1ddc49dbe9ff8cae2722e8a1de806b7"
+    },
+    "phone/src/main/res/drawable/ic_launcher_foreground.xml": {
+      "bytes": 838,
+      "sha256": "a000b47931ba891628ef0c69eac4dda12f0ca25d04918f3aba0b562cf7e7c9e8"
+    },
+    "phone/src/main/res/drawable/ic_launcher_monochrome.xml": {
+      "bytes": 857,
+      "sha256": "67e369af21bd3e2592129dd21fa994a94d6d71a9263c96f5c2e24a08dddb446d"
+    },
+    "phone/src/main/res/drawable/ic_stat_voice.xml": {
+      "bytes": 517,
+      "sha256": "3e2d7a7ce5ae3813dc0f85e7ceac486c5ba94880994579d0e675817715e711ca"
+    },
+    "phone/src/main/res/mipmap-anydpi-v26/ic_launcher.xml": {
+      "bytes": 273,
+      "sha256": "1c832bf194d8eecd439a92bcced0df144c9f566b934b3d7865e983d8ee8dbdeb"
+    },
+    "phone/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml": {
+      "bytes": 273,
+      "sha256": "1c832bf194d8eecd439a92bcced0df144c9f566b934b3d7865e983d8ee8dbdeb"
+    },
+    "phone/src/main/res/mipmap-anydpi-v33/ic_launcher.xml": {
+      "bytes": 344,
+      "sha256": "ada31da9e23f4520f3753e71ca23799a107431473daa3774b6cecac26847260c"
+    },
+    "phone/src/main/res/mipmap-anydpi-v33/ic_launcher_round.xml": {
+      "bytes": 344,
+      "sha256": "ada31da9e23f4520f3753e71ca23799a107431473daa3774b6cecac26847260c"
+    },
+    "phone/src/main/res/values/strings.xml": {
+      "bytes": 114,
+      "sha256": "8d4b818a86f7b9dda122ebda89b91bf24fce23aa7afb072f0bc66556f815c73b"
+    },
+    "phone/src/main/res/values/themes.xml": {
+      "bytes": 390,
+      "sha256": "63384ba02eb952d9ff7e0ecc7f7d510a64715616f61fda8944364dbd5f824662"
+    },
+    "phone/src/main/res/values/wear.xml": {
+      "bytes": 268,
+      "sha256": "b7d9a52ef61b8f31793ecd45f3f7e07db4f7efd49f21cf148e7d51d5545d1eab"
+    },
+    "phone/src/main/res/xml/backup_rules.xml": {
+      "bytes": 585,
+      "sha256": "053e41bab1e12427cd39cd9670a618bee95c69c347d77912d1c99df64ff4a0f0"
+    },
+    "phone/src/main/res/xml/data_extraction_rules.xml": {
+      "bytes": 614,
+      "sha256": "082b1bd951cfccd217202ad34538a2d91c73afd570ef390792d97b5786e96bb2"
+    },
+    "phone/src/main/res/xml/diag_share_paths.xml": {
+      "bytes": 353,
+      "sha256": "ace56dd9ee2aa58d8b6b9b966a8af01ec0bf8236e3d4fecd3b40d724d3f58f9a"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/core/FakeHermesDashboard.kt": {
+      "bytes": 42607,
+      "sha256": "adac1cccc23dadc5bb01e3ee44c8e4a48d425185abb133c26279bdd617b0b48b"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/core/HeadsetGear.kt": {
+      "bytes": 2541,
+      "sha256": "f536ab470a77654c21e463201ec8d52adee5d9f2c129079de322bc3195c23614"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/core/TestAudio.kt": {
+      "bytes": 2846,
+      "sha256": "a88405de4038385d0b6c11fdcf5c4b014f59ab23ffa95f6c70574b50e905953b"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/core/VoiceMarkerTestSupport.kt": {
+      "bytes": 861,
+      "sha256": "6c3e0c2aba797bb4f9892178d89840623aaec6f68a1cf4a36adfff16e1a6d888"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/ChargingWakeR7PhoneRoboTest.kt": {
+      "bytes": 15173,
+      "sha256": "e4d48983e954d6ac7ad566146cb8fb4a3df3d49f561e9da12a66a780b2cf2233"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/ChargingWakeR7SettingsUiRoboTest.kt": {
+      "bytes": 5667,
+      "sha256": "b3b039fb6b36620a69358860a0ec6a6fb69c1e2c3affc7a453713b1d99b7608f"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/FakeAndroidKeyStore.kt": {
+      "bytes": 3535,
+      "sha256": "b52d6e4580d1cf27e7e1c98d8858a9cee2b20f223709bc03573a2bdd86b8bfc7"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/HeadsetDisconnectedR7RoboTest.kt": {
+      "bytes": 3532,
+      "sha256": "fb3b8d74511cb05cff72ffbaabbe73d87a012b47a0ae70414497cc47619e04a4"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneActivityRoboTest.kt": {
+      "bytes": 7791,
+      "sha256": "57c10bde6c7807c1b4c221a1622cd38fee54a5e249a3cac5bb29bb01f8e10c6e"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneAlertDismissRoboTest.kt": {
+      "bytes": 9475,
+      "sha256": "2911d1a7b1386e0999426c289697674a379b58faba2eb88c008ec0a58836de23"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneAudioRecoveryClassTest.kt": {
+      "bytes": 9249,
+      "sha256": "a0a137d26e2ae5ebe28822d2f6124a335963f74bb768597d40fd95ddad8d26ee"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneChatPaneBubbleTest.kt": {
+      "bytes": 4844,
+      "sha256": "2aad0a800a0288f70cf4ecce74e1777da6dc6f6ab5284ff5092d0e06bc730b9e"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneComposerFlowRoboTest.kt": {
+      "bytes": 13057,
+      "sha256": "7e568717d3cbafefe092117d812ba6d8a0298ff4423404f99d8cedb81321ceb1"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneComposerRoboTest.kt": {
+      "bytes": 7397,
+      "sha256": "abab713bba91d40c42d8ea5a4b246184355782f1538430b193b2cc03488974bb"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneCueFocusRouteTest.kt": {
+      "bytes": 25815,
+      "sha256": "d4584d6bc1e38acbb5e6092e8166ea4ea5e6f5d6f28e58b8830814b8e4ec7d7f"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneForegroundEligibilityTest.kt": {
+      "bytes": 2525,
+      "sha256": "d23e699b0ef72adc8fdc437e1fbf54f49cddfa2eac699859248e9559bb7e8fad"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneHeadsetHiddenControlTest.kt": {
+      "bytes": 21409,
+      "sha256": "37e1d863383d59d5e435108c996927455d0596d98ef5f2c46c8ee571068a8443"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneHeadsetMediaControlTest.kt": {
+      "bytes": 11324,
+      "sha256": "807a304348e8f1486af058fa04de3564779b4f9056a153ab1ad7256182a30874"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneHeadsetRecorderTest.kt": {
+      "bytes": 11504,
+      "sha256": "b92214c3da255b48b15d5dc8c5b61cf79e88321a1a04e2161db002be778f0db3"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneHeadsetRecordingFlowTest.kt": {
+      "bytes": 21472,
+      "sha256": "598e683b127cf72ebd7173abe16762d8b6681530b42287ba6242a5d4be6a88bc"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneHeadsetSettingsTest.kt": {
+      "bytes": 2330,
+      "sha256": "11c389714d29cc1ac128bbec151bfbdab1bc923a7fe7fe1d0d68b0193bbfd5ad"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneHeadsetSinkTest.kt": {
+      "bytes": 10221,
+      "sha256": "bb0b19e168e00998908575c7e78f6ae0fd5b5e0f309132f545a112d21a793ee0"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneLegacyAlertDismissRoboTest.kt": {
+      "bytes": 14223,
+      "sha256": "04723dd3dcfef5869a4c5b7b536c9af94d2ae1938fb62f75a18e9dd2f96397c5"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneMarkdownRoboTest.kt": {
+      "bytes": 10291,
+      "sha256": "23f14b508d50d8d52c1c2f2641a7dfa20edee8c134f1ea093d172e85d0411acb"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneMessageSelectionTest.kt": {
+      "bytes": 12407,
+      "sha256": "5b7d3c7065b3fc68f3b534510e64f7c1916f90073d4ac74a921c8fdc1d39bb31"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneNetworkDiagnosticsRoboTest.kt": {
+      "bytes": 15875,
+      "sha256": "cbc24a647e0bdfe967c5675fbb09ca81b13dbba23b84fa0eb8d7cbc270c0f21a"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhonePrivateAudioHubTest.kt": {
+      "bytes": 7473,
+      "sha256": "27dfef9dab3d96b3014a3d0d4a5c55a478b3b8a5fd2d8c2920f6b02eca4e5c68"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhonePrivateSpeakerRouteTest.kt": {
+      "bytes": 30610,
+      "sha256": "972ea0746e535b90d280f4eefdf5042889b91f5e6dd839778b8ee59d5e82d788"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneQuietReplyAlertTest.kt": {
+      "bytes": 3496,
+      "sha256": "6ecea64b52336179716db6371f135ad2064f33443da1a1e03c9e48b1d7faf3ce"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneRecorderAdmissionTest.kt": {
+      "bytes": 3714,
+      "sha256": "2b76fb44cd49c25a2713d47c3be315dd06f7197fdd1e5f9875271544c14d60b4"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneRecordingCuesTest.kt": {
+      "bytes": 6948,
+      "sha256": "8d569e7929a8404cdc36e9df36bfb333ca61e2bfcfc966e103154aa06dc4b1cf"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneReplyAlertRoboTest.kt": {
+      "bytes": 18151,
+      "sha256": "b43a8714fb6acf55888119fa76faac42b03811f73710fad206f6635abf864e52"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneReplyAlertSurfaceTest.kt": {
+      "bytes": 4856,
+      "sha256": "c3fe733586019174ae7c466148f638bd0efe6acf44c2ff8aab1fb51e8c9d517b"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneReplyPreviewSurfaceTest.kt": {
+      "bytes": 6908,
+      "sha256": "7072e49c6709cb31929047de680a6a2158a1f0635b6a0797380fc6206e56d207"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneRestartPersistenceHarnessTest.kt": {
+      "bytes": 2113,
+      "sha256": "c34f3fa629a8874ac0f6f78a452abcf1ddded5cb1302396d5f6f367af40f5e94"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneRetryScopeRoboTest.kt": {
+      "bytes": 15242,
+      "sha256": "c336eca47785436c87dcadc8cb9b5f2168376edd8b259210b8b2081862b9a101"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneRoboSupport.kt": {
+      "bytes": 7301,
+      "sha256": "0de15fac56aa69bdd19017265b15f2c73332b7ad0090879224ecae5fff1a72da"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneSentBubbleRoboTest.kt": {
+      "bytes": 8220,
+      "sha256": "5c6c877d165a93e0a48c1a53fb7024e4b40d5e9c6967cbfaf5bdc14b7c49ed00"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneWatchReceiptDeliveryTest.kt": {
+      "bytes": 7838,
+      "sha256": "ab5522340fe98c1da8d162e1b6bb499baf6cce52032891e79880ce3ac0d62dfe"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/PhoneWatchReplayPathTest.kt": {
+      "bytes": 6423,
+      "sha256": "bdf222c92b113b737983a06d475b47424ba9f861a1da87a50cbef032c3bd15ee"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/R5PhoneBackgroundAnswersTest.kt": {
+      "bytes": 11729,
+      "sha256": "e356ffed444bf590c34507368dd02c107d654e3ba1dd9323b33a3f29d400b1c5"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/R5PhoneFailedClearFenceTest.kt": {
+      "bytes": 7558,
+      "sha256": "35d16158b6f5306fd5c08e1671991b1bed46011453ce22fa8480ee29dc787775"
+    },
+    "phone/src/test/kotlin/com/rumi/hermesvoice/phone/R5PhoneUnplayedRevocationTest.kt": {
+      "bytes": 9953,
+      "sha256": "7d6632576e0600efc02bf55ae1019e60848d13e3228116484aeafff775ae684d"
+    },
+    "scripts/core-jvm-check.sh": {
+      "bytes": 2931,
+      "sha256": "19789c588928c73db6d4b2dabfe559e18122e1cfea97aeb90960cde2f48777f6"
+    },
+    "settings.gradle.kts": {
+      "bytes": 368,
+      "sha256": "ed53a7b4c3d595e3199f644adaf8c604847d54122ffdffa5440deab176d4da8a"
+    },
+    "watch/build.gradle.kts": {
+      "bytes": 4243,
+      "sha256": "832118b24c18aa3ddd75edc3674dab6c15bb5b02da06fbb9c4b2e2fe9472f34b"
+    },
+    "watch/src/androidTest/kotlin/com/rumi/hermesvoice/watch/HoldToTalkUiTest.kt": {
+      "bytes": 15066,
+      "sha256": "80d5bdee411c2f711166afebdd8f7d860ab3c8041d63153b081d0aa61593c9ae"
+    },
+    "watch/src/main/AndroidManifest.xml": {
+      "bytes": 4023,
+      "sha256": "e3ac75586ce0cd5fab5acc5e6a1b8f10348048b0d007c6e849ede496938f1c9f"
+    },
+    "watch/src/main/kotlin/com/rumi/hermesvoice/watch/LocalChargingObserver.kt": {
+      "bytes": 2275,
+      "sha256": "4396599152407a37b36a4b8fb6832b8c7c5137ffccaa71d00ad953dcfbc8fb4e"
+    },
+    "watch/src/main/kotlin/com/rumi/hermesvoice/watch/MarkdownWatch.kt": {
+      "bytes": 2166,
+      "sha256": "ccb52c497f778581fcf3b4cb76819e8b89c8d127b39d73af0f58a2ef89128c1b"
+    },
+    "watch/src/main/kotlin/com/rumi/hermesvoice/watch/ReaderUi.kt": {
+      "bytes": 22938,
+      "sha256": "3749904b0b3f6bce2f4ef1c19f7f7e9604e32759bce66ea1ee7b28d89a7f80ca"
+    },
+    "watch/src/main/kotlin/com/rumi/hermesvoice/watch/StandbyScheduler.kt": {
+      "bytes": 2321,
+      "sha256": "a50b7349ce90340c9e7f11348c6e37b08da5cbdc30044958e7458e9943196c94"
+    },
+    "watch/src/main/kotlin/com/rumi/hermesvoice/watch/WakeController.kt": {
+      "bytes": 9667,
+      "sha256": "d56d84bf5026196e9534f5cea3188c67592dd390ad74d60d87d7a0c803b60804"
+    },
+    "watch/src/main/kotlin/com/rumi/hermesvoice/watch/WatchActivity.kt": {
+      "bytes": 20789,
+      "sha256": "6ab6df033a977766fc3b12686a3baeafbe39e2a8d7cd2dbde28f17b41a1ac34c"
+    },
+    "watch/src/main/kotlin/com/rumi/hermesvoice/watch/WatchApp.kt": {
+      "bytes": 53522,
+      "sha256": "1957fb4de23acb3c870836aeebf80ee123947d5e382c96f147d2ce8269f5c98d"
+    },
+    "watch/src/main/kotlin/com/rumi/hermesvoice/watch/WatchCapture.kt": {
+      "bytes": 3043,
+      "sha256": "bb155d7b7adf45acfb05a4cba0367679945b91bbb7c1080f588a9ee37c53c5f5"
+    },
+    "watch/src/main/kotlin/com/rumi/hermesvoice/watch/WatchListenerService.kt": {
+      "bytes": 5023,
+      "sha256": "e8d640e5be96f36ea43911b6a1b6eb05215c3a7b3232a314efb0ee3860057340"
+    },
+    "watch/src/main/kotlin/com/rumi/hermesvoice/watch/WatchReplyAlertNotifier.kt": {
+      "bytes": 8906,
+      "sha256": "44b7fd1a185c268ef4a0bbb71c4df375a7b22bf45c22198da0f65391917207fd"
+    },
+    "watch/src/main/kotlin/com/rumi/hermesvoice/watch/WatchVoiceRuntime.kt": {
+      "bytes": 32721,
+      "sha256": "7dc8973f08cda769a796008c4245659129330a49d1dd8c09c5d797b13fbacf59"
+    },
+    "watch/src/main/kotlin/com/rumi/hermesvoice/watch/WatchVoiceService.kt": {
+      "bytes": 7531,
+      "sha256": "87dc4f6d05a5819b7df868c9cc4d6a45e016c1041bed2ff7b0831b23265f4570"
+    },
+    "watch/src/main/res/drawable/ic_launcher_background.xml": {
+      "bytes": 791,
+      "sha256": "57ed9663eec7b797b724e20f69a08e69c1ddc49dbe9ff8cae2722e8a1de806b7"
+    },
+    "watch/src/main/res/drawable/ic_launcher_foreground.xml": {
+      "bytes": 838,
+      "sha256": "a000b47931ba891628ef0c69eac4dda12f0ca25d04918f3aba0b562cf7e7c9e8"
+    },
+    "watch/src/main/res/drawable/ic_launcher_monochrome.xml": {
+      "bytes": 857,
+      "sha256": "67e369af21bd3e2592129dd21fa994a94d6d71a9263c96f5c2e24a08dddb446d"
+    },
+    "watch/src/main/res/drawable/ic_stat_voice.xml": {
+      "bytes": 521,
+      "sha256": "70ebdd6f970b4c88d4fc8bed6e738e6cbf821b7da52c7748cbb99e7bc4d5b428"
+    },
+    "watch/src/main/res/mipmap-anydpi-v26/ic_launcher.xml": {
+      "bytes": 273,
+      "sha256": "1c832bf194d8eecd439a92bcced0df144c9f566b934b3d7865e983d8ee8dbdeb"
+    },
+    "watch/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml": {
+      "bytes": 273,
+      "sha256": "1c832bf194d8eecd439a92bcced0df144c9f566b934b3d7865e983d8ee8dbdeb"
+    },
+    "watch/src/main/res/mipmap-anydpi-v33/ic_launcher.xml": {
+      "bytes": 344,
+      "sha256": "ada31da9e23f4520f3753e71ca23799a107431473daa3774b6cecac26847260c"
+    },
+    "watch/src/main/res/mipmap-anydpi-v33/ic_launcher_round.xml": {
+      "bytes": 344,
+      "sha256": "ada31da9e23f4520f3753e71ca23799a107431473daa3774b6cecac26847260c"
+    },
+    "watch/src/main/res/values/strings.xml": {
+      "bytes": 114,
+      "sha256": "8d4b818a86f7b9dda122ebda89b91bf24fce23aa7afb072f0bc66556f815c73b"
+    },
+    "watch/src/main/res/values/themes.xml": {
+      "bytes": 581,
+      "sha256": "10ac368059e7ead9387f9960ef715cc6054b8f27e5ee5b56284f8447d580d29b"
+    },
+    "watch/src/main/res/values/wear.xml": {
+      "bytes": 221,
+      "sha256": "dad88b6bc447a67784903cd8ca75c0abe2ee971256d1f8cf7ced4c13b76f1111"
+    },
+    "watch/src/main/res/xml/backup_rules.xml": {
+      "bytes": 265,
+      "sha256": "d5a70c0c8528ef890b15696563e7f9b297d76436c07394b36773781bf5181898"
+    },
+    "watch/src/main/res/xml/data_extraction_rules.xml": {
+      "bytes": 324,
+      "sha256": "fddc966a4f581e611c98bccde68f1d3bcc54fed55d5a208e569fd2ce4fff6869"
+    },
+    "watch/src/test/kotlin/com/rumi/hermesvoice/watch/ChargingWakeR7WatchRoboTest.kt": {
+      "bytes": 13565,
+      "sha256": "5231cecae91ceb6eb78c00307758678a7a76f699b96fc8c3e0ef5d21dc4256c3"
+    },
+    "watch/src/test/kotlin/com/rumi/hermesvoice/watch/RecordingVibratorShadow.kt": {
+      "bytes": 1034,
+      "sha256": "abdf762a8fca97a94ee04bfbbaa7c1114ac1db423230406fe0e0c1895b78e700"
+    },
+    "watch/src/test/kotlin/com/rumi/hermesvoice/watch/ScreenOffJson.kt": {
+      "bytes": 325,
+      "sha256": "2184fa62edd08d3796a36fc2a7406f56b8c15c5aef7d7b607dca86d72c4ed2c5"
+    },
+    "watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchAlertDismissRoboTest.kt": {
+      "bytes": 10576,
+      "sha256": "ccc3ab7f878ecc2b0f1b4514c4e3d906706671a161e0ad9c89a562ac431006ec"
+    },
+    "watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchClearLogChipRoboTest.kt": {
+      "bytes": 4430,
+      "sha256": "f668654fefe68cb5264ea9fd2a505512f5e788e178e36defcaab3c1f68c3fecd"
+    },
+    "watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchDefaultBackgroundRoboTest.kt": {
+      "bytes": 84335,
+      "sha256": "1cebc8ea1822bc02c872f76a1f4f8c320265e6cd8781aa77297e5ea5af2ea063"
+    },
+    "watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchDiagBoundaryRoboTest.kt": {
+      "bytes": 11257,
+      "sha256": "145b90ac6a654c5749d5a0aaa68d40b0616b688bed296b68682a20ca65bf50c5"
+    },
+    "watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchForegroundSeparationRoboTest.kt": {
+      "bytes": 8368,
+      "sha256": "c53b767cdcb306909a17a9b335161cad0688bef9fadbfcec1e7825cfb88865d9"
+    },
+    "watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchLegacyAlertDismissRoboTest.kt": {
+      "bytes": 17077,
+      "sha256": "400416b9d396763da6d55f9f40676c71317a631745254c4438ff0a8787f9891c"
+    },
+    "watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchMarkdownRoboTest.kt": {
+      "bytes": 4944,
+      "sha256": "e53a077478535e49fb13a4df8ee418647ba763cf7def2291d8debcb6d4c3a2dc"
+    },
+    "watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchNavigationRoboTest.kt": {
+      "bytes": 11937,
+      "sha256": "c835e3340b5be0460443be367cc98deb3b236a0fa8071d5b914c3163da225408"
+    },
+    "watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchNetworkDiagnosticsRoboTest.kt": {
+      "bytes": 12193,
+      "sha256": "1060e83b6404ca911ae80f4670e25e43f814d010552933d6a9f4f42c991cb5ae"
+    },
+    "watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchPrivateAudioRoboTest.kt": {
+      "bytes": 9754,
+      "sha256": "73075638814991e8c1be0d012836f9b44732396df922d9ce4b63fe77cc2673ef"
+    },
+    "watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchReaderRelayR6RoboTest.kt": {
+      "bytes": 8111,
+      "sha256": "e852e2fd4589be4ca0eb89dd2876495e0a0837f825810ee6941899916bef0a1f"
+    },
+    "watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchReaderRenderR6RoboTest.kt": {
+      "bytes": 4954,
+      "sha256": "53f7079d5442f89d79618c66bfc94dff8721169b7253dc4389eb7dd66f85d70f"
+    },
+    "watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchReplayPathRoboTest.kt": {
+      "bytes": 7472,
+      "sha256": "1806d0aae2a8763338d04a78a3bf9b592935e7d6021559106550414f2fa5777e"
+    },
+    "watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchReplyAlertRoboTest.kt": {
+      "bytes": 11607,
+      "sha256": "7ae0b5887c725ed92abd7371747848ac695c3cc9395407427eccccbb8f751635"
+    },
+    "watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchScreenOffRoboTest.kt": {
+      "bytes": 14647,
+      "sha256": "46aaace5368192174561dadeb638a457c0aeb545725cd466df6cef986a241b81"
+    },
+    "watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchStandbyAlarmRoboTest.kt": {
+      "bytes": 9504,
+      "sha256": "b433943796c4fd931398161432e3086c356a9d0f370c84a71cbd8012051c9a52"
+    },
+    "watch/src/test/kotlin/com/rumi/hermesvoice/watch/WatchStandbyOffTimerRoboTest.kt": {
+      "bytes": 15920,
+      "sha256": "e02088ed77c245b945b1c110f0a0883379a2d8571ff94082aecb69d9c369533f"
+    }
+  }
+}

@@ -13,6 +13,7 @@ object BackgroundText {
         status.microphone && loop == WakeLoop.RETRYING -> "Wake phrase paused, retrying (phone or recognizer not ready). Replies play here"
         // Asked for, not armed yet (the service is still entering the foreground).
         status.microphone && loop == WakeLoop.WAITING_FOR_SCREEN -> "Wake phrase waiting for the screen (screen-off recognition is off). Replies play here"
+        status.microphone && loop == WakeLoop.NOT_SELECTED -> "Wake phrase off for this watch (Listen on does not include it). Replies play here"
         status.microphone && loop == WakeLoop.OFF -> "Starting the wake phrase. Replies play here"
         status.microphone -> "Listening for the wake phrase. Replies play here"
         else -> "Replies play here. " + when (status.notice) {
@@ -31,6 +32,7 @@ object BackgroundText {
         BackgroundNotice.LISTENING -> when (loop) {
             WakeLoop.RETRYING -> "Background: retrying"
             WakeLoop.WAITING_FOR_SCREEN -> "Background: waiting for screen"
+            WakeLoop.NOT_SELECTED -> "Background: not selected in Listen on"
             else -> "Background: listening"
         }
         BackgroundNotice.RUNNING -> "Background: replies only"
@@ -62,6 +64,7 @@ object BackgroundText {
         !status.session.microphone -> "Not listening: " + phoneWakeBlocked(status.session.notice)
         status.loop == WakeLoop.RETRYING -> "Wake phrase paused, retrying (recognizer not ready)"
         status.loop == WakeLoop.NO_RECOGNIZER -> "Not listening: no on-device recognizer for the wake phrase"
+        status.loop == WakeLoop.NOT_SELECTED -> "Not listening: Listen on does not include this phone"
         status.loop == WakeLoop.WAITING_FOR_SCREEN -> "Waiting for the screen: screen-off recognition is off for this phone"
         status.listeningNow -> "Listening for the wake phrase"
         else -> "Listens for the wake phrase when this app is closed"
@@ -74,6 +77,7 @@ object BackgroundText {
         BackgroundNotice.REFUSED, BackgroundNotice.NEEDS_VISIBLE -> "Couldn't start. Open this app and switch it on again"
         BackgroundNotice.LISTENING -> when {
             status.loop == WakeLoop.RETRYING -> "On, retrying: the recognizer isn't ready"
+            status.loop == WakeLoop.NOT_SELECTED -> "On, not listening: Listen on does not include this phone"
             status.loop == WakeLoop.WAITING_FOR_SCREEN -> "On, waiting for the screen: recognition with the screen off is off for this phone"
             status.listeningNow -> "Listening in the background now"
             else -> "On: listens when this app is closed"

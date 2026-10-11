@@ -112,11 +112,10 @@ class OffTimerContractTest {
         return w
     }
 
-    @Test fun `hidden, a pending quiet gap does not survive standby OFF while push-to-talk records`() { hiddenGapPttOff(Gap.QUIET_TIMEOUT, WakeLocation.OFF) }
-    @Test fun `hidden, a pending 1 s failure retry does not survive standby OFF while push-to-talk records`() { hiddenGapPttOff(Gap.FAILURE_BACKOFF, WakeLocation.OFF) }
-    @Test fun `hidden, a pending blocked retry does not survive standby OFF while push-to-talk records`() { hiddenGapPttOff(Gap.BLOCKED_UNREACHABLE, WakeLocation.OFF) }
-    @Test fun `hidden, a pending cooldown re-arm does not survive standby OFF while push-to-talk records`() { hiddenGapPttOff(Gap.COOLDOWN, WakeLocation.OFF) }
-    @Test fun `hidden with the foreground location on the Watch, a pending gap does not survive standby OFF while push-to-talk records`() { hiddenGapPttOff(Gap.QUIET_TIMEOUT, WakeLocation.WATCH) }
+    @Test fun `hidden, a pending quiet gap does not survive standby OFF while push-to-talk records`() { hiddenGapPttOff(Gap.QUIET_TIMEOUT, WakeLocation.WATCH) }
+    @Test fun `hidden, a pending 1 s failure retry does not survive standby OFF while push-to-talk records`() { hiddenGapPttOff(Gap.FAILURE_BACKOFF, WakeLocation.WATCH) }
+    @Test fun `hidden, a pending blocked retry does not survive standby OFF while push-to-talk records`() { hiddenGapPttOff(Gap.BLOCKED_UNREACHABLE, WakeLocation.WATCH) }
+    @Test fun `hidden, a pending cooldown re-arm does not survive standby OFF while push-to-talk records`() { hiddenGapPttOff(Gap.COOLDOWN, WakeLocation.WATCH) }
     @Test fun `hidden with both switches on and the location Both, OFF on the Watch alone cancels the Watch gap and keeps the recording`() { hiddenGapPttOff(Gap.QUIET_TIMEOUT, WakeLocation.BOTH, phoneStandby = true) }
 
     // ── 2. the selected-foreground window ends into a gap, a recording starts, the app is hidden, then OFF ─
@@ -172,7 +171,7 @@ class OffTimerContractTest {
     }
 
     @Test fun `hidden and screen off, a pending gap and a push-to-talk, OFF leaves no timer`() {
-        val w = ComposedWatch(WakeLocation.OFF, watchStandby = true)
+        val w = ComposedWatch(WakeLocation.WATCH, watchStandby = true)
         w.show(); w.start(); w.hide()
         w.screenOn = false; w.coordinator.onScreenOff(); w.drain()
         w.pendingTimer(Gap.QUIET_TIMEOUT)
@@ -185,7 +184,7 @@ class OffTimerContractTest {
     }
 
     @Test fun `screen on again after OFF while hidden-armed and recording does not bring a timer back`() {
-        val w = ComposedWatch(WakeLocation.OFF, watchStandby = true)
+        val w = ComposedWatch(WakeLocation.WATCH, watchStandby = true)
         w.show(); w.start(); w.hide()
         w.screenOn = false; w.coordinator.onScreenOff(); w.drain()
         w.pendingTimer(Gap.QUIET_TIMEOUT)
@@ -200,7 +199,7 @@ class OffTimerContractTest {
     // ── 4. repeated OFF and the other entry (settings events) ────────────────────────────────
 
     @Test fun `repeated OFF events and unrelated settings revisions keep the recording and add no timer`() {
-        val w = ComposedWatch(WakeLocation.OFF, watchStandby = true)
+        val w = ComposedWatch(WakeLocation.WATCH, watchStandby = true)
         w.show(); w.start(); w.hide()
         w.pendingTimer(Gap.QUIET_TIMEOUT)
         w.pttStarts()
@@ -215,7 +214,7 @@ class OffTimerContractTest {
     // ── 5. accepted hands-free recording and its claim (NB1 witness: no standby_off follow-up) ─
 
     @Test fun `OFF during an accepted hands-free recording schedules no retry, keeps the recording and never reports a standby_off close`() {
-        val w = ComposedWatch(WakeLocation.OFF, watchStandby = true)
+        val w = ComposedWatch(WakeLocation.WATCH, watchStandby = true)
         w.show(); w.start(); w.hide()
         w.heard("루미"); w.handoffDue()
         assertTrue(w.capturing)
@@ -233,7 +232,7 @@ class OffTimerContractTest {
     }
 
     @Test fun `OFF during an arbitrated accepted recording keeps the claim, never releases it and schedules no retry`() {
-        val w = ComposedWatch(WakeLocation.OFF, arbitrated = true, watchStandby = true, phoneStandby = true)
+        val w = ComposedWatch(WakeLocation.BOTH, arbitrated = true, watchStandby = true, phoneStandby = true)
         w.show(); w.start(); w.hide()
         w.heard("루미")
         w.wake.onClaimVerdict("claim-1", ClaimVerdict.GRANTED); w.drain()
@@ -249,10 +248,10 @@ class OffTimerContractTest {
         w.lateDueOpensNothing("arbitrated accepted recording, OFF")
     }
 
-    // ── 6. the two switches are independent; foreground location is a separate axis ──────────
+    // ── 6. the two switches are independent; "Listen on" is the master gate above both ──────────
 
     @Test fun `the Phone switch turning OFF leaves the Watch's pending gap and its listening alone`() {
-        val w = ComposedWatch(WakeLocation.OFF, watchStandby = true, phoneStandby = true)
+        val w = ComposedWatch(WakeLocation.BOTH, watchStandby = true, phoneStandby = true)
         w.show(); w.start(); w.hide()
         val delay = w.pendingTimer(Gap.QUIET_TIMEOUT)
         w.standbyChange(phone = false)
@@ -263,7 +262,7 @@ class OffTimerContractTest {
     }
 
     @Test fun `the Watch switch turning OFF stops the Watch whatever the Phone switch says`() {
-        val w = ComposedWatch(WakeLocation.OFF, watchStandby = true, phoneStandby = true)
+        val w = ComposedWatch(WakeLocation.BOTH, watchStandby = true, phoneStandby = true)
         w.show(); w.start(); w.hide()
         w.pendingTimer(Gap.QUIET_TIMEOUT)
         w.standbyChange(watch = false)
@@ -283,14 +282,15 @@ class OffTimerContractTest {
         w.assertIdleListeningGone("selected foreground, standby OFF, hidden")
     }
 
-    @Test fun `excluded foreground with standby ON stays excluded on screen and listens only hidden`() {
-        val w = ComposedWatch(WakeLocation.OFF, watchStandby = true)
+    @Test fun `a Watch that Listen on excludes never listens with standby ON, on screen or hidden`() {
+        val w = ComposedWatch(WakeLocation.PHONE, watchStandby = true)
         w.show(); w.start()
-        assertFalse("foreground excluded while on screen", w.windowOpen)
+        assertFalse("not selected: nothing listens on screen", w.windowOpen)
         w.hide()
-        assertTrue("standby listens hidden", w.windowOpen)
+        assertFalse("standby does not select it", w.windowOpen)
+        assertNull("and no retry is pending", w.rearmIn)
         w.show()
-        assertFalse("excluded again on screen", w.windowOpen)
+        assertFalse("still excluded on screen", w.windowOpen)
     }
 
     // ── 7. policy-only adversarial coverage (not by itself a caller-path defect) ─────────────

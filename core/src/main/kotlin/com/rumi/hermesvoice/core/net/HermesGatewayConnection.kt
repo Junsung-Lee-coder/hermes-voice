@@ -154,8 +154,8 @@ class HermesGatewayConnection private constructor() : GatewayRpc, Closeable {
 
     private fun closeError(code: Int, reason: String): HermesException = when (code) {
         4401 -> HermesAuthRequiredException("gateway rejected the WebSocket credential")
-        4403 -> HermesProtocolException("gateway refused the connection (host/origin or embedded chat disabled)")
-        else -> HermesProtocolException("gateway closed ($code${if (reason.isBlank()) "" else ": ${reason.take(120)}"})")
+        4403 -> com.rumi.hermesvoice.core.HermesGatewayClosedException(4403, "gateway refused the connection (host/origin or embedded chat disabled)")
+        else -> com.rumi.hermesvoice.core.HermesGatewayClosedException(code, "gateway closed ($code${if (reason.isBlank()) "" else ": ${reason.take(120)}"})")
     }
 
     companion object {

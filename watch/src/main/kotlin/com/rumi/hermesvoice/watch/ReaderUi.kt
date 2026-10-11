@@ -28,6 +28,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -65,6 +67,7 @@ import com.rumi.hermesvoice.core.watchlink.SwipeTracker
 import com.rumi.hermesvoice.core.watchlink.WatchPhase
 import com.rumi.hermesvoice.core.watchlink.WatchTalkState
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.first
 
 /**
  * Root horizontal-swipe detector. It watches the Final pass, after the lists and buttons had
@@ -220,8 +223,9 @@ private fun Bubble(message: ReaderMessageRow) {
                 .padding(horizontal = 9.dp, vertical = 6.dp)
                 .testTag(if (message.sent) "bubble_sent" else "bubble_received"),
         ) {
-            Text(message.text + if (message.truncated) " (more on phone)" else "",
-                color = if (message.sent) OnSentBubble else OnReceivedBubble, style = MaterialTheme.typography.caption2)
+            val color = if (message.sent) OnSentBubble else OnReceivedBubble
+            val shown = remember(message.text, message.truncated, color) { watchMessageText(message.text, message.truncated, color.copy(alpha = 0.18f)) }
+            Text(shown, color = color, style = MaterialTheme.typography.caption2)
         }
     }
 }
@@ -232,6 +236,7 @@ fun readerErrorText(error: String?): String = when (error) {
     ReaderError.NOT_CONFIGURED -> "Set up Hermes on the phone"
     ReaderError.TIMEOUT -> "Phone did not answer"
     ReaderError.NOT_OWNED -> "Conversation not available"
+    ReaderError.HISTORY_SCAN_LIMIT -> "Too much hidden activity. Open on the phone"
     else -> "Could not load"
 }
 
@@ -253,13 +258,33 @@ fun ChatSurface(
     onScrollStep: () -> Unit,
     talkStatus: @Composable () -> Unit,
 ) {
+    key(history.sessionId) {
+        ChatSurfaceContent(title, history, focusRequester, onOlder, onRetry, onScrollStep, talkStatus)
+    }
+}
+
+@Composable
+private fun ChatSurfaceContent(
+    title: String,
+    history: ReaderHistory,
+    focusRequester: FocusRequester,
+    onOlder: () -> Unit,
+    onRetry: () -> Unit,
+    onScrollStep: () -> Unit,
+    talkStatus: @Composable () -> Unit,
+) {
     val listState = rememberLazyListState()
     val ids = history.messages.map { it.rowId }
     var previousIds by remember(history.sessionId) { mutableStateOf(emptyList<Long>()) }
     LaunchedEffect(history.sessionId, ids) {
         // "At latest" = the previously newest message is still on screen; older pages never pull the view down.
         val wasAtLatest = previousIds.lastOrNull()?.let { newest -> listState.layoutInfo.visibleItemsInfo.any { it.key == newest } } ?: true
-        if (ReaderScrollPolicy.followLatest(wasAtLatest, previousIds, ids)) listState.scrollToItem(ids.size + 1)
+        if (ReaderScrollPolicy.followLatest(wasAtLatest, previousIds, ids)) {
+            // The new composition may precede the lazy measure. Admit its item count before
+            // scrolling, and anchor the latest BUBBLE (header + messages), not the empty footer.
+            snapshotFlow { listState.layoutInfo.totalItemsCount }.first { it == ids.size + 2 }
+            listState.scrollToItem(ids.size)
+        }
         previousIds = ids
     }
     Box(Modifier.fillMaxSize()) {
@@ -307,6 +332,7 @@ fun SessionsSurface(
     onSelect: (String) -> Unit,
     onRefresh: () -> Unit,
     onScrollStep: () -> Unit,
+    onClearLog: (suspend () -> Boolean)? = null,
 ) {
     val listState = rememberLazyListState()
     LazyColumn(
@@ -339,7 +365,30 @@ fun SessionsSurface(
                 modifier = Modifier.fillMaxWidth().testTag("session_${row.alias}"),
             )
         }
+        if (onClearLog != null) item(key = "clear_log") { ClearWatchLogChip(onClearLog) }
     }
+}
+
+/** Clears only this watch's saved diagnostics: a second tap confirms; conversations, settings and the phone are untouched. */
+@Composable
+private fun ClearWatchLogChip(clear: suspend () -> Boolean) {
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    var armed by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
+    var result by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
+    CompactChip(
+        onClick = {
+            if (!armed) {
+                armed = true
+                result = null
+            } else {
+                armed = false
+                scope.launch { result = if (clear()) "This watch's log was cleared" else "Couldn't clear this watch's log" }
+            }
+        },
+        label = { Text(result ?: if (armed) "Tap again to clear" else "Clear this watch's log", maxLines = 2) },
+        colors = ChipDefaults.secondaryChipColors(),
+        modifier = Modifier.testTag("clear_watch_diagnostics"),
+    )
 }
 
 /** What a press does now, or what the voice request is doing: recording, sending, waiting, the wake phrase. */
@@ -353,7 +402,7 @@ fun talkHint(talk: WatchTalkState, wakeListening: Boolean): String = when {
 
 /** The home screen when no conversation is open: status lines only; the talk gesture covers the whole screen. */
 @Composable
-fun TalkHome(phone: Boolean?, talk: WatchTalkState, wakeEnabled: Boolean, wakeListening: Boolean, wakeUnavailable: Boolean) {
+fun TalkHome(phone: Boolean?, talk: WatchTalkState, wakeEnabled: Boolean, wakeListening: Boolean, wakeUnavailable: Boolean, onReplay: () -> Unit = {}) {
     Column(Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 14.dp),
         horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterVertically)) {
         Text(
@@ -377,6 +426,7 @@ fun TalkHome(phone: Boolean?, talk: WatchTalkState, wakeEnabled: Boolean, wakeLi
             color = if (recording) MaterialTheme.colors.error else MaterialTheme.colors.onBackground,
             style = MaterialTheme.typography.body2, textAlign = TextAlign.Center, maxLines = 3,
         )
+        if (talk.replayTurnId != null) PlayAgainChip(onReplay)
         Text("Swipe left for conversations", color = MaterialTheme.colors.onSurfaceVariant,
             style = MaterialTheme.typography.caption3, textAlign = TextAlign.Center)
     }
@@ -384,10 +434,20 @@ fun TalkHome(phone: Boolean?, talk: WatchTalkState, wakeEnabled: Boolean, wakeLi
 
 /** One compact line over the bottom of the chat: recording, the request's progress, or the hold hint. */
 @Composable
-fun TalkStatusLine(talk: WatchTalkState, wakeListening: Boolean) {
+fun TalkStatusLine(talk: WatchTalkState, wakeListening: Boolean, onReplay: () -> Unit = {}) {
     val recording = talk.phase == WatchPhase.RECORDING
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+    if (talk.replayTurnId != null) PlayAgainChip(onReplay)
     Text(talkHint(talk, wakeListening),
         Modifier.background(Color(0xCC000000), RoundedCornerShape(8.dp)).padding(horizontal = 6.dp, vertical = 2.dp).testTag("talk_status"),
         color = if (recording) MaterialTheme.colors.error else MaterialTheme.colors.onSurfaceVariant,
         style = MaterialTheme.typography.caption3, maxLines = 2, textAlign = TextAlign.Center)
+    }
+}
+
+/** The same-reply replay of a reply whose audio did not play: a real, labelled control (not the hold gesture). */
+@Composable
+fun PlayAgainChip(onClick: () -> Unit) {
+    CompactChip(onClick = onClick, label = { Text("Play again") }, colors = ChipDefaults.secondaryChipColors(),
+        modifier = Modifier.testTag("play_again"))
 }

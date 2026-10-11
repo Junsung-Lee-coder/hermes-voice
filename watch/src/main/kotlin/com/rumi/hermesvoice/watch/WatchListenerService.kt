@@ -7,6 +7,8 @@ import com.google.android.gms.wearable.DataMapItem
 import com.google.android.gms.wearable.MessageEvent
 import com.google.android.gms.wearable.Wearable
 import com.google.android.gms.wearable.WearableListenerService
+import com.rumi.hermesvoice.core.diag.DiagWire
+import com.rumi.hermesvoice.core.diag.DiagWireV2
 import com.rumi.hermesvoice.core.watchlink.BoundedRead
 import com.rumi.hermesvoice.core.watchlink.LinkFrame
 import com.rumi.hermesvoice.core.watchlink.PlayRequest
@@ -60,7 +62,8 @@ class WatchListenerService : WearableListenerService() {
         when (event.path) {
             WatchLinkPaths.STATE -> TurnStateMessage.decode(event.data)?.let { app.scope.launch { app.onPhoneState(it) } }
             WatchLinkPaths.STOP -> TurnStateMessage.decode(event.data)?.let { app.scope.launch { app.stopPlayback("stopped", it.turnId) } }
-            WatchLinkPaths.DIAG_REQUEST -> app.onDiagRequest(event.sourceNodeId, event.data)
+            WatchLinkPaths.DIAG_REQUEST -> app.onDiagRequest(event.sourceNodeId, event.data, DiagWire.SCHEMA)
+            WatchLinkPaths.DIAG_REQUEST_V2 -> app.onDiagRequest(event.sourceNodeId, event.data, DiagWireV2.SCHEMA)
             WatchLinkPaths.WAKE_VERDICT -> {
                 val source = event.sourceNodeId
                 val data = event.data
@@ -70,6 +73,10 @@ class WatchListenerService : WearableListenerService() {
                 val source = event.sourceNodeId
                 val data = event.data
                 app.scope.launch { app.onNavigation(source, data) }
+            }
+            WatchLinkPaths.REPLY -> {
+                val data = event.data
+                app.scope.launch { app.onReplyAlert(data) }
             }
             WatchLinkPaths.READER_RESPONSE -> {
                 val source = event.sourceNodeId

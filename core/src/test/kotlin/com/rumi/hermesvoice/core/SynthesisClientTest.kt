@@ -4,6 +4,8 @@ import com.rumi.hermesvoice.core.auth.HermesBearerSession
 import com.rumi.hermesvoice.core.auth.HermesDashboardEndpoint
 import com.rumi.hermesvoice.core.auth.InMemoryHermesTokenStore
 import com.rumi.hermesvoice.core.net.HermesDashboardClient
+import com.rumi.hermesvoice.core.net.HermesSttTransportException
+import com.rumi.hermesvoice.core.net.SttTransport
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.async
@@ -44,7 +46,9 @@ class SynthesisClientTest {
         try {
             client.transcribe(ByteArray(44) { 1 }, "audio/wav")
             fail("transcription must still time out on the bounded client")
-        } catch (_: IOException) {
+        } catch (e: HermesSttTransportException) {
+            assertEquals(SttTransport.TIMEOUT, e.transport)
+            assertTrue(e.cause is IOException)
         }
     }
 

@@ -67,7 +67,7 @@ class ChatPaneUiTest {
                     talkBar = { TalkBar(PhoneUiState(signedIn = true)) {} }) {
                     ChatPane(
                         sessionKey = f.session, history = f.history, hasOlder = f.hasOlder, draft = f.draft,
-                        attachments = emptyList(), sending = false,
+                        attachments = emptyList(),
                         onLoadOlder = {
                             val oldest = f.history.first().rowId
                             f.history = ((oldest - 20) until oldest).map { msg(it) } + f.history
