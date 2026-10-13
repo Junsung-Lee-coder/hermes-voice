@@ -35,8 +35,8 @@ import org.junit.Test
 
 /**
  * v19: a new voice request is accepted while earlier, independent requests still wait for their replies; each request keeps its
- * own destination, status and reply; requests to the SAME conversation queue (visibly, cancellably, bounded) behind the
- * earlier one; Stop ends exactly the request it targets; a reply never interrupts a recording nor is dropped.
+ * own destination, status and reply; requests to the SAME conversation are sent at once too (Hermes' own busy-input policy decides
+ * what happens to them; only a finite overload guard refuses, visibly); Stop ends exactly the request it targets; a reply never interrupts a recording nor is dropped.
  * Driven through the production [VoiceTurnOrchestrator] with a scripted gateway (a contract double, not a live Hermes).
  */
 class WaitWhilePendingTest {
@@ -141,64 +141,68 @@ class WaitWhilePendingTest {
     }
 
     @Test(timeout = 120_000)
-    fun `a second request to the same conversation is queued visibly, sent only after the first is answered, in order`() = runBlocking {
+    fun `a second request to the same conversation is sent at once while the first is unanswered, and each reply is spoken once in arrival order`() = runBlocking {
         val o = orchestrator()
         val first = async { o.run(request("t1", "work one")) }
         waitFor("first awaiting") { phases(o)["t1"] == PendingPhase.AWAITING }
         val second = async { o.run(request("t2", "work two")) }
-        waitFor("second queued") { phases(o)["t2"] == PendingPhase.QUEUED }
-        assertTrue("queued status is reported", stages.contains("t2:${VoiceTurnStage.QUEUED}"))
-        delay(300)
-        assertFalse("nothing is sent for it while the earlier request is unanswered", timeline.any { it == "submit:work_session:work two" })
+        waitFor("second sent and awaiting while the first is unanswered") { phases(o)["t2"] == PendingPhase.AWAITING }
+        assertTrue("the app holds nothing back: the second is submitted before the first has a reply",
+            timeline.contains("submit:work_session:work two") && !first.isCompleted)
+        assertFalse("no queued stage is entered", stages.contains("t2:${VoiceTurnStage.QUEUED}"))
+        assertEquals(mapOf("t1" to PendingPhase.AWAITING, "t2" to PendingPhase.AWAITING), phases(o))
         script("work one").send(RecipientEvent.Complete("one done", "complete"))
         assertTrue(first.await() is VoiceTurnOutcome.Completed)
-        waitFor("second sent after the first was answered") { timeline.contains("submit:work_session:work two") }
         script("work two").send(RecipientEvent.Complete("two done", "complete"))
         assertTrue(second.await() is VoiceTurnOutcome.Completed)
-        assertEquals("both replies spoken once, in request order", listOf("play:phone:FINAL:one done", "play:phone:FINAL:two done"), timeline.filter { it.contains(":FINAL:") })
+        assertEquals("both replies spoken once, in arrival order", listOf("play:phone:FINAL:one done", "play:phone:FINAL:two done"), timeline.filter { it.contains(":FINAL:") })
         assertEquals(listOf("submit:work_session:work one", "submit:work_session:work two"), timeline.filter { it.startsWith("submit:") })
     }
 
     @Test(timeout = 120_000)
-    fun `cancelling a queued request sends nothing for it and leaves the earlier request and a later queued one alone`() = runBlocking {
+    fun `stopping the middle one of three same-conversation requests ends only that turn by its id and leaves the others delivered`() = runBlocking {
         val o = orchestrator(perSession = 3)
         val first = async { o.run(request("t1", "work one")) }
         waitFor("first awaiting") { phases(o)["t1"] == PendingPhase.AWAITING }
         val second = async { o.run(request("t2", "work two")) }
-        waitFor("second queued") { phases(o)["t2"] == PendingPhase.QUEUED }
+        waitFor("second awaiting") { phases(o)["t2"] == PendingPhase.AWAITING }
         val third = async { o.run(request("t3", "work three")) }
-        waitFor("third queued") { phases(o)["t3"] == PendingPhase.QUEUED }
+        waitFor("third awaiting") { phases(o)["t3"] == PendingPhase.AWAITING }
         assertTrue(o.stopTurn("t2"))
         assertEquals(VoiceTurnOutcome.Stopped, second.await())
         assertFalse(o.stopTurn("t2"))
         assertFalse(first.isCompleted)
+        assertFalse(third.isCompleted)
         script("work one").send(RecipientEvent.Complete("one done", "complete"))
         assertTrue(first.await() is VoiceTurnOutcome.Completed)
-        waitFor("third sent next") { timeline.contains("submit:work_session:work three") }
-        assertFalse(timeline.contains("submit:work_session:work two"))
         script("work three").send(RecipientEvent.Complete("three done", "complete"))
         assertTrue(third.await() is VoiceTurnOutcome.Completed)
+        assertEquals("all three were submitted exactly once (the app sent them all)", 3, rawSubmits.count { it.first == "work_session" })
+        assertFalse("nothing is spoken for the stopped one", timeline.any { it.startsWith("play:") && it.contains("work two") })
     }
 
     @Test(timeout = 120_000)
-    fun `a full conversation line refuses visibly and loses none of the queued work`() = runBlocking {
-        assertEquals("by default one request is active and ONE waits behind it", 2, VoiceTurnOrchestrator.SESSION_QUEUE_MAX)
-        val o = orchestrator()
+    fun `the per-conversation overload guard refuses visibly before anything is sent, and never makes a request wait`() = runBlocking {
+        assertEquals("a finite guard remains, but it is generous and nothing waits behind it", 8, VoiceTurnOrchestrator.SESSION_QUEUE_MAX)
+        val o = orchestrator(perSession = 2)
         val first = async { o.run(request("t1", "work one")) }
         waitFor("first awaiting") { phases(o)["t1"] == PendingPhase.AWAITING }
         val second = async { o.run(request("t2", "work two")) }
-        waitFor("second queued") { phases(o)["t2"] == PendingPhase.QUEUED }
+        waitFor("second awaiting") { phases(o)["t2"] == PendingPhase.AWAITING }
         val third = o.run(request("t3", "work three"))
         third as VoiceTurnOutcome.NotDelivered
         assertEquals(VoiceTurnOrchestrator.QUEUE_FULL, third.reason)
-        assertEquals(VoiceTurnStage.QUEUED, third.stage)
-        assertFalse("the refused request was refused BEFORE submission", rawSubmits.any { it.second.startsWith("work three") })
+        assertFalse("the refused request was refused BEFORE submission", rawSubmits.any { it.second.endsWith("work three") })
+        assertEquals("the two admitted requests were each sent", 2, rawSubmits.count { it.first == "work_session" })
         script("work one").send(RecipientEvent.Complete("one", "complete"))
         assertTrue(first.await() is VoiceTurnOutcome.Completed)
-        waitFor("second sent") { timeline.contains("submit:work_session:work two") }
         script("work two").send(RecipientEvent.Complete("two", "complete"))
         assertTrue(second.await() is VoiceTurnOutcome.Completed)
         assertTrue("the refused request left no pending entry", o.pending.value.isEmpty())
+        val again = async { o.run(request("t4", "work four")) }
+        waitFor("capacity returned") { phases(o)["t4"] == PendingPhase.AWAITING }
+        script("work four").send(RecipientEvent.Complete("four", "complete"))
+        assertTrue(again.await() is VoiceTurnOutcome.Completed)
     }
 
     @Test(timeout = 120_000)
@@ -321,17 +325,16 @@ class WaitWhilePendingTest {
     }
 
     @Test(timeout = 120_000)
-    fun `queued same-conversation requests each carry their own marker and words when finally sent, and a detail request is untouched`() = runBlocking {
+    fun `same-conversation requests sent while one is unanswered each carry their own marker and words, and a detail request is untouched`() = runBlocking {
         val o = orchestrator()
         val first = async { o.run(request("t1", "work one")) }
         waitFor("first awaiting") { phases(o)["t1"] == PendingPhase.AWAITING }
         val second = async { o.run(request("t2", "자세히 설명해 줘")) }
-        waitFor("second queued") { phases(o)["t2"] == PendingPhase.QUEUED }
-        assertEquals("nothing for the queued request was sent yet", 1, rawSubmits.count { it.first == "work_session" })
+        waitFor("second sent at once") { rawSubmits.count { it.first == "work_session" } == 2 }
+        assertEquals(VOICE_MARK + "work one", rawSubmits.first { it.first == "work_session" }.second)
+        assertEquals("the marker appears exactly once, the words are untouched", VOICE_MARK + "자세히 설명해 줘", rawSubmits.last { it.first == "work_session" }.second)
         script("work one").send(RecipientEvent.Complete("one", "complete"))
         assertTrue(first.await() is VoiceTurnOutcome.Completed)
-        waitFor("second sent") { rawSubmits.count { it.first == "work_session" } == 2 }
-        assertEquals(VOICE_MARK + "자세히 설명해 줘", rawSubmits.last { it.first == "work_session" }.second)
         script("자세히 설명해 줘").send(RecipientEvent.Complete("a very long and detailed explanation", "complete"))
         assertTrue(second.await() is VoiceTurnOutcome.Completed)
         assertTrue("the reply is spoken whole, not shortened by the client", timeline.contains("play:phone:FINAL:a very long and detailed explanation"))

@@ -18,6 +18,8 @@ import org.json.JSONObject
  * - `/hv/v1/state`               message, Phone → Watch: [TurnStateMessage]
  * - `/hv/v1/play/<turnId>/<seq>` channel, Phone → Watch: [LinkFrame] {play header} + audio bytes
  * - `/hv/v1/played`              message, Watch → Phone: [PlayedAck] (sent when playback ends)
+ * - `/hv/v1/private_audio`      message, Watch → Phone: [PrivateAudioReceipt] (revision applied, whether the Watch now refuses to play), sent
+ *                                after every settings snapshot the Watch applied or found stale
  * - `/hv/v1/stop`                message, Phone → Watch: stop playing this turn now (interruption)
  * - `/hv/v1/cancel`             message, Watch → Phone: the Watch's Stop: stop this Watch's own request ([TurnStateMessage]
  *                                with the turn id) wherever it is (queued, awaiting its reply, speaking); one message per request
@@ -26,6 +28,8 @@ import org.json.JSONObject
  *                                bounded, closed schema, answered once per request, never polled
  * - `/hv/v1/navigate`            message, Phone → Watch: a Watch-originated routed request was DELIVERED to this conversation
  *                                ([WatchNavigation]); the Watch may select it, guarded by [WatchNavigationGuard]
+ * - `/hv/v1/reply`               message, Phone → Watch: an unspoken final answer for the Watch arrived ([ReplyAlertMessage]); the
+ *                                Watch shows (and owns) the arrival alert, the Phone then shows none
  * - `/hv/v1/settings`            data item, Phone → Watch: [com.rumi.hermesvoice.core.settings.WatchSettings] JSON
  * - `/hv/v1/reader/request`      message, Watch → Phone, and `/hv/v1/reader/response`, Phone → Watch:
  *                                the conversation reader ([ReaderRequest], [ReaderResponse])
@@ -39,13 +43,25 @@ object WatchLinkPaths {
     const val PLAY_PREFIX = "/hv/v1/play/"
     const val PLAYED = "/hv/v1/played"
 
+    /** Watch → Phone: what the Watch applied of the private-output flag, with the snapshot revision ([PrivateAudioReceipt]). */
+    const val PRIVATE_AUDIO = "/hv/v1/private_audio"
+
     /** Watch → Phone: the player's real position while one clip plays ([PlayProgress]). Optional: an older Watch never sends it. */
     const val PLAY_PROGRESS = "/hv/v1/play_progress"
     const val STOP = "/hv/v1/stop"
     const val CANCEL = "/hv/v1/cancel"
+
+    /** Watch → Phone: play the final reply of this Watch's own turn again, because its audio did not play ([ReplayRequest]). */
+    const val REPLAY = "/hv/v1/replay"
     const val DIAG_REQUEST = "/hv/v1/diag/request"
+
+    /** Phone → Watch: the newer-schema diagnostics request. An older Watch has no handler for this path and ignores it. */
+    const val DIAG_REQUEST_V2 = "/hv/v1/diag/request2"
     const val DIAG_RESPONSE = "/hv/v1/diag/response"
     const val NAVIGATE = "/hv/v1/navigate"
+
+    /** Phone → Watch: a final answer for this Watch arrived without audio; the Watch shows its own alert ([ReplyAlertMessage]). */
+    const val REPLY = "/hv/v1/reply"
     const val SETTINGS = "/hv/v1/settings"
     const val READER_REQUEST = "/hv/v1/reader/request"
     const val READER_RESPONSE = "/hv/v1/reader/response"
@@ -233,9 +249,10 @@ class WatchTurnUpload(
 }
 
 /** Phone → Watch talk-state projection. [terminal] ends the turn on the Watch UI. */
-data class TurnStateMessage(val turnId: String, val stage: String, val detail: String, val terminal: Boolean) {
+data class TurnStateMessage(val turnId: String, val stage: String, val detail: String, val terminal: Boolean, val replay: Boolean = false) {
+    /** [replay]: the turn ended because the reply's audio did not play; the Watch may offer to play it again ([ReplayRequest]). */
     fun encode(): ByteArray = JSONObject().put("turn_id", turnId).put("stage", stage).put("detail", detail.take(MAX_DETAIL))
-        .put("terminal", terminal).toString().toByteArray(StandardCharsets.UTF_8)
+        .put("terminal", terminal).apply { if (replay) put("replay", true) }.toString().toByteArray(StandardCharsets.UTF_8)
 
     companion object {
         const val MAX_DETAIL = 280
@@ -243,8 +260,25 @@ data class TurnStateMessage(val turnId: String, val stage: String, val detail: S
         fun decode(bytes: ByteArray): TurnStateMessage? = runCatching {
             val json = JSONObject(String(bytes, StandardCharsets.UTF_8))
             TurnStateMessage(json.getString("turn_id"), json.getString("stage"), json.optString("detail").take(MAX_DETAIL),
-                json.optBoolean("terminal"))
+                json.optBoolean("terminal"), json.optBoolean("replay"))
         }.getOrNull()?.takeIf { WatchLinkPaths.isValidTurnId(it.turnId) }
+    }
+}
+
+/** Watch → Phone on [WatchLinkPaths.REPLAY]: `{"v":1,"turn_id":…}`. Strict; the turn must be one this Watch node sent. */
+data class ReplayRequest(val turnId: String) {
+    init {
+        require(WatchLinkPaths.isValidTurnId(turnId)) { "invalid replay request" }
+    }
+
+    fun encode(): ByteArray = JSONObject().put("v", 1).put("turn_id", turnId).toString().toByteArray(StandardCharsets.UTF_8)
+
+    companion object {
+        fun decode(bytes: ByteArray): ReplayRequest? = runCatching {
+            val json = JSONObject(String(bytes, StandardCharsets.UTF_8))
+            if (json.opt("v") != 1) return@runCatching null
+            ReplayRequest(json.opt("turn_id") as? String ?: return@runCatching null)
+        }.getOrNull()
     }
 }
 
@@ -424,6 +458,23 @@ data class PlayProgress(val turnId: String, val sequence: Int, val positionMs: L
             if (!WatchLinkPaths.isValidTurnId(turnId)) return null
             val progress = PlayProgress(turnId, json.getInt("seq"), json.getLong("pos"), json.getLong("dur"))
             progress.takeIf { it.sequence >= 0 && it.durationMs in 1..MAX_DURATION_MS && it.positionMs in 0..it.durationMs }
+        }.getOrNull()
+    }
+}
+
+/** Phone → Watch: identity and conversation of an unspoken final answer, for the Watch's own arrival alert. Strict like [WatchNavigation]; no reply text. */
+data class ReplyAlertMessage(val identity: String, val sessionId: String) {
+    init {
+        require(com.rumi.hermesvoice.core.notify.ReplyAlert.isValidIdentity(identity) && DestinationAllowlist.isValidSessionId(sessionId)) { "invalid reply alert" }
+    }
+
+    fun encode(): ByteArray = JSONObject().put("v", 1).put("identity", identity).put("session_id", sessionId).toString().toByteArray(StandardCharsets.UTF_8)
+
+    companion object {
+        fun decode(bytes: ByteArray): ReplyAlertMessage? = runCatching {
+            val json = JSONObject(String(bytes, StandardCharsets.UTF_8))
+            if (json.opt("v") != 1) return@runCatching null
+            ReplyAlertMessage(json.opt("identity") as? String ?: return@runCatching null, json.opt("session_id") as? String ?: return@runCatching null)
         }.getOrNull()
     }
 }

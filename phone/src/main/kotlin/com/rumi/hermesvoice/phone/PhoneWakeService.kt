@@ -32,6 +32,10 @@ class PhoneWakeService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    /** True only after the platform accepted [ServiceCompat.startForeground] and until this service finishes or is destroyed. */
+    @Volatile var foregroundActive = false
+        private set
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val wake = PhoneApp.from(this).phoneWake
         when (intent?.action) {
@@ -53,8 +57,11 @@ class PhoneWakeService : Service() {
                     enter(microphone) -> Unit
                     microphone && enter(false) -> wake.background.onMicrophoneRefused(generation)
                     else -> {
+                        foregroundActive = false
+                        _admission.value = false
                         running = null
                         stopSelf()
+                        wake.onServiceEnding(generation)
                         wake.background.onServiceGone(generation)
                     }
                 }
@@ -73,6 +80,8 @@ class PhoneWakeService : Service() {
             if (it.session.running) it else it.copy(session = it.session.copy(running = true, microphone = microphone))
         }
         ServiceCompat.startForeground(this, NOTIFICATION_ID, notification(this, status), type)
+        foregroundActive = true
+        if (running === this) _admission.value = true
         Log.i(TAG, "phone background listening service foreground microphone=$microphone generation=$generation")
     }.onFailure { Log.w(TAG, "phone background listening service type refused microphone=$microphone: ${it.javaClass.simpleName}") }.isSuccess
 
@@ -87,16 +96,20 @@ class PhoneWakeService : Service() {
 
     /** The user's stop: leave the foreground, remove the notification, end. */
     fun finish() {
-        if (running === this) running = null
+        foregroundActive = false
+        if (running === this) { running = null; _admission.value = false }
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
         Log.i(TAG, "phone background listening service finished generation=$generation")
     }
 
     override fun onDestroy() {
+        foregroundActive = false
         if (running === this) {
             // Not the user's stop: shown as paused, and not started again by the app.
             running = null
+            _admission.value = false
+            PhoneApp.from(this).phoneWake.onServiceEnding(generation)
             PhoneApp.from(this).phoneWake.background.onServiceGone(generation)
         }
         super.onDestroy()
@@ -113,6 +126,13 @@ class PhoneWakeService : Service() {
         /** The running service of the current session (same process, main thread). */
         @Volatile var running: PhoneWakeService? = null
             private set
+
+        private val _admission = kotlinx.coroutines.flow.MutableStateFlow(false)
+        /** Actual current foreground-service admission changes, observed independently of the requested standby status. */
+        val admission: kotlinx.coroutines.flow.StateFlow<Boolean> = _admission
+
+        /** The platform admitted the current session as a foreground service (not merely that the object exists). */
+        val foregroundActive: Boolean get() = running?.foregroundActive == true
 
         fun start(context: Context, microphone: Boolean): Intent =
             Intent(context, PhoneWakeService::class.java).setAction(ACTION_START).putExtra(EXTRA_MICROPHONE, microphone)

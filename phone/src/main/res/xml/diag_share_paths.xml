@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Read-only sharing of the user-started diagnostics report: only the app's own cache subfolder "diag/". -->
+<!-- Read-only sharing from two app-cache subfolders only: the user-started diagnostics report ("diag/") and the one stored
+     attachment the user is viewing and chose to open elsewhere ("viewed/"). -->
 <paths>
     <cache-path name="diag" path="diag/" />
+    <cache-path name="viewed" path="viewed/" />
 </paths>

@@ -365,7 +365,10 @@ class WatchVoiceRuntime(private val app: WatchApp) {
     }
 
     /** The user really opened the app (a launch, or the task brought back to the front), not a resume after a dialog. */
-    fun onUserOpened() = coordinator.onUserOpened()
+    fun onUserOpened() {
+        chargingObserver.start()
+        coordinator.onUserOpened()
+    }
 
     /** WatchVoiceService entered the foreground for session [generation] (typed for the microphone or not). */
     fun onServiceEntered(generation: Long, microphone: Boolean) = coordinator.onServiceEntered(generation, microphone)
@@ -376,6 +379,8 @@ class WatchVoiceRuntime(private val app: WatchApp) {
      * end whether visible or hidden. A later explicit foreground PTT is a new operation.
      */
     fun stopBackground() {
+        chargingObserver.stop()
+        wake.wake.onChargingChanged(false)
         // Tombstone old turn/speaker identities before wake/capture teardown can clear talk state.
         app.cancelPendingUploads("Stopped")
         coordinator.stop()
@@ -393,7 +398,14 @@ class WatchVoiceRuntime(private val app: WatchApp) {
     fun onMicrophoneRefused(generation: Long) = coordinator.onMicrophoneRefused(generation)
 
     /** The service is gone without the user's stop. */
-    fun onServiceGone(generation: Long) = coordinator.onServiceGone(generation)
+    fun onServiceGone(generation: Long) {
+        val current = background.isCurrent(generation)
+        coordinator.onServiceGone(generation)
+        if (current) {
+            chargingObserver.stop()
+            wake.wake.onChargingChanged(false)
+        }
+    }
 
     // ── activity ─────────────────────────────────────────────────────────────────────────────
 
@@ -461,7 +473,7 @@ class WatchVoiceRuntime(private val app: WatchApp) {
         val turnId = app.newTurn(trigger) ?: return false
         if (!captures.begin(turnId, trigger)) return false
         val wakeRequest = trigger == TurnTrigger.WAKE_PHRASE
-        val endpoint = if (wakeRequest) SilenceEndpoint(sampleRate = WatchCapture.SAMPLE_RATE, silenceMs = silenceMs) else null
+        val endpoint = if (wakeRequest) SilenceEndpoint.forWatch(silenceMs = silenceMs, sampleRate = WatchCapture.SAMPLE_RATE) else null
         if (wakeRequest) Log.i(TAG, "hands-free capture turn=${turnId.take(12)} vad_silence_ms=$silenceMs")
         val started = WatchCapture(turnId, trigger, WatchCapture.FRAME_BOUND_PCM_BYTES, endpoint,
             object : PcmCaptureLoop.Listener {
@@ -574,10 +586,16 @@ class WatchVoiceRuntime(private val app: WatchApp) {
         }
     }
 
+    private val chargingObserver = LocalChargingObserver(app, handler) { charging ->
+        wake.wake.onChargingChanged(charging)
+        coordinator.onEligibilityChanged()
+    }
+
     init {
         // A process started again owns no alarm of an earlier one: nothing stale may run a window.
         standbyAlarm.cancel(force = true)
         coordinator.attach(wake.wake)
+        chargingObserver.start()
         val notificationChanges = IntentFilter().apply {
             addAction(NotificationManager.ACTION_APP_BLOCK_STATE_CHANGED)
             addAction(NotificationManager.ACTION_NOTIFICATION_CHANNEL_BLOCK_STATE_CHANGED)

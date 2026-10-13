@@ -18,8 +18,8 @@ android {
         applicationId = "com.rumi.hermesvoice"
         minSdk = 29
         targetSdk = 35
-        versionCode = 19
-        versionName = "0.1.18-dev"
+        versionCode = 20
+        versionName = "0.1.19-dev"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 

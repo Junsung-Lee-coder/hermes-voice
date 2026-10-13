@@ -20,6 +20,8 @@ import com.rumi.hermesvoice.core.VoiceOrigin
 import com.rumi.hermesvoice.core.settings.WatchSettings
 import com.rumi.hermesvoice.core.wake.RecognizerGuard
 import com.rumi.hermesvoice.core.wake.WakeClaimPort
+import com.rumi.hermesvoice.core.wake.ContinuousWakePolicy
+import com.rumi.hermesvoice.core.wake.WakeBlock
 import com.rumi.hermesvoice.core.wake.WakeContract
 import com.rumi.hermesvoice.core.wake.WakeDeviceController
 import com.rumi.hermesvoice.core.wake.WakeDevicePort
@@ -37,10 +39,12 @@ import com.rumi.hermesvoice.core.wake.WakeTimerPort
  */
 class PhoneWakeController(
     private val activity: ComponentActivity,
-    port: WakeDevicePort,
+    inner: WakeDevicePort,
     initial: WatchSettings,
     claims: WakeClaimPort,
 ) : DefaultLifecycleObserver {
+    private val app = PhoneApp.from(activity)
+    private var micLease: AutoCloseable? = null
     private val handler = Handler(Looper.getMainLooper())
     private var recognizer: SpeechRecognizer? = null
     private val guard = RecognizerGuard()
@@ -74,11 +78,13 @@ class PhoneWakeController(
             return startRecognizer(generation, onDevice = onDeviceAvailable())
         }
 
-        override fun release() = destroyRecognizer()
+        override fun release() { destroyRecognizer() }
     }
 
     /** On-device recognition is preferred; [onDevice] false uses the system's default recognition service. */
     private fun startRecognizer(generation: Long, onDevice: Boolean): Boolean = runCatching {
+        micLease = app.phoneMic.acquire(recognizer = true) { wake.onBusy(); recognizer == null }
+            ?: return false
         val created = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && onDevice) SpeechRecognizer.createOnDeviceSpeechRecognizer(activity) else SpeechRecognizer.createSpeechRecognizer(activity)
         recognizer = created
         created.setRecognitionListener(listenerFor(generation, onDevice, guard.open()))
@@ -95,10 +101,14 @@ class PhoneWakeController(
     }.onFailure { Log.w(TAG, "phone wake recognizer start failed ${it.javaClass.simpleName}") }.isSuccess
 
     /** Cancels and destroys the recognizer; its late callbacks are ignored from here on ([guard]). */
-    private fun destroyRecognizer() {
+    private fun destroyRecognizer(): Boolean {
         guard.close()
-        recognizer?.let { runCatching { it.cancel() }; runCatching { it.destroy() } }
-        recognizer = null
+        val released = runCatching { recognizer?.cancel(); recognizer?.destroy() }.isSuccess
+        if (released) {
+            recognizer = null
+            micLease?.close(); micLease = null
+        }
+        return released
     }
 
     private val deadlineCheck: Runnable = Runnable { wake.onTimer() }
@@ -112,14 +122,111 @@ class PhoneWakeController(
         override fun cancel() = handler.removeCallbacks(deadlineCheck)
     }
 
+    private var resumed = false
+    private var locallyCharging = false
+    private var ordinaryEndMs = 0L
+    private var chargingWindow = false
+    private var screenWasInteractive = activity.getSystemService(android.os.PowerManager::class.java)?.isInteractive == true
+    private var failures = 0
+    private var blockedRetries = 0
+
+    /** Foreground charging uses the same controller; its background twin remains dormant while the Activity owns the mic. */
+    private fun continuouslyEligible(): Boolean {
+        val app = PhoneApp.from(activity)
+        return resumed && locallyCharging && wake.settings.phoneWakeWhileCharging && wake.settings.phoneBackgroundWakeEnabled &&
+            wake.selected && app.tokens.load() != null && app.phoneWake.status.value.session.microphone &&
+            PhoneWakeService.foregroundActive && activity.getSystemService(android.os.PowerManager::class.java)?.isInteractive == true
+    }
+
+    private fun openChargingWindow() {
+        if (!continuouslyEligible()) return
+        val wasListening = wake.listening
+        wake.rearm("charging_foreground")
+        if (!wasListening && wake.listening) chargingWindow = true
+    }
+
+    private val rearm = Runnable { openChargingWindow() }
+
+    private fun cancelRearm() {
+        handler.removeCallbacks(rearm)
+        failures = 0
+        blockedRetries = 0
+    }
+
+    private fun scheduleRearm(delayMs: Long) {
+        if (!continuouslyEligible()) return cancelRearm()
+        handler.removeCallbacks(rearm)
+        handler.postDelayed(rearm, delayMs)
+    }
+
+    private val port = object : WakeDevicePort by inner {
+        override fun settingsApplied() {
+            inner.settingsApplied()
+            reconcileCharging()
+        }
+
+        override fun cancelRequestCapture(reason: String) {
+            if (reason == "pause") resumed = false
+            if (reason == "pause" || reason == "screen_off") cancelRearm()
+            inner.cancelRequestCapture(reason)
+        }
+
+        override fun closed(reason: String) {
+            inner.closed(reason)
+            if (!continuouslyEligible()) return cancelRearm()
+            val next = ContinuousWakePolicy.next(reason, failures) ?: return
+            failures = if (next.failure) failures + 1 else 0
+            scheduleRearm(next.delayMs)
+        }
+
+        override fun armBlocked(source: String, block: WakeBlock) {
+            inner.armBlocked(source, block)
+            if (!continuouslyEligible()) return cancelRearm()
+            when (block) {
+                WakeBlock.MICROPHONE_MUTED, WakeBlock.PHONE_UNREACHABLE -> scheduleRearm(ContinuousWakePolicy.blockedRetryDelay(blockedRetries++))
+                WakeBlock.COOLDOWN -> inner.armInputs().let { scheduleRearm((it.cooldownUntilMs - it.nowMs).coerceAtLeast(0L) + ContinuousWakePolicy.COOLDOWN_MARGIN_MS) }
+                else -> Unit
+            }
+        }
+    }
+
     /** The shared wake flow; the activity feeds it settings, busy/idle and handoff timing. */
     val wake: WakeDeviceController = WakeDeviceController(VoiceOrigin.PHONE, recognizerPort, timerPort, port, SystemClock::elapsedRealtime, initial, claims)
+
+    private val chargingObserver = LocalChargingObserver(activity, handler) { charging ->
+        locallyCharging = charging
+        wake.onChargingChanged(charging)
+        reconcileCharging()
+    }
+
+    private fun reconcileCharging() {
+        if (!continuouslyEligible()) {
+            cancelRearm()
+            if (chargingWindow && SystemClock.elapsedRealtime() >= ordinaryEndMs) wake.endChargingForegroundIdle()
+        } else if (!wake.listening && !wake.episodePending) openChargingWindow()
+    }
+
+    fun onEnvironmentChanged() = reconcileCharging()
+
+    fun onSignInChanged(signedIn: Boolean) {
+        if (!signedIn) {
+            cancelRearm()
+            wake.onBusy()
+        } else reconcileCharging()
+    }
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
-                Intent.ACTION_SCREEN_OFF -> handler.post { wake.onScreenOff() }
-                Intent.ACTION_SCREEN_ON -> handler.post { wake.onScreenOn() }
+                Intent.ACTION_SCREEN_OFF -> handler.post { screenWasInteractive = false; wake.onScreenOff() }
+                Intent.ACTION_SCREEN_ON -> handler.post {
+                    if (!screenWasInteractive) {
+                        ordinaryEndMs = SystemClock.elapsedRealtime() + WakeContract.WINDOW_MS
+                        chargingWindow = false
+                    }
+                    screenWasInteractive = true
+                    wake.onScreenOn()
+                }
             }
         }
     }
@@ -136,20 +243,34 @@ class PhoneWakeController(
             activity.registerReceiver(screenReceiver, filter)
         }
         receiverRegistered = true
+        chargingObserver.start()
     }
 
     /** The Phone owns the settings, so they are always current here. */
-    override fun onResume(owner: LifecycleOwner) = wake.onResume(settingsPending = false)
+    override fun onResume(owner: LifecycleOwner) {
+        resumed = true
+        ordinaryEndMs = SystemClock.elapsedRealtime() + WakeContract.WINDOW_MS
+        chargingWindow = false
+        screenWasInteractive = activity.getSystemService(android.os.PowerManager::class.java)?.isInteractive == true
+        wake.onResume(settingsPending = false)
+    }
 
     override fun onPause(owner: LifecycleOwner) = wake.onPause()
 
     override fun onStop(owner: LifecycleOwner) {
+        resumed = false
+        cancelRearm()
+        chargingObserver.stop()
+        locallyCharging = false
+        wake.onChargingChanged(false)
         if (receiverRegistered) runCatching { activity.unregisterReceiver(screenReceiver) }
         receiverRegistered = false
         wake.onPause()
     }
 
     override fun onDestroy(owner: LifecycleOwner) {
+        resumed = false
+        chargingObserver.stop()
         handler.removeCallbacksAndMessages(null)
         wake.onPause()
     }
@@ -168,6 +289,7 @@ class PhoneWakeController(
             Log.i(TAG, "phone wake recognizer error gen=$gen code=$error mode=${if (onDevice) "ON_DEVICE" else "SYSTEM"}")
             // A late callback of a recognizer that was already released must not touch the current one.
             if (!guard.isCurrent(token)) return
+            com.rumi.hermesvoice.core.diag.DiagSpeechError.record(PhoneApp.from(activity).diagnostics.log, com.rumi.hermesvoice.core.diag.DiagOrigin.PHONE, error)
             // The on-device model may lack the wake phrases' language: try the system's default recognition
             // service once, in the same window (that service may use the network).
             if (onDevice && error in LANGUAGE_ERRORS) {

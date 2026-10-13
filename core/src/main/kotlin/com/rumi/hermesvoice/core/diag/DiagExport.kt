@@ -4,6 +4,8 @@ import java.io.File
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 /** App-owned report files: random names, a count and an age bound, atomic writes. Only files this store names are ever touched. */
@@ -84,7 +86,8 @@ sealed interface DiagExportResult {
 /**
  * Builds one report on the user's request: a snapshot of the Phone's ring buffer (so capture, playback and intake continue
  * undisturbed), one scoped, bounded request to the Watch (a missing or late answer is a marker, never a failure of the Phone
- * part), then a file in the app's own cache. One export at a time. Nothing here writes a preference or keeps a resource.
+ * part), the app's version and build identity (hashed on an IO thread), then a file in the app's own cache. One export at a
+ * time. Nothing here writes a preference or keeps a resource.
  */
 class DiagExporter(
     private val appVersionCode: Int,
@@ -94,6 +97,12 @@ class DiagExporter(
     private val store: DiagFileStore,
     private val watchTimeoutMs: Long = WATCH_TIMEOUT_MS,
     private val newSalt: () -> String = { DiagPseudonyms.newSalt() },
+    private val versionName: String = DiagApp.UNKNOWN_NAME,
+    /** Blocking: reads the app's own installed APK. Called on an IO thread; the default says there is no identity to give. */
+    private val build: () -> DiagBuild = { DiagBuild.UNAVAILABLE },
+    private val network: () -> DiagNetwork = { DiagNetwork.UNKNOWN },
+    private val persistence: () -> DiagPersistStatus = { DiagPersistStatus.NOT_ENABLED },
+    private val wallClockMs: () -> Long = System::currentTimeMillis,
 ) {
     private val running = AtomicBoolean(false)
 
@@ -102,8 +111,10 @@ class DiagExporter(
         try {
             val salt = newSalt()
             val events = log.snapshot()
-            val dropped = log.dropped()
+            val coverage = WireCoverage.of(log.coverage(), persistence())
             val now = log.now()
+            val exportedAt = wallClockMs()
+            val networkNow = try { network() } catch (_: Exception) { DiagNetwork.UNKNOWN }
             val watchPart = try {
                 withTimeoutOrNull(watchTimeoutMs) { watch(salt) } ?: WatchDiag(WatchDiagStatus.TIMEOUT)
             } catch (cancelled: CancellationException) {
@@ -111,7 +122,15 @@ class DiagExporter(
             } catch (error: Exception) {
                 WatchDiag(WatchDiagStatus.OFFLINE)
             }
-            val json = DiagReport.build(appVersionCode, events, dropped, now, salt, watchPart, settings())
+            val identity = try {
+                withContext(Dispatchers.IO) { build() }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                DiagBuild.UNREADABLE
+            }
+            val json = DiagReportV2.build(exportedAt, DiagApp(DiagApp.safeName(versionName), appVersionCode, identity), events, now, salt,
+                coverage, networkNow, watchPart, settings(), DiagWireV2.SCHEMA_3)
             return when (val written = store.write(json)) {
                 is DiagFileStore.Written.Ok -> DiagExportResult.Ready(written.file, watchPart.status, events.size, watchPart.events.size)
                 is DiagFileStore.Written.Failed -> DiagExportResult.Failed(written.fail)

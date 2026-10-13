@@ -68,6 +68,12 @@ interface WakeEpochStore {
  *   Phone restarted meanwhile) is refused before the turn is accepted: nothing is transcribed,
  *   routed or delivered, and where replies play does not change. Push-to-talk and text are never
  *   arbitrated. It is not a merge by content or time: two deliberate requests are two claims.
+ * - **Accepted before a mode change.** "Listen on" decides who may START a wake request; a request a
+ *   device already accepted is delivered under the policy it was accepted under. A turn that carries a
+ *   claim is arbitrated (lease, once, expiry) whatever the mode is now. A device that accepted alone
+ *   (no claim needed) before "Listen on" became Both has no claim to show: for a bounded time
+ *   ([WakeContract.ACCEPTED_ALONE_GRACE_MS]) its ONE claimless wake turn is admitted, once, and only
+ *   for a device the previous setting listened on ([settingsChanged]).
  * - **Answered episodes.** Every admitted wake request raises [epoch]. A claim carries the epoch
  *   its device knew when its recognizer window opened; a claim from a window that was already
  *   listening when a request was admitted is refused, however late its recognizer finishes the
@@ -87,6 +93,9 @@ class WakeAdmission(
     private var lease: Lease? = null
     private var answered = epochs?.load() ?: 0L
     private var lastAnswered: WakeEpisode? = null
+
+    /** Devices that may have accepted a wake request alone just before both were selected: the time their one claimless turn is admitted until. */
+    private val acceptedAlone = HashMap<VoiceOrigin, Long>()
 
     /** The number of wake requests answered so far: what a device must know when its window opens. */
     val epoch: Long get() = synchronized(lock) { answered }
@@ -121,7 +130,19 @@ class WakeAdmission(
             return if (byOther) ClaimVerdict.HELD_BY_OTHER else ClaimVerdict.STALE_WINDOW
         }
         lease = Lease(claim, now + ttlMs)
+        acceptedAlone.remove(claim.origin)
         return ClaimVerdict.GRANTED
+    }
+
+    /**
+     * The Phone saved new settings ([before] -> [after], see [com.rumi.hermesvoice.core.settings.AppSettings.onWatchSettingsSaved]).
+     * When "Listen on" starts selecting both devices, each device the previous settings listened on may hold a request it accepted alone.
+     */
+    fun settingsChanged(before: WatchSettings, after: WatchSettings): Unit = synchronized(lock) {
+        if (!after.arbitrationRequired) return acceptedAlone.clear()
+        if (before.revision <= 0 || before.arbitrationRequired) return
+        val until = clock() + WakeContract.ACCEPTED_ALONE_GRACE_MS
+        VoiceOrigin.values().filter { before.mayListen(it) }.forEach { acceptedAlone[it] = until }
     }
 
     fun renew(claimId: String, origin: VoiceOrigin, nodeId: String): ClaimVerdict = synchronized(lock) {
@@ -142,14 +163,22 @@ class WakeAdmission(
     }
 
     /**
-     * Admits a turn: null when it may proceed, else the refusal reason. A wake-phrase turn in Both
-     * uses up its device's claim and counts as an answered episode; every other turn is admitted untouched.
+     * Admits a turn: null when it may proceed, else the refusal reason. A wake-phrase turn in Both,
+     * or carrying a claim, uses up its device's claim and counts as an answered episode; every other turn is admitted untouched.
      */
     fun admitTurn(wakeTurn: Boolean, origin: VoiceOrigin, nodeId: String, claimId: String?): String? {
         val episode = synchronized(lock) {
-            if (!wakeTurn || !required()) return null
-            if (claimId == null) return "wake_claim_missing"
-            expire(clock())
+            if (!wakeTurn) return null
+            if (claimId == null && !required()) return null
+            val now = clock()
+            expire(now)
+            if (claimId == null) {
+                val until = acceptedAlone.remove(origin)
+                if (until == null || now >= until) return "wake_claim_missing"
+                answered += 1
+                epochs?.save(answered)
+                return@synchronized WakeEpisode(answered, "", origin, nodeId).also { lastAnswered = it }
+            }
             val held = lease?.takeIf { it.claim.claimId == claimId && sameDevice(it.claim, origin, nodeId) } ?: return "wake_claim_invalid"
             lease = null
             answered += 1

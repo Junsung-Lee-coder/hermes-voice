@@ -29,6 +29,8 @@ import com.rumi.hermesvoice.core.background.NotificationCapability
 import com.rumi.hermesvoice.core.background.PhoneBackgroundHost
 import com.rumi.hermesvoice.core.background.PhoneBackgroundWake
 import com.rumi.hermesvoice.core.background.PhoneWakeStatus
+import com.rumi.hermesvoice.core.headset.HeadsetText
+import com.rumi.hermesvoice.core.headset.MicPlan
 import com.rumi.hermesvoice.core.voice.EpisodeMicrophone
 import com.rumi.hermesvoice.core.voice.MicrophoneClaim
 import com.rumi.hermesvoice.core.voice.TurnRouting
@@ -81,6 +83,8 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
     // ── recognizer (on-device only) ──────────────────────────────────────────────────────────
 
     private var recognizer: SpeechRecognizer? = null
+    private var recognizerLease: AutoCloseable? = null
+    private var captureLease: AutoCloseable? = null
     private val guard = RecognizerGuard()
 
     /** The on-device model lacked the wake phrases' language this session: no cloud fallback, the loop stops. */
@@ -96,6 +100,8 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
             // Background is on-device only: older devices must fail closed, never stream to a system recognizer.
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
             return runCatching {
+                recognizerLease = app.phoneMic.acquire(recognizer = true) { background.wake.onBusy(); recognizer == null }
+                    ?: return false
                 val created = SpeechRecognizer.createOnDeviceSpeechRecognizer(app)
                 recognizer = created
                 created.setRecognitionListener(listenerFor(generation, guard.open()))
@@ -112,8 +118,10 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
 
         override fun release() {
             guard.close()
-            recognizer?.let { runCatching { it.cancel() }; runCatching { it.destroy() } }
-            recognizer = null
+            if (runCatching { recognizer?.cancel(); recognizer?.destroy() }.isSuccess) {
+                recognizer = null
+                recognizerLease?.close(); recognizerLease = null
+            }
         }
 
         override fun schedule(delayMs: Long) {
@@ -137,6 +145,7 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
             Log.i(TAG, "phone background wake recognizer error gen=$gen code=$error")
             // A late callback of a recognizer that was already released must not touch the current one.
             if (!guard.isCurrent(token)) return
+            com.rumi.hermesvoice.core.diag.DiagSpeechError.record(app.diagnostics.log, com.rumi.hermesvoice.core.diag.DiagOrigin.PHONE, error)
             // The on-device model lacks the language: say so (the next window finds no recognizer); never fall back to a server.
             if (error in LANGUAGE_ERRORS) languageMissing = true
             background.wake.onError(gen, error)
@@ -157,6 +166,10 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
 
     private var recorder: PhoneCapture? = null
     private var captureClaimId: String? = null
+
+    /** The headset link a recording is still bringing up, and the loss watch of a running one ("Use headset"). */
+    private var preparing: AutoCloseable? = null
+    private var inputLoss: AutoCloseable? = null
     private var recognizedClaimId: String? = null
 
     /** The microphone claims ([PhoneApp.audio]) of the recording and of the recognized request; handed to their request. */
@@ -170,7 +183,12 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
         override fun stopRecorder(captureId: String, reason: CaptureStop): ByteArray? {
             val active = recorder?.takeIf { it.captureId == captureId }
             recorder = null
+            runCatching { preparing?.close() }
+            preparing = null
+            runCatching { inputLoss?.close() }
+            inputLoss = null
             val wav = active?.stop()
+            captureLease?.close(); captureLease = null
             active?.stats()?.let { stats ->
                 Log.i(TAG, "phone background capture ended turn=${captureId.take(12)} end=$reason pcm_bytes=${stats.pcmBytes} " +
                     "speech=${stats.speech} vad_silence_ms=${stats.silenceMs} wav=${wav != null}")
@@ -219,9 +237,11 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
             held?.release()
             return false
         }
+        captureLease = app.phoneMic.acquire() ?: run { held?.release(); return false }
         captureClaimId = claimId
         val id = UUID.randomUUID().toString()
         if (!captures.begin(id, TurnTrigger.WAKE_PHRASE)) {
+            captureLease?.close(); captureLease = null
             held?.release()
             return false
         }
@@ -233,8 +253,9 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
                 override fun onLive() { handler.post { captures.onLive(id) } }
                 override fun onCalibrated() { handler.post { captures.onCalibrated(id) } }
                 override fun onEnd(reason: CaptureEnd) { handler.post { captures.stop(id, CaptureStop.of(reason)) } }
-            })
+            }, app.recordFactory)
         recorder = capture
+        micNotice.value = null
         Log.i(TAG, "phone background capture turn=${id.take(12)} vad_silence_ms=$silenceMs")
         // Opened only once a later reply it stopped has stopped; null: that happens in a moment (or it ends as START_FAILED).
         return microphone.whenSpeakerStopped(app.mainScope) { stopped -> openCapture(id, capture, stopped) } ?: true
@@ -243,12 +264,48 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
     private fun openCapture(id: String, capture: PhoneCapture, stopped: Boolean): Boolean {
         // Cancelled meanwhile (Stop, app shown, settings): nothing to open.
         if (captures.activeId != id || recorder !== capture) return false
-        if (!stopped || !capture.start()) {
+        if (!stopped) {
             captures.stop(id, CaptureStop.START_FAILED)
             return false
         }
+        var settled = false
+        var opened = false
+        val link = app.headsetMic.prepare { plan ->
+            settled = true
+            preparing = null
+            opened = beginCapture(id, capture, plan)
+        }
+        if (!settled) {
+            preparing = link
+            return true
+        }
+        return opened
+    }
+
+    private fun beginCapture(id: String, capture: PhoneCapture, plan: MicPlan): Boolean {
+        if (captures.activeId != id || recorder !== capture) {
+            plan.release()
+            return false
+        }
+        if (!capture.start(plan) { report -> report.text?.let { micNotice.value = it } }) {
+            captures.stop(id, CaptureStop.START_FAILED)
+            return false
+        }
+        if (plan.preferred != null) {
+            inputLoss = app.headsetMic.watchLoss(plan) {
+                handler.post {
+                    if (captures.activeId == id) {
+                        micNotice.value = HeadsetText.LOST
+                        captures.stop(id, CaptureStop.INPUT_LOST)
+                    }
+                }
+            }
+        }
         return true
     }
+
+    /** Which microphone the current or last background recording really used, or why the headset was lost; null when nothing to say. */
+    val micNotice = MutableStateFlow<String?>(null)
 
     /**
      * A request heard with the app closed: a Phone voice request like any other, run by the
@@ -271,8 +328,14 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
                 VoiceTurnRequest(turnId, VoiceOrigin.PHONE, wav, "audio/wav", PhoneSpeakerSink(app), wakeTurn = true, wakeClaimId = claimId,
                     routing = routing, microphone = microphone)
             }
-            val outcome = runCatching { wiring.core.orchestrator.run(request) }
-            val line = outcome.fold({ VoiceOutcomeText.describe(it) }, { "Not sent: ${it.javaClass.simpleName}" })
+            val outcome = try {
+                Result.success(wiring.core.orchestrator.run(request))
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                Result.failure(error)
+            }
+            val line = outcome.fold({ VoiceOutcomeText.describe(it) }, { "Not sent: ${com.rumi.hermesvoice.core.diag.DiagLabels.cause(com.rumi.hermesvoice.core.diag.DiagClassify.of(it).cause)}" })
             Log.i(TAG, "phone background turn ${turnId.take(12)} outcome=${outcome.getOrNull()?.javaClass?.simpleName ?: "failed"}")
             notice.value = line
         }
@@ -361,7 +424,7 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
             ambient = false,
             permission = hasMic(),
             microphoneMuted = app.getSystemService(AudioManager::class.java)?.isMicrophoneMute == true,
-            talkIdle = !capturing && app.phoneTurns.value == 0 && !app.speakingLater.value,
+            talkIdle = !capturing && !app.phoneMic.recordingOwned && app.phoneTurns.value == 0 && !app.speakingLater.value,
             // A Phone request needs a Hermes sign-in, not a reachable peer.
             phoneReachable = app.tokens.load() != null,
             nowMs = SystemClock.elapsedRealtime(),
@@ -460,6 +523,11 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
         }
     }
 
+    private val chargingObserver = LocalChargingObserver(app, handler) { charging ->
+        background.wake.onChargingChanged(charging)
+        background.onEligibilityChanged()
+    }
+
     init {
         // An alarm an earlier process of this app left behind opens nothing.
         standbyAlarm.cancel(force = true)
@@ -468,10 +536,12 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
         else app.registerReceiver(screenReceiver, screenFilter)
         background.attach(WakeDeviceController(VoiceOrigin.PHONE, recognizerPort, recognizerPort, background.devicePort(devicePort),
             SystemClock::elapsedRealtime, app.settings.watchSettings(), claimPort))
+        chargingObserver.start()
         // A Phone request in flight owns the microphone and speaker; a later reply holding this Phone's
         // speaker closes an open window only (an episode under way owns the microphone and goes on).
         app.appScope.launch {
-            combine(app.phoneTurns, app.speakingLater) { turns, later -> if (turns > 0) BUSY else if (later) SPEAKER else IDLE }
+            combine(app.phoneTurns, app.speakingLater, app.manualCapture.state) { turns, later, capture ->
+                if (turns > 0 || capture.phase in setOf(ManualPhase.PENDING, ManualPhase.ADMITTED, ManualPhase.RECORDING)) BUSY else if (later) SPEAKER else IDLE }
                 .distinctUntilChanged().collect { state ->
                     handler.post {
                         when (state) {
@@ -497,6 +567,7 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
 
     /** The user's switch, from the visible app (the session refuses it otherwise). A new start retries the on-device model. */
     fun start(): BackgroundStatus {
+        chargingObserver.start()
         languageMissing = false
         return background.start()
     }
@@ -515,6 +586,8 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
      * next time the app is opened does not start it again.
      */
     fun stop(): BackgroundStatus {
+        chargingObserver.stop()
+        background.wake.onChargingChanged(false)
         saveStandbyOff()
         handler.removeCallbacks(handoff)
         val status = background.stop()
@@ -537,6 +610,7 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
      * switch is a request that is honored at the next real visit. A saved OFF is never turned on.
      */
     fun onAppShown() {
+        chargingObserver.start()
         handler.removeCallbacks(hide)
         handler.removeCallbacks(handoff)
         background.onAppShown()
@@ -554,6 +628,24 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
     fun onAppHidden() {
         handler.removeCallbacks(hide)
         handler.postDelayed(hide, HIDE_GRACE_MS)
+    }
+
+    /** Before the service's existing direct onServiceGone delegate: only this exact generation closes local observation. */
+    fun onServiceEnding(generation: Long) {
+        if (background.session.isCurrent(generation)) {
+            chargingObserver.stop()
+            background.wake.onChargingChanged(false)
+        }
+    }
+
+    /** Sign-out ends microphone authority without changing the user's saved standby or charging choices. */
+    fun onSignedOut() {
+        chargingObserver.stop()
+        handler.removeCallbacks(handoff)
+        background.stop()
+        background.wake.onChargingChanged(false)
+        captures.activeId?.let { captures.stop(it, CaptureStop.LIFECYCLE) }
+        app.stopLaterReplies()
     }
 
     /** The wake settings, the microphone or the notification permission may have changed. */

@@ -18,7 +18,7 @@ import org.junit.Test
  * holds composed by [ComposedWatch] (only the platform is fake). A hidden Watch listens only when its own standby master is ON
  * and (its own screen is interactive OR its own screen-off preference is ON). Turning the screen off, or the preference off,
  * while the Watch is not eligible tears down the idle recognizer, LISTEN/HANDOFF holds and pending retry timers; recordings,
- * claims and the session are left alone. Screen off is never Stop and never a foreground-exclusion bypass.
+ * claims and the session are left alone. Screen off is never Stop and never bypasses "Listen on".
  */
 class ScreenOffWatchPolicyTest {
     private enum class Gap { QUIET_TIMEOUT, FAILURE_BACKOFF, BLOCKED_UNREACHABLE, COOLDOWN }
@@ -26,19 +26,24 @@ class ScreenOffWatchPolicyTest {
     private fun hidden(
         pref: Boolean,
         master: Boolean = true,
-        location: WakeLocation = WakeLocation.OFF,
+        location: WakeLocation = WakeLocation.WATCH,
         phoneStandby: Boolean = false,
         arbitrated: Boolean = false,
     ) = ComposedWatch(location, arbitrated = arbitrated, watchStandby = master, phoneStandby = phoneStandby, watchScreenOff = pref)
         .apply { show(); start(); hide() }
 
+    /** A quiet window ends: at its deadline in a continuous background, early (nothing matched) inside a screen activation's budget, where a gap after the deadline is never scheduled. */
+    private fun ComposedWatch.quietClose() {
+        if (wake.budgeted) { wake.onError(wake.generation, 7); drain() } else windowTimeout()
+    }
+
     private fun ComposedWatch.pendingTimer(gap: Gap) {
         assertTrue("a window is open before the gap", windowOpen)
         when (gap) {
-            Gap.QUIET_TIMEOUT -> windowTimeout()
+            Gap.QUIET_TIMEOUT -> quietClose()
             Gap.FAILURE_BACKOFF -> { wake.onError(wake.generation, 5); drain() }
-            Gap.BLOCKED_UNREACHABLE -> { windowTimeout(); reachable = false; rearmDue() }
-            Gap.COOLDOWN -> { windowTimeout(); cooldownUntil = now + 4_000L; rearmDue() }
+            Gap.BLOCKED_UNREACHABLE -> { quietClose(); reachable = false; rearmDue() }
+            Gap.COOLDOWN -> { quietClose(); cooldownUntil = now + 4_000L; rearmDue() }
         }
         assertNotNull("positive control: the $gap timer is really pending", rearmIn)
         assertFalse(windowOpen)
@@ -96,7 +101,10 @@ class ScreenOffWatchPolicyTest {
             assertEquals("$label: window", expected, w.windowOpen)
             assertEquals("$label: LISTEN hold", expected, HoldReason.LISTEN in w.held())
             repeat(3) { if (w.windowOpen) w.windowTimeout(); w.rearmDue() }
-            assertEquals("$label: window after rearm cycles", expected, w.windowOpen)
+            // Without the preference the one budget of the screen activation is spent after these cycles; with it the loop is continuous.
+            val continuous = expected && (screenOff || pref)
+            assertEquals("$label: window after rearm cycles", continuous, w.windowOpen)
+            if (expected && !continuous) assertNull("$label: the spent budget leaves no timer", w.rearmIn)
             if (!expected) {
                 assertNull("$label: no timer", w.rearmIn)
                 assertFalse("$label: no window", w.windowOpen)
@@ -156,6 +164,12 @@ class ScreenOffWatchPolicyTest {
     fun `every kind of pending idle timer is cancelled when the screen turns off with the preference off`() {
         for (gap in Gap.values()) {
             val w = hidden(pref = false)
+            if (gap == Gap.BLOCKED_UNREACHABLE) {
+                // A 15 s blocked retry would land after the 5 s budget: nothing is scheduled at all.
+                w.quietClose(); w.reachable = false; w.rearmDue()
+                assertNull("an unreachable Phone schedules no retry past the budget", w.rearmIn)
+                continue
+            }
             w.pendingTimer(gap)
             w.screenOff()
             w.assertIdleGone("screen off during $gap")
@@ -268,7 +282,7 @@ class ScreenOffWatchPolicyTest {
 
     @Test
     fun `an accepted claim and its recording are untouched by the screen turning off`() {
-        val w = hidden(pref = false, phoneStandby = true, arbitrated = true)
+        val w = hidden(pref = false, location = WakeLocation.BOTH, phoneStandby = true, arbitrated = true)
         w.heard("루미")
         assertEquals(listOf("claim:claim-1"), w.claimsSent)
         w.wake.onClaimVerdict("claim-1", ClaimVerdict.GRANTED); w.drain()
@@ -319,7 +333,7 @@ class ScreenOffWatchPolicyTest {
 
     @Test
     fun `the preference on without a legal armed session arms nothing, with or without a screen`() {
-        val w = ComposedWatch(WakeLocation.OFF, watchStandby = true, watchScreenOff = true)
+        val w = ComposedWatch(WakeLocation.WATCH, watchStandby = true, watchScreenOff = true)
         w.screenOn = false
         w.start()
         assertEquals("never armed from the background", 0, w.micRequests())
@@ -408,20 +422,19 @@ class ScreenOffWatchPolicyTest {
     }
 
     @Test
-    fun `a truly screen-off excluded Watch follows the background rules and the foreground exclusion returns with the screen`() {
-        val on = ComposedWatch(WakeLocation.PHONE, watchStandby = true, watchScreenOff = true)
-        on.show(); on.start()
-        on.screenOff()
-        assertTrue("screen off, own master on, own preference on: background eligibility", on.windowOpen)
-        on.screenOnEvent()
-        assertFalse("interactive on screen again: the foreground exclusion applies", on.windowOpen)
-        assertFalse(HoldReason.LISTEN in on.held())
-        val off = ComposedWatch(WakeLocation.PHONE, watchStandby = true, watchScreenOff = false)
-        off.show(); off.start()
-        off.screenOff()
-        assertFalse("screen off but the preference is off", off.windowOpen)
-        off.screenOnEvent()
-        assertFalse(off.windowOpen)
+    fun `a screen-off Watch that Listen on excludes listens neither with the screen on nor off, whatever its standby and preference say`() {
+        for (pref in listOf(true, false)) {
+            val w = ComposedWatch(WakeLocation.PHONE, watchStandby = true, watchScreenOff = pref)
+            w.show(); w.start()
+            w.screenOff()
+            assertFalse("pref=$pref: screen off, not selected", w.windowOpen)
+            w.screenOnEvent()
+            assertFalse("pref=$pref: interactive again, still not selected", w.windowOpen)
+            w.screenOffPreference(watch = !pref)
+            assertFalse("pref=$pref: a preference change selects nothing", w.windowOpen)
+            assertFalse(HoldReason.LISTEN in w.held())
+            assertNull(w.rearmIn)
+        }
     }
 
     @Test
@@ -437,10 +450,10 @@ class ScreenOffWatchPolicyTest {
     }
 
     @Test
-    fun `a stale visible flag with the screen off and the preference on follows the background rules, not the excluding foreground location`() {
-        val w = ComposedWatch(WakeLocation.OFF, watchStandby = true, watchScreenOff = true)
+    fun `a stale visible flag with the screen off and the preference on follows the background rules`() {
+        val w = ComposedWatch(WakeLocation.WATCH, watchStandby = true, watchScreenOff = true)
         w.show(); w.start()
-        assertFalse("location OFF: nothing listens on screen", w.windowOpen)
+        assertTrue("selected: the foreground listens on screen", w.windowOpen)
         w.screenOn = false
         w.screenOffPreference(watch = true)
         w.assertListening("screen off + master + preference: background eligibility")

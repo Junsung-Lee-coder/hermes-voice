@@ -52,7 +52,7 @@ import org.junit.Test
  */
 class ChunkedReplyGapTest {
     private val timeline: MutableList<String> = Collections.synchronizedList(mutableListOf())
-    private val scripts = HashMap<String, Channel<RecipientEvent>>()
+    private val scripts = ConcurrentHashMap<String, Channel<RecipientEvent>>()
     private val rawSubmits = Collections.synchronizedList(mutableListOf<Pair<String, String>>())
     private val outcomes = Collections.synchronizedMap(HashMap<String, VoiceTurnOutcome>())
     private val synthStarted = Collections.synchronizedList(mutableListOf<String>())
@@ -307,6 +307,8 @@ class ChunkedReplyGapTest {
         parkInGap(o)
         val watch = CoroutineScope(Dispatchers.Default).async { o.run(request("t2", "ZETA words", VoiceOrigin.WATCH)) }
         waitFor("the Watch acknowledgement") { timeline.contains("play:watch:ACK:Sending to home.") }
+        // The original is submitted (and its script channel created) on the orchestrator's thread after the acknowledgement; the test must not race it.
+        waitFor("the Watch request awaiting") { phases(o)["t2"] == PendingPhase.AWAITING }
         script("ZETA words").send(RecipientEvent.Complete("home final", "complete"))
         synthGates.getValue(chunks[1]).complete(Unit)
         assertTrue(run.await() is VoiceTurnOutcome.Completed)

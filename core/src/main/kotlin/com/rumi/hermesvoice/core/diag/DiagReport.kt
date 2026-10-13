@@ -10,9 +10,18 @@ enum class WatchDiagStatus(val wire: String) {
 }
 
 /** The Watch's part: events whose times are ages in ms before the Watch answered. Never more than [DiagWire.MAX_EVENTS]. */
-data class WatchDiag(val status: WatchDiagStatus, val events: List<WireEvent> = emptyList(), val dropped: Long = 0) {
-    init { require(status == WatchDiagStatus.REACHABLE || events.isEmpty()) { "only a readable Watch carries events" } }
+data class WatchDiag(
+    val status: WatchDiagStatus,
+    val events: List<WireEvent> = emptyList(),
+    val dropped: Long = 0,
+    /** The Watch's answer in the newer schema (coverage, app identity, network category), or null for an older Watch. */
+    val v2: WatchDiagV2? = null,
+) {
+    init { require(status == WatchDiagStatus.REACHABLE || (events.isEmpty() && v2 == null)) { "only a readable Watch carries events" } }
 }
+
+/** What only a Watch of this version adds to its answer. */
+data class WatchDiagV2(val coverage: WireCoverage, val app: DiagApp, val network: DiagNetwork, val omittedForSize: Long, val schema: Int = DiagWireV2.SCHEMA)
 
 /** An event as it travels and is exported: age before the report, pseudonymous ref, fixed words and small numbers. */
 data class WireEvent(
@@ -23,6 +32,12 @@ data class WireEvent(
     val n: Int?,
     val ms: Long?,
     val fail: DiagFail?,
+    val stage: DiagStage? = null,
+    val cause: DiagCause? = null,
+    val modality: DiagModality? = null,
+    val conn: DiagConn? = null,
+    val status: Int? = null,
+    val stt: DiagStt? = null,
 )
 
 /** The transport of one Watch part: a bounded JSON document with a closed schema, checked strictly on arrival. */
@@ -31,6 +46,8 @@ object DiagWire {
     const val MAX_BYTES = 32 * 1024
     const val MAX_EVENTS = 160
     private val EVENT_KEYS = setOf("age_ms", "code", "origin", "ref", "n", "ms", "fail")
+    internal val EVENT_KEYS_V2 = EVENT_KEYS + setOf("stage", "cause", "modality", "conn", "status")
+    internal val EVENT_KEYS_V3 = EVENT_KEYS_V2 + "stt"
     private val TOP_KEYS = setOf("schema", "salt", "dropped", "events")
 
     fun encodeRequest(salt: String): ByteArray = JSONObject().put("schema", SCHEMA).put("salt", salt).toString().toByteArray(Charsets.UTF_8)
@@ -47,8 +64,32 @@ object DiagWire {
         }
     }
 
-    /** The Watch's answer: its events as pseudonymous, bounded wire events, newest last, trimmed to the size bound. */
-    fun encodeResponse(salt: String, events: List<DiagEvent>, dropped: Long, now: Long): ByteArray {
+    /**
+     * The newer request: the same two keys under schema 2. It travels on its own message path, which a Watch that only knows
+     * schema 1 has no handler for, so it ignores it; that is how [DiagWatchClient] finds out that it must ask again in schema 1.
+     */
+    fun encodeRequestV2(salt: String): ByteArray = JSONObject().put("schema", DiagWireV2.SCHEMA).put("salt", salt).toString().toByteArray(Charsets.UTF_8)
+
+    /** Schema 3 adds the STT detail and the newer event kinds; like schema 2 it travels on a path an older Watch ignores. */
+    fun encodeRequestV3(salt: String): ByteArray = JSONObject().put("schema", DiagWireV2.SCHEMA_3).put("salt", salt).toString().toByteArray(Charsets.UTF_8)
+
+    /** The (schema, salt) of a request in either schema, or null for anything that is not exactly a request. */
+    fun decodeRequestAny(bytes: ByteArray): Pair<Int, String>? {
+        if (bytes.size > 256) return null
+        return try {
+            val json = JSONObject(String(bytes, Charsets.UTF_8))
+            if (json.keys().asSequence().toSet() != setOf("schema", "salt")) return null
+            val schema = (json.opt("schema") as? Int)?.takeIf { it == SCHEMA || it == DiagWireV2.SCHEMA || it == DiagWireV2.SCHEMA_3 } ?: return null
+            val salt = (json.opt("salt") as? String)?.takeIf { DiagPseudonyms.SALT_FORMAT.matches(it) } ?: return null
+            schema to salt
+        } catch (_: JSONException) {
+            null
+        }
+    }
+
+    /** The Watch's answer in schema 1: only the original kinds of event and fields, so an older Phone reads it unchanged. */
+    fun encodeResponse(salt: String, allEvents: List<DiagEvent>, dropped: Long, now: Long): ByteArray {
+        val events = allEvents.filter { it.code.legacy }
         var keep = events.takeLast(MAX_EVENTS)
         while (true) {
             val bytes = build(salt, keep, dropped + (events.size - keep.size), now)
@@ -71,6 +112,12 @@ object DiagWire {
         e.n?.let { put("n", it) }
         e.ms?.let { put("ms", it) }
         e.fail?.let { put("fail", it.wire) }
+        e.stage?.let { put("stage", it.wire) }
+        e.cause?.let { put("cause", it.wire) }
+        e.modality?.let { put("modality", it.wire) }
+        e.conn?.let { put("conn", it.wire) }
+        e.status?.let { put("status", it) }
+        e.stt?.let { put("stt", DiagSttJson.encode(it)) }
     }
 
     /**
@@ -119,13 +166,13 @@ object DiagReport {
 
     /** What a report is made of; the consent dialog lists exactly these. */
     val CONTENT_LINES = listOf(
-        "Recent events of this phone: request stages, waiting and queue states, reply and speech-synthesis progress, playback and Stop results, with how long ago each happened.",
-        "The same kind of events from the Watch, if it can be reached now (otherwise only a note that it is offline).",
-        "Failure types as fixed words (for example timeout or disconnected), counts, durations, and which switches in Settings are on.",
+        "Events of this phone from the last 24 hours (at most 256), kept on the phone until you clear them: which step of a request ran (preparing, uploading, sending, waiting for or receiving the reply, speech, transfer to the Watch), failures as fixed categories such as timeout, no network or sign-in, counts, durations and how long ago each happened.",
+        "The same from the Watch, if it can be reached now (otherwise only a note that it is offline); the Watch keeps its own copy.",
+        "App version, a hash of the installed app file, the export time, the network type (Wi-Fi, mobile, VPN) and whether Android has validated it, and which Settings switches are on.",
         "Request references are one-time pseudonyms that are only valid inside this file.",
     )
     val EXCLUDED_LINES = listOf(
-        "No audio, what you said, replies, conversation names, addresses, accounts, passwords or tokens, device names or ids, and no error messages.",
+        "No audio, what you said, replies, conversation names, file names, addresses, Wi-Fi names, accounts, passwords or tokens, device names or ids, and no error messages.",
     )
 
     fun build(
@@ -162,8 +209,12 @@ object DiagReport {
  * The Phone's side of the scoped Watch request: one request in flight, answered by a Watch message that carries the request's
  * salt back. An answer for another salt (an earlier export) is ignored; no timer runs and nothing polls: the caller's own
  * bound ([DiagExporter]) ends the wait.
+ *
+ * It asks in the newest schema first. A Watch of an older version ignores a request it does not know, so after [newerWaitMs]
+ * without any answer it asks in the next older schema (3, then 2, then 1, which every version answers); an answer to any
+ * request is accepted whenever it arrives.
  */
-class DiagWatchClient(private val send: suspend (ByteArray) -> Boolean) {
+class DiagWatchClient(private val newerWaitMs: Long = NEWER_WAIT_MS, private val send: suspend (ByteArray) -> Boolean) {
     private class Waiting(val salt: String, val answer: kotlinx.coroutines.CompletableDeferred<WatchDiag>)
 
     @Volatile private var waiting: Waiting? = null
@@ -173,18 +224,23 @@ class DiagWatchClient(private val send: suspend (ByteArray) -> Boolean) {
         val entry = Waiting(salt, kotlinx.coroutines.CompletableDeferred())
         waiting = entry
         try {
-            val sent = try {
-                send(DiagWire.encodeRequest(salt))
-            } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                false
-            }
-            if (!sent) return WatchDiag(WatchDiagStatus.OFFLINE)
+            if (!deliver(DiagWire.encodeRequestV3(salt))) return WatchDiag(WatchDiagStatus.OFFLINE)
+            kotlinx.coroutines.withTimeoutOrNull(newerWaitMs) { entry.answer.await() }?.let { return it }
+            if (!deliver(DiagWire.encodeRequestV2(salt))) return WatchDiag(WatchDiagStatus.OFFLINE)
+            kotlinx.coroutines.withTimeoutOrNull(newerWaitMs) { entry.answer.await() }?.let { return it }
+            if (!deliver(DiagWire.encodeRequest(salt))) return WatchDiag(WatchDiagStatus.OFFLINE)
             return entry.answer.await()
         } finally {
             if (waiting === entry) waiting = null
         }
+    }
+
+    private suspend fun deliver(bytes: ByteArray): Boolean = try {
+        send(bytes)
+    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+        throw cancelled
+    } catch (error: Exception) {
+        false
     }
 
     fun onResponse(bytes: ByteArray) {
@@ -193,8 +249,17 @@ class DiagWatchClient(private val send: suspend (ByteArray) -> Boolean) {
             entry.answer.complete(WatchDiag(WatchDiagStatus.TOO_LARGE))
             return
         }
-        val salt = runCatching { JSONObject(String(bytes, Charsets.UTF_8)).opt("salt") }.getOrNull()
+        val head = runCatching { JSONObject(String(bytes, Charsets.UTF_8)) }.getOrNull()
+        val salt = head?.opt("salt")
         if (salt != null && salt != entry.salt) return
-        entry.answer.complete(DiagWire.decodeResponse(bytes, entry.salt))
+        entry.answer.complete(when (head?.opt("schema")) {
+            DiagWireV2.SCHEMA_3 -> DiagWireV2.decodeResponse(bytes, entry.salt, DiagWireV2.SCHEMA_3)
+            DiagWireV2.SCHEMA -> DiagWireV2.decodeResponse(bytes, entry.salt)
+            else -> DiagWire.decodeResponse(bytes, entry.salt)
+        })
+    }
+
+    companion object {
+        const val NEWER_WAIT_MS = 1_500L
     }
 }

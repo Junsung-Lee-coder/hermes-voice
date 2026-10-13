@@ -181,6 +181,17 @@ class BackgroundSession(
         return changed()
     }
 
+    /** The platform refused foreground admission after accepting the start request; the service ends itself. */
+    @Synchronized
+    fun onServiceRefused(generation: Long): BackgroundStatus {
+        if (!isCurrent(generation)) return status
+        running = false
+        microphone = false
+        refused = BackgroundNotice.REFUSED
+        this.generation += 1
+        return changed()
+    }
+
     /** The service of session [generation] is gone without the user's stop (the system ended it). */
     @Synchronized
     fun onServiceGone(generation: Long): BackgroundStatus {

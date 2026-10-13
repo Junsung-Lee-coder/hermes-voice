@@ -24,9 +24,10 @@ interface CapturePort {
  * when the user taps, and a wake-phrase request on trailing silence or the no-speech timeout.
  * [SIZE_LIMIT] is the recorder's storage bound (on the Watch the Data Layer frame, about 13 minutes
  * of audio), a storage failure: the recording is not sent rather than sent truncated.
+ * [INPUT_LOST] (Phone only): the headset microphone it records from disconnected; the capture so far is finalized like a tap.
  */
 enum class CaptureStop {
-    TAP_SEND, SILENCE, NO_SPEECH, SIZE_LIMIT, MIC_ERROR, LIFECYCLE, START_FAILED;
+    TAP_SEND, SILENCE, NO_SPEECH, SIZE_LIMIT, MIC_ERROR, LIFECYCLE, START_FAILED, INPUT_LOST;
 
     companion object {
         /** How a recorder's own end ([PcmCaptureLoop]) stops the capture, on either device. */
@@ -94,7 +95,7 @@ class CaptureCoordinator(
         haptics.onEnded(captureId)?.let(port::haptic)
         when (reason) {
             // A recording with no usable audio is never uploaded (see AudioInputGate).
-            CaptureStop.TAP_SEND, CaptureStop.SILENCE -> when {
+            CaptureStop.TAP_SEND, CaptureStop.SILENCE, CaptureStop.INPUT_LOST -> when {
                 wav == null -> port.discard("Too short")
                 inputGate(wav) != AudioInputVerdict.USABLE -> port.discard("No speech detected")
                 else -> port.upload(captureId, turnTrigger, wav)

@@ -15,7 +15,7 @@ import org.junit.Test
  * Each test asserts the positive LISTEN hold first, so a missing hold cannot pass as "nothing held".
  */
 class IdleGapNoHoldTest {
-    private fun hidden() = ComposedWatch(WakeLocation.OFF, watchStandby = true).apply { show(); start(); hide() }
+    private fun hidden() = ComposedWatch(WakeLocation.WATCH, watchStandby = true).apply { show(); start(); hide() }
 
     @Test
     fun `a window is held while open, released before the gap, and the gap holds nothing`() {

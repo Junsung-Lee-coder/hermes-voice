@@ -34,6 +34,8 @@ object WatchReaderLimits {
     const val MAX_CACHED_SESSIONS = 4
     const val MAX_MESSAGES_PER_SESSION = 200
     const val REQUEST_TIMEOUT_MS = 15_000L
+    /** Bound hidden/tool-only raw-page scanning per reader request. */
+    const val MAX_HIDDEN_SCAN_PAGES = 8
 }
 
 enum class ReaderKind(val wire: String) {
@@ -52,6 +54,7 @@ object ReaderError {
     const val UNAVAILABLE = "unavailable"
     const val TIMEOUT = "timeout"
     const val OFFLINE = "offline"
+    const val HISTORY_SCAN_LIMIT = "history_scan_limit"
 }
 
 data class ReaderRequest(
@@ -196,10 +199,26 @@ class PhoneReaderService(private val sessions: AppSessionRepository) {
         if (owned == null || owned.role != OwnedRole.CONVERSATION || owned.archived) {
             throw SessionNotOwnedException("not an active conversation of this app")
         }
-        val page = sessions.history(sessionId, request.limit, request.offset)
-        val messages = page.messages.map { ReaderMessageRow(it.rowId, it.role, it.text, truncated = false) }
-        return ReaderResponse(request.reqId, request.kind, ok = true, sessionId = sessionId, messages = messages,
-            offset = request.offset, nextOffset = request.offset + page.returned, hasOlder = page.returned >= request.limit)
+        // The server's cursor counts RAW rows; its projection filters tool/hidden/empty rows.
+        // A raw page with no visible conversation is not an empty conversation or a useful
+        // "Load older" landing page. Find the nearest displayable page, latest first, without
+        // changing request identity, resubmitting a turn or losing the exact raw cursor.
+        var offset = request.offset
+        repeat(WatchReaderLimits.MAX_HIDDEN_SCAN_PAGES) {
+            val page = sessions.history(sessionId, request.limit, offset)
+            if (page.sessionId != sessionId || page.returned < 0 || page.returned > request.limit ||
+                offset > Int.MAX_VALUE - page.returned) return failure(request, ReaderError.UNAVAILABLE)
+            val nextOffset = offset + page.returned
+            val hasOlder = page.returned >= request.limit
+            if (page.messages.isNotEmpty() || !hasOlder) {
+                val messages = page.messages.sortedBy { it.rowId }.map { ReaderMessageRow(it.rowId, it.role, it.text, truncated = false) }
+                return ReaderResponse(request.reqId, request.kind, ok = true, sessionId = sessionId, messages = messages,
+                    offset = request.offset, nextOffset = nextOffset, hasOlder = hasOlder)
+            }
+            offset = nextOffset
+        }
+        // Bounded work is not proof of no history. Preserve any cached rows and render an honest error.
+        return failure(request, ReaderError.HISTORY_SCAN_LIMIT)
     }
 
     /** Shortens message text step by step until the encoded response fits one Data Layer message. */
@@ -310,6 +329,7 @@ data class WatchReaderState(
             val history = histories.firstOrNull { it.pendingReqId == response.reqId && it.sessionId == response.sessionId }
             when {
                 history == null || response.sessionId != selectedSessionId -> this
+                response.ok && response.offset != (if (history.loadingOlder) history.nextOlderOffset else 0) -> this
                 response.ok -> putHistory(merge(history, response))
                 response.error == ReaderError.NOT_OWNED -> copy(selectedSessionId = null, surface = ReaderSurface.SESSIONS,
                     histories = histories.filterNot { it.sessionId == history.sessionId }, sessions = sessions.copy(stale = true))
@@ -338,8 +358,10 @@ data class WatchReaderState(
         }
         // Latest page. A full page that shares no row with the cache may hide a gap: start over from it.
         val overlaps = page.messages.any { it.rowId in known }
-        val merged = (history.messages + page.messages.filter { it.rowId !in known }).sortedBy { it.rowId }
-        val fresh = history.messages.isEmpty() || (!overlaps && page.hasOlder)
+        // Canonical same-id rows may grow from partial to final. Latest page wins by identity,
+        // not text; older cached rows and empty transient reads remain intact.
+        val merged = (history.messages + page.messages).associateBy { it.rowId }.values.sortedBy { it.rowId }
+        val fresh = history.messages.isEmpty() || (page.messages.isNotEmpty() && !overlaps && page.hasOlder)
         return if (fresh || merged.size > WatchReaderLimits.MAX_MESSAGES_PER_SESSION) {
             settled.copy(messages = page.messages.sortedBy { it.rowId }, nextOlderOffset = page.nextOffset, hasOlder = page.hasOlder)
         } else {

@@ -107,7 +107,12 @@ class PhoneBackgroundWakeTest {
         fun status() = background.status
     }
 
-    private fun startedAndHidden(): Phone = Phone().apply {
+    /** [continuous]: the Phone's screen-off recognition is on, so the background is the continuous loop (off: one 5 s budget per screen activation). */
+    private fun startedAndHidden(continuous: Boolean = false): Phone = Phone().apply {
+        if (continuous) {
+            settings = settings.copy(revision = settings.revision + 1).withScreenOff(phone = true)
+            background.onEligibilityChanged()
+        }
         background.onAppShown()
         background.start()
         background.onAppHidden()
@@ -221,7 +226,7 @@ class PhoneBackgroundWakeTest {
 
     @Test
     fun `failures back off up to a minute, a quiet window rearms quickly, and no recognizer stops the loop`() {
-        val phone = startedAndHidden()
+        val phone = startedAndHidden(continuous = true)
         phone.wake.onTimer() // no-op: deadline not reached
         phone.wake.onError(phone.wake.generation, 2) // network-type error: a failure
         assertTrue(phone.calls.contains("rearm_in:${ContinuousWakePolicy.FIRST_BACKOFF_MS}"))

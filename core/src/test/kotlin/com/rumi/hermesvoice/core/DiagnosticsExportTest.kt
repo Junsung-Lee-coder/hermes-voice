@@ -208,7 +208,8 @@ class DiagnosticsExportTest {
         val answer = CompletableDeferred<WatchDiag>()
         val job = launch { answer.complete(client.request(salt)) }
         runCurrent()
-        assertEquals(salt, DiagWire.decodeRequest(sent!!))
+        assertEquals("the newest request is offered first", 3 to salt, DiagWire.decodeRequestAny(sent!!))
+        assertNull("an older Watch cannot read it", DiagWire.decodeRequest(sent!!))
         client.onResponse(response(goodEvent, salt = "fedcba9876543210"))
         runCurrent()
         assertFalse("a foreign salt is ignored, not an error", answer.isCompleted)

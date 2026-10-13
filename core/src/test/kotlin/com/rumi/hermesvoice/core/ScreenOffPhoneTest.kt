@@ -33,7 +33,7 @@ class ScreenOffPhoneTest {
     internal class Rig(
         pref: Boolean,
         master: Boolean = true,
-        location: WakeLocation = WakeLocation.OFF,
+        location: WakeLocation = WakeLocation.PHONE,
         watchPref: Boolean = false,
         val store: InMemoryKeyValueStore = InMemoryKeyValueStore(),
     ) {
@@ -321,7 +321,7 @@ class ScreenOffPhoneTest {
     fun `the persisted settings drive the Phone after a restart with the visit that arms it`() {
         val store = InMemoryKeyValueStore()
         val saver = AppSettings(store)
-        saver.saveWatchSettings(saver.watchSettings().copy(phoneBackgroundWakeEnabled = true).withScreenOff(phone = true), 1_000L)
+        saver.saveWatchSettings(saver.watchSettings().copy(wakeLocation = WakeLocation.PHONE, phoneBackgroundWakeEnabled = true).withScreenOff(phone = true), 1_000L)
         val rig = Rig(pref = false, store = InMemoryKeyValueStore())
         rig.settings = AppSettings(store).watchSettings()
         rig.background.onEligibilityChanged()
@@ -358,14 +358,17 @@ class ScreenOffPhoneTest {
     }
 
     @Test
-    fun `the foreground location does not keep a screen-off Phone listening and the Watch settings are not its inputs`() {
+    fun `Listen on selecting the Phone does not keep a screen-off Phone listening and the Watch settings are not its inputs`() {
         val phone = Rig(pref = false, location = WakeLocation.BOTH, watchPref = true).startedAndHidden()
         phone.assertListening("hidden, screen on")
         phone.screenOff()
         phone.assertIdleGone("location Both and the Watch preference do not decide the Phone")
-        val other = Rig(pref = true, location = WakeLocation.WATCH, watchPref = false).startedAndHidden()
+        val other = Rig(pref = true, location = WakeLocation.PHONE, watchPref = false).startedAndHidden()
         other.screenOff()
         other.assertListening("the Phone's own preference decides")
+        val excluded = Rig(pref = true, location = WakeLocation.WATCH, watchPref = false).startedAndHidden()
+        excluded.screenOff()
+        excluded.assertIdleGone("Listen on leaves the Phone out: its own preference and standby decide nothing")
     }
 
     @Test

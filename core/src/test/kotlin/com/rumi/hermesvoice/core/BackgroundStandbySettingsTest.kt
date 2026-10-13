@@ -133,15 +133,16 @@ class BackgroundStandbySettingsTest {
     }
 
     @Test
-    fun `listening arbitration and the Both claim depend on who may listen not on the foreground location alone`() {
+    fun `listening arbitration and the Both claim depend on Listen on alone, never on a standby switch`() {
         val offBoth = WatchSettings(WakeLocation.OFF, phoneBackgroundWakeEnabled = true, watchBackgroundWakeEnabled = true)
-        assertTrue("both standbys on with location OFF still need arbitration", offBoth.arbitrationRequired)
-        assertTrue(offBoth.mayListen(VoiceOrigin.PHONE))
-        assertTrue(offBoth.mayListen(VoiceOrigin.WATCH))
+        assertFalse("both standbys on with Listen on Off need no arbitration", offBoth.arbitrationRequired)
+        assertFalse(offBoth.mayListen(VoiceOrigin.PHONE))
+        assertFalse(offBoth.mayListen(VoiceOrigin.WATCH))
         val watchOnly = WatchSettings(WakeLocation.OFF, watchBackgroundWakeEnabled = true)
         assertFalse(watchOnly.arbitrationRequired)
         assertFalse(watchOnly.mayListen(VoiceOrigin.PHONE))
-        assertTrue(WatchSettings(WakeLocation.PHONE, watchBackgroundWakeEnabled = true).arbitrationRequired)
+        assertFalse(watchOnly.mayListen(VoiceOrigin.WATCH))
+        assertFalse(WatchSettings(WakeLocation.PHONE, watchBackgroundWakeEnabled = true).arbitrationRequired)
         assertTrue(WatchSettings(WakeLocation.BOTH).arbitrationRequired)
         assertFalse(WatchSettings(WakeLocation.WATCH).arbitrationRequired)
     }

@@ -29,6 +29,7 @@ import com.rumi.hermesvoice.core.watchlink.WatchAckRegistry
 import com.rumi.hermesvoice.core.watchlink.WatchTurnIntake
 import java.io.IOException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.isActive
 import okhttp3.OkHttpClient
 
 /** Result of a text-chat send; the transcript itself is re-read from history after the turn. */
@@ -37,38 +38,167 @@ sealed class ChatSendResult {
 
     /** Hermes accepted the message but its reply could not be attributed (busy session); refresh history later. */
     data class Accepted(val submitStatus: String) : ChatSendResult()
-    data class Failed(val reason: String, val authRequired: Boolean = false) : ChatSendResult()
+
+    /**
+     * [reason] is the legacy text the UI already shows. [stage], [cause] and [acceptanceObserved] are what the diagnostics observed
+     * (fixed words only): [acceptanceObserved] is true only when Hermes was seen to accept the message before the failure.
+     */
+    data class Failed(
+        val reason: String,
+        val authRequired: Boolean = false,
+        val stage: com.rumi.hermesvoice.core.diag.DiagStage? = null,
+        val cause: com.rumi.hermesvoice.core.diag.DiagCause? = null,
+        val acceptanceObserved: Boolean = false,
+    ) : ChatSendResult()
 }
 
-/** Text chat into an app-owned conversation. Replies are shown, not spoken. */
-class ChatService(private val sessions: AppSessionRepository, private val replyTimeoutMs: Long = 15 * 60_000L) {
-    suspend fun send(storedSessionId: String, text: String, attachments: List<OutgoingAttachment> = emptyList()): ChatSendResult {
+/** Text chat into an app-owned conversation. Replies are shown; they are spoken only through a connected headset with "Use headset" on. */
+class ChatService(
+    private val sessions: AppSessionRepository,
+    private val replyTimeoutMs: Long = 15 * 60_000L,
+    /** Told of each final text answer received (never spoken, so always unheard); one send, one identity. */
+    private val finalReply: (com.rumi.hermesvoice.core.notify.FinalReply) -> Unit = {},
+    private val newSendId: () -> String = { java.util.UUID.randomUUID().toString() },
+    /**
+     * The Phone's "Use headset": speaks a typed answer through the connected headset (see [VoiceTurnOrchestrator.speakTypedFinal]).
+     * True when it took the answer, which it then reports through its callback exactly once; false (or null): the answer is only shown.
+     */
+    private val typedFinal: ((turnId: String, storedSessionId: String, text: String, done: (heard: Boolean, cancelled: Boolean, detail: String) -> Unit) -> Boolean)? = null,
+    /** The headset is the private output now: a text answer's alert is then visual only. */
+    private val privateOutput: () -> Boolean = { false },
+    /** Where the transient "Hermes is working" slot of each attributable request is published; null: none. */
+    private val activity: com.rumi.hermesvoice.core.activity.ActivityFeed? = null,
+    /** The typed diagnostic events of each send attempt (a fresh opaque reference per attempt); null: none recorded. */
+    private val diag: com.rumi.hermesvoice.core.diag.DiagLog? = null,
+) {
+    /** One send attempt as the diagnostics see it: classifies by type, never reads a message, never throws. */
+    private class Probe(
+        val log: com.rumi.hermesvoice.core.diag.DiagLog?,
+        val modality: com.rumi.hermesvoice.core.diag.DiagModality,
+        val trace: com.rumi.hermesvoice.core.diag.DiagTrace,
+    ) {
+        val ref: String? = if (log != null) com.rumi.hermesvoice.core.diag.DiagPseudonyms.newRef() else null
+        private val started = System.nanoTime()
+        private val conn = log?.connectivityNow() ?: com.rumi.hermesvoice.core.diag.DiagConn.UNKNOWN
+        fun elapsedMs(): Long = (System.nanoTime() - started) / 1_000_000
+
+        fun begin(attachments: Int) {
+            log?.record(com.rumi.hermesvoice.core.diag.DiagCode.REQUEST_STARTED, com.rumi.hermesvoice.core.diag.DiagOrigin.PHONE, ref,
+                n = attachments.takeIf { it > 0 }, modality = modality, opaqueRef = true)
+        }
+
+        fun accepted() {
+            trace.stage = com.rumi.hermesvoice.core.diag.DiagStage.WAIT
+            log?.record(com.rumi.hermesvoice.core.diag.DiagCode.REQUEST_ACCEPTED, com.rumi.hermesvoice.core.diag.DiagOrigin.PHONE, ref,
+                ms = elapsedMs(), stage = com.rumi.hermesvoice.core.diag.DiagStage.SUBMIT, modality = modality, opaqueRef = true)
+        }
+
+        fun completed() {
+            log?.record(com.rumi.hermesvoice.core.diag.DiagCode.REQUEST_COMPLETED, com.rumi.hermesvoice.core.diag.DiagOrigin.PHONE, ref,
+                ms = elapsedMs(), modality = modality, opaqueRef = true)
+        }
+
+        /** The failure result for [error] seen at the stage the request had reached; recorded once. */
+        fun failed(error: Throwable, reason: String, acceptanceObserved: Boolean): ChatSendResult.Failed {
+            val classified = com.rumi.hermesvoice.core.diag.DiagClassify.of(error, conn)
+            val stage = trace.stage
+            log?.record(com.rumi.hermesvoice.core.diag.DiagCode.REQUEST_FAILED, com.rumi.hermesvoice.core.diag.DiagOrigin.PHONE, ref,
+                ms = elapsedMs(), fail = classified.fail, stage = stage, cause = classified.cause, modality = modality,
+                status = classified.status, opaqueRef = true)
+            return ChatSendResult.Failed(reason, classified.fail == com.rumi.hermesvoice.core.diag.DiagFail.AUTH && error is HermesAuthRequiredException,
+                stage, classified.cause, acceptanceObserved)
+        }
+
+        /** A cancellation: the user's Stop when this coroutine is cancelled, otherwise an internal timeout that is a failure. */
+        suspend fun interrupted(error: kotlinx.coroutines.CancellationException) {
+            if (kotlinx.coroutines.currentCoroutineContext().isActive) {
+                failed(error, "", false)
+            } else {
+                log?.record(com.rumi.hermesvoice.core.diag.DiagCode.REQUEST_STOPPED, com.rumi.hermesvoice.core.diag.DiagOrigin.PHONE, ref,
+                    ms = elapsedMs(), fail = com.rumi.hermesvoice.core.diag.DiagFail.CANCELLED, stage = trace.stage,
+                    cause = com.rumi.hermesvoice.core.diag.DiagCause.CANCELLED, modality = modality, opaqueRef = true)
+            }
+        }
+    }
+
+    /** [onAccepted]: Hermes has the message (the submit succeeded); called once, before any wait for the reply. */
+    suspend fun send(storedSessionId: String, text: String, attachments: List<OutgoingAttachment> = emptyList(), onAccepted: () -> Unit = {}): ChatSendResult {
+        val trace = com.rumi.hermesvoice.core.diag.DiagTrace()
+        val probe = Probe(diag, if (attachments.isEmpty()) com.rumi.hermesvoice.core.diag.DiagModality.TEXT else com.rumi.hermesvoice.core.diag.DiagModality.ATTACHMENT, trace)
+        probe.begin(attachments.size)
+        return kotlinx.coroutines.withContext(trace) { sendTraced(probe, storedSessionId, text, attachments, onAccepted) }
+    }
+
+    private suspend fun sendTraced(probe: Probe, storedSessionId: String, text: String, attachments: List<OutgoingAttachment>, onAccepted: () -> Unit): ChatSendResult {
         val turn: SubmittedTurn = try {
             sessions.sendMessage(storedSessionId, text, attachments)
         } catch (error: HermesAuthRequiredException) {
-            return ChatSendResult.Failed(error.message ?: "sign-in required", authRequired = true)
+            return probe.failed(error, error.message ?: "sign-in required", false).copy(authRequired = true)
         } catch (error: HermesException) {
-            return ChatSendResult.Failed(error.message ?: error.javaClass.simpleName)
+            return probe.failed(error, error.message ?: error.javaClass.simpleName, false)
         } catch (error: IllegalArgumentException) {
-            return ChatSendResult.Failed(error.message ?: "invalid message")
+            return probe.failed(error, error.message ?: "invalid message", false)
         } catch (error: IOException) {
-            return ChatSendResult.Failed("network: ${error.javaClass.simpleName}")
+            return probe.failed(error, "network: ${error.javaClass.simpleName}", false)
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            probe.interrupted(error)
+            throw error
+        } catch (error: RuntimeException) {
+            probe.failed(error, "", false)
+            throw error
         }
+        probe.accepted()
+        runCatching { onAccepted() }
         if (!turn.attributable) {
             turn.release()
             return ChatSendResult.Accepted(turn.submitStatus)
         }
         var reply: RecipientEvent.Complete? = null
+        var replied = false
+        val slot = "chat-activity-${java.util.UUID.randomUUID()}"
+        activity?.begin(slot, storedSessionId)
         return try {
-            turn.collect(replyTimeoutMs) { event -> if (event is RecipientEvent.Complete) reply = event }
-            reply?.let { ChatSendResult.Replied(it.text, it.status) } ?: ChatSendResult.Accepted(turn.submitStatus)
+            turn.collect(replyTimeoutMs) { event ->
+                probe.trace.stage = com.rumi.hermesvoice.core.diag.DiagStage.RECEIVE
+                when (event) {
+                    is RecipientEvent.Complete -> reply = event
+                    is RecipientEvent.Activity -> activity?.update(slot, event.label)
+                    is RecipientEvent.Interim -> com.rumi.hermesvoice.core.activity.ActivityLabels.interim(event.text)?.let { activity?.update(slot, it) }
+                }
+            }
+            reply?.let { received ->
+                if (received.text.isNotBlank() && (received.status == null || received.status == "complete")) {
+                    replied = true
+                    val sendId = "chat-${newSendId()}"
+                    val identity = com.rumi.hermesvoice.core.notify.ReplyAlert.identityOf(sendId, "reply")
+                    val quiet = runCatching { privateOutput() }.getOrDefault(false)
+                    fun report(heard: Boolean, cancelled: Boolean) {
+                        runCatching {
+                            finalReply(com.rumi.hermesvoice.core.notify.FinalReply(identity, storedSessionId,
+                                VoiceOrigin.PHONE, heard = heard, cancelled = cancelled, source = com.rumi.hermesvoice.core.notify.FinalReplySource.TEXT, text = received.text, quiet = quiet))
+                        }
+                    }
+                    // Spoken on the headset only when the Phone took it (setting on, headset connected); it then reports what became of the audio.
+                    val spoken = runCatching { typedFinal?.invoke(sendId, storedSessionId, received.text) { heard, cancelled, _ -> report(heard, cancelled) } }.getOrNull() == true
+                    if (!spoken) report(heard = false, cancelled = false)
+                }
+                probe.completed()
+                ChatSendResult.Replied(received.text, received.status)
+            } ?: ChatSendResult.Accepted(turn.submitStatus)
         } catch (error: HermesException) {
-            ChatSendResult.Failed("sent, but the reply failed: ${error.message}")
+            probe.failed(error, "sent, but the reply failed: ${error.message}", true)
         } catch (error: IOException) {
-            ChatSendResult.Failed("sent, but the connection dropped: ${error.javaClass.simpleName}")
+            probe.failed(error, "sent, but the connection dropped: ${error.javaClass.simpleName}", true)
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            probe.interrupted(error)
+            throw error
+        } catch (error: RuntimeException) {
+            probe.failed(error, "", true)
+            throw error
         } finally {
-            // Text replies are shown, never followed or spoken.
+            // Text replies are shown and never followed; only "Use headset" speaks one (above).
             turn.release()
+            activity?.end(slot, replied)
         }
     }
 }
@@ -112,27 +242,50 @@ class HermesVoiceCore(
     routerRuntime: SessionRuntimeSpec? = RouterRuntime.LUNA_LOW,
     /** The Phone's typed diagnostic events (user-shared only; see [com.rumi.hermesvoice.core.diag.DiagExporter]). Null: none recorded. */
     diag: com.rumi.hermesvoice.core.diag.DiagLog? = null,
+    /** The arrival alert for an unspoken final answer (see [com.rumi.hermesvoice.core.notify.ReplyAlerts]); null: none. */
+    replyAlerts: com.rumi.hermesvoice.core.notify.ReplyAlerts? = null,
+    /** The Phone's "Use headset" over the live audio endpoints; null: none (no headset behavior at all). */
+    headset: com.rumi.hermesvoice.core.headset.HeadsetPolicy? = null,
+    /** The Phone's own speaker sink, used for typed chat answers read through the headset (they never go to the Watch). */
+    phoneSink: com.rumi.hermesvoice.core.voice.PlaybackSink? = null,
+    /** How a recording is transcribed again while the speech server is temporarily unavailable (see [com.rumi.hermesvoice.core.voice.SttRecoveryPolicy]). */
+    sttPolicy: com.rumi.hermesvoice.core.voice.SttRecoveryPolicy = com.rumi.hermesvoice.core.voice.SttRecoveryPolicy(),
+    /** The clock that counts the recovery budget (real time; the Phone passes elapsed-realtime so a sleeping device still counts). */
+    recoveryClock: (() -> Long)? = null,
+    /** How the audio of a final reply is tried again after a transient synthesis failure (see [com.rumi.hermesvoice.core.voice.AudioRecoveryPolicy]). */
+    audioPolicy: com.rumi.hermesvoice.core.voice.AudioRecoveryPolicy = com.rumi.hermesvoice.core.voice.AudioRecoveryPolicy(),
+    /** Device-local keeping of replies that ended without audio, so a manual Replay survives a process end; null: in memory only. */
+    unplayedStore: com.rumi.hermesvoice.core.voice.UnplayedReplyStore? = null,
 ) {
+    private val finalReply: (com.rumi.hermesvoice.core.notify.FinalReply) -> Unit = { reply -> replyAlerts?.onFinalReply(reply) }
     val sessions = AppSessionRepository(sessionsApi, conversations, registry, routerRuntime = routerRuntime,
         diagnostic = { line -> voiceListener.onDiagnostic("", "router", line) })
-    val chat = ChatService(sessions)
+    val chat: ChatService
     /** Arbitrates the wake phrase when both devices listen: one spoken wake episode, one admitted device. */
     val wakeAdmission = WakeAdmission(clock, settings::watchSettings,
         epochs = object : WakeEpochStore {
             override fun load(): Long = settings.wakeEpoch
             override fun save(epoch: Long) { settings.wakeEpoch = epoch }
         },
-        onAnswered = { episode -> onWakeEpisode(episode) })
+        onAnswered = { episode -> onWakeEpisode(episode) }).also { settings.onWatchSettingsSaved = it::settingsChanged }
 
     /** Told of each admitted wake request in Both (see [WakeAdmission]); the Phone app publishes it to the Watch. */
     @Volatile var onWakeEpisode: (WakeEpisode) -> Unit = {}
+    /** The transient activity slots of in-flight requests (typed and voice); the Phone screen observes it, nothing is stored. */
+    val activity = com.rumi.hermesvoice.core.activity.ActivityFeed()
     val orchestrator = VoiceTurnOrchestrator(speech, sessions.guardedPort(), config = ::voiceConfig, listener = voiceListener,
         recipientCreator = sessions.recipientCreator(),
         admission = { request -> wakeAdmission.admitTurn(request.wakeTurn, request.origin, request.originNodeId, request.wakeClaimId) },
         laterScope = laterScope, laterWindowMs = laterWindowMs ?: VoiceTurnOrchestrator.LATER_WINDOW_MS,
         laterWindowProvider = if (laterWindowMs != null) null else ({ settings.laterReplyWindowMillis }), laterWork = laterWork,
         laterEnabled = laterEnabled, wakeListening = wakeListening, laterDeferMaxMs = laterDeferMaxMs,
-        ownership = ownership, laterSpeaker = laterSpeaker)
+        ownership = ownership, laterSpeaker = laterSpeaker, finalReply = finalReply, headset = headset, privateSink = phoneSink, activity = activity,
+        sttPolicy = sttPolicy, recoveryClock = recoveryClock ?: { System.nanoTime() / 1_000_000 }, audioPolicy = audioPolicy, unplayedStore = unplayedStore)
+    init {
+        chat = ChatService(sessions, finalReply = finalReply,
+            typedFinal = if (phoneSink == null) null else { turnId, storedSessionId, text, done -> orchestrator.speakTypedFinal(turnId, phoneSink, text, storedSessionId, done) },
+            privateOutput = { headset?.output() != null }, activity = activity, diag = diag)
+    }
     val watchAcks = WatchAckRegistry()
     /** A Watch turn's routing is the Phone's switch when its upload arrives; routing off uses the Watch's selection. */
     val watchIntake = WatchTurnIntake(orchestrator, watchAcks,
@@ -170,11 +323,19 @@ class HermesVoiceCore(
             /** The routing session's model setup limits (production: 90 s in all, a switch only with 5 s left, 2 s of it for the readback; tests may shorten them). */
             runtimeSetupLimits: RuntimeSetupLimits = RuntimeSetupLimits(),
             diag: com.rumi.hermesvoice.core.diag.DiagLog? = null,
+            replyAlerts: com.rumi.hermesvoice.core.notify.ReplyAlerts? = null,
+            headset: com.rumi.hermesvoice.core.headset.HeadsetPolicy? = null,
+            phoneSink: com.rumi.hermesvoice.core.voice.PlaybackSink? = null,
+            sttPolicy: com.rumi.hermesvoice.core.voice.SttRecoveryPolicy = com.rumi.hermesvoice.core.voice.SttRecoveryPolicy(),
+            recoveryClock: (() -> Long)? = null,
+            audioPolicy: com.rumi.hermesvoice.core.voice.AudioRecoveryPolicy = com.rumi.hermesvoice.core.voice.AudioRecoveryPolicy(),
+            unplayedStore: com.rumi.hermesvoice.core.voice.UnplayedReplyStore? = null,
         ): Pair<HermesVoiceCore, HermesGatewayConnector> {
             val dashboard = HermesDashboardClient(endpoint, http, tokens, settings.profile.ifBlank { null })
             val connector = HermesGatewayConnector(dashboard, http)
             val core = HermesVoiceCore(dashboard, dashboard, GatewayConversationPort(settings.profile.ifBlank { null }, runtimeSetupLimits) { connector.connection() }, registry, settings,
-                voiceListener, clock, laterScope, laterWindowMs, laterWork, wakeListening, laterDeferMaxMs, laterEnabled, ownership, laterSpeaker, diag = diag)
+                voiceListener, clock, laterScope, laterWindowMs, laterWork, wakeListening, laterDeferMaxMs, laterEnabled, ownership, laterSpeaker, diag = diag, replyAlerts = replyAlerts, headset = headset, phoneSink = phoneSink,
+                sttPolicy = sttPolicy, recoveryClock = recoveryClock, audioPolicy = audioPolicy, unplayedStore = unplayedStore)
             return core to connector
         }
     }

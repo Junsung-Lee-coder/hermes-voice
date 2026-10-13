@@ -35,6 +35,10 @@ data class WatchTalkState(
     val speakingTurnId: String? = null,
     /** Earlier delivered requests still waiting for their reply, oldest first (bounded by [MAX_EARLIER]); nothing is held for them. */
     val earlier: List<String> = emptyList(),
+    /** The finished request whose reply audio did not play: the Watch may ask the Phone to play it again (cleared by any new state). */
+    val replayTurnId: String? = null,
+    /** The finished request whose reply the Phone was asked to play again; its next terminal state is shown even though the request had ended. */
+    val replayingTurnId: String? = null,
 ) {
     /** Whether another request may start while this one waits: a waiting request only waits, and the bound is not reached. */
     private val roomToStart: Boolean get() = phase == WatchPhase.IDLE || (phase == WatchPhase.WAITING && earlier.size < MAX_EARLIER)
@@ -69,15 +73,28 @@ data class WatchTalkState(
     fun stopped(reason: String): WatchTalkState =
         if (turnId == null && earlier.isEmpty()) this else WatchTalkState(line = reason, speakingTurnId = speakingTurnId)
 
+    /** The Watch asked the Phone to play [replayTurnId]'s reply again: the control goes away until the Phone says it failed again. */
+    fun replayRequested(): WatchTalkState =
+        if (replayTurnId == null) this else copy(replayTurnId = null, replayingTurnId = replayTurnId, line = REPLAY_REQUESTED)
+
     fun onPhoneState(message: TurnStateMessage): WatchTalkState {
         if (message.turnId in earlier) {
             // An earlier request ended or only changed stage: its own end leaves the waiting list, nothing else touches the current one.
             return if (message.terminal) copy(earlier = earlier - message.turnId) else this
         }
-        if (message.turnId != turnId) return this
-        if (message.terminal) return WatchTalkState(line = message.detail, speakingTurnId = speakingTurnId, earlier = earlier)
+        if (message.turnId != turnId) {
+            if (message.turnId != replayingTurnId || !message.terminal) return this
+            // A newer request of this Watch is in progress: its state is not overwritten by the older reply's replay result.
+            if (phase != WatchPhase.IDLE) return copy(replayingTurnId = null)
+            return WatchTalkState(line = message.detail, speakingTurnId = speakingTurnId, earlier = earlier,
+                replayTurnId = if (message.replay) message.turnId else null)
+        }
+        if (message.terminal) return WatchTalkState(line = message.detail, speakingTurnId = speakingTurnId, earlier = earlier,
+            replayTurnId = if (message.replay) message.turnId else null)
         val line = when (message.stage) {
             "transcribing" -> "Transcribing…"
+            "stt_recovering" -> STT_RECOVERING
+            "audio_recovering" -> AUDIO_RECOVERING
             "routing" -> "Choosing where to send…"
             "creating" -> "Creating a conversation…"
             "routed" -> "→ ${message.detail}"
@@ -111,6 +128,14 @@ data class WatchTalkState(
 
         /** The request waits for the earlier request to the same conversation to be answered; it is sent after that. */
         const val QUEUED = "Queued behind an earlier request…"
+
+        /** The speech server is temporarily unavailable; the phone keeps the recording and tries again (Stop cancels it). */
+        const val STT_RECOVERING = "Waiting for the speech server…"
+
+        /** The reply's audio did not play yet; the Phone is trying again (Stop cancels it). */
+        const val AUDIO_RECOVERING = "Reply audio did not play yet - trying again…"
+
+        const val REPLAY_REQUESTED = "Asking the phone to play the reply again…"
 
         const val TOO_MANY = "Too many requests are waiting. Wait for a reply or Stop"
 

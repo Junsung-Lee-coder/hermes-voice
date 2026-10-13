@@ -15,6 +15,8 @@ import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
@@ -119,7 +121,7 @@ class HermesDashboardClient(
     private val http: OkHttpClient,
     private val tokens: HermesTokenStore,
     private val profile: String? = null,
-) : HermesSpeechGateway, HermesSessionsApi {
+) : HermesSpeechGateway, HermesSessionsApi, StoredFileSource {
     private val refreshLock = Mutex()
 
     suspend fun exchangeNativeCode(code: String, codeVerifier: String): HermesBearerSession = withContext(Dispatchers.IO) {
@@ -148,7 +150,7 @@ class HermesDashboardClient(
         require(mime.startsWith("audio/")) { "transcription payload must be audio/*" }
         val dataUrl = "data:$mime;base64," + Base64.getEncoder().encodeToString(audio)
         val json = authorized(endpoint.route("api/audio/transcribe"), "POST",
-            JSONObject().put("data_url", dataUrl).put("mime_type", mime))
+            JSONObject().put("data_url", dataUrl).put("mime_type", mime), sttBoundary = true)
         if (!json.optBoolean("ok", false)) throw HermesProtocolException("transcription response not ok")
         return json.optString("transcript").trim()
     }
@@ -206,6 +208,41 @@ class HermesDashboardClient(
         return HistoryPage.parse(authorized(url, "GET", null))
     }
 
+    /**
+     * A stored file named in a message, through the dashboard's existing authenticated routes (bearer header only; the path is
+     * the sole query value): images from `GET /api/media?path=`, anything else (or an image that route refuses) from
+     * `GET /api/files/read?path=`. Both answer JSON with a base64 `data_url`; the body and the decoded bytes are bounded by
+     * [StoredFileSource.MAX_BYTES]. The dashboard decides what it will serve; a refusal is reported, never worked around.
+     */
+    override suspend fun fetchStoredFile(ref: com.rumi.hermesvoice.core.attachments.AttachmentRef): StoredFile {
+        val image = ref.kind == com.rumi.hermesvoice.core.attachments.RefKind.IMAGE ||
+            ref.name.substringAfterLast('.', "").lowercase() in setOf("png", "jpg", "jpeg", "gif", "webp")
+        val first = if (image) "api/media" else "api/files/read"
+        return try {
+            readStoredFile(first, ref)
+        } catch (error: HermesHttpException) {
+            if (!image || error.status !in setOf(400, 403, 404, 415)) throw error
+            readStoredFile("api/files/read", ref)
+        }
+    }
+
+    private suspend fun readStoredFile(route: String, ref: com.rumi.hermesvoice.core.attachments.AttachmentRef): StoredFile {
+        val url = endpoint.route(route).newBuilder().addQueryParameter("path", ref.path).build()
+        val json = authorized(url, "GET", null, scoped = false, maxBytes = StoredFileSource.MAX_BODY_BYTES)
+        val dataUrl = json.optString("data_url")
+        if (!dataUrl.startsWith("data:") || !dataUrl.contains(";base64,")) throw HermesProtocolException("the file response has no base64 data")
+        val encoded = dataUrl.substringAfter(";base64,")
+        if (encoded.length > (StoredFileSource.MAX_BYTES.toLong() * 4 / 3 + 8)) throw HermesProtocolException("the file is larger than the ${StoredFileSource.MAX_BYTES / (1024 * 1024)} MiB preview limit")
+        val bytes = try {
+            Base64.getDecoder().decode(encoded)
+        } catch (error: IllegalArgumentException) {
+            throw HermesProtocolException("the file response is not valid base64", error)
+        }
+        if (bytes.isEmpty()) throw HermesProtocolException("the file is empty")
+        val mime = json.optString("mime_type").ifBlank { dataUrl.substringBefore(";base64,").removePrefix("data:") }
+        return StoredFile(ref.name, mime.substringBefore(';').trim().lowercase().ifEmpty { "application/octet-stream" }, bytes)
+    }
+
     /** `PATCH /api/sessions/{id}` with `{archived}`; the profile rides in the body as the route expects. */
     override suspend fun setArchived(sessionId: String, archived: Boolean) {
         val body = JSONObject().put("archived", archived)
@@ -220,16 +257,19 @@ class HermesDashboardClient(
      * socket, so every request + parse runs on [Dispatchers.IO]: Android forbids network I/O on the
      * main thread (NetworkOnMainThreadException), which is where ViewModel coroutines run.
      */
-    private suspend fun authorized(url: HttpUrl, method: String, body: JSONObject?, scoped: Boolean = true, synthesis: Boolean = false): JSONObject =
+    private suspend fun authorized(url: HttpUrl, method: String, body: JSONObject?, scoped: Boolean = true, synthesis: Boolean = false,
+                                   maxBytes: Long = Long.MAX_VALUE, sttBoundary: Boolean = false): JSONObject =
         withContext(Dispatchers.IO) {
-            if (!synthesis) return@withContext authorizedOnIo(url, method, body, scoped, http, null)
-            // The synthesis request has no elapsed limit, so its call is cancelled with the coroutine: this also ends a
+            if (!synthesis && !sttBoundary) return@withContext authorizedOnIo(url, method, body, scoped, http, null, maxBytes, false)
+            // The synthesis request has no elapsed limit and a transcription is bounded by its caller's remaining budget or a
+            // Stop, so their live call (a refresh round trip included) is cancelled with the coroutine: this also ends a
             // blocking body read, which coroutine cancellation alone would not.
             val current = java.util.concurrent.atomic.AtomicReference<Call?>()
             coroutineScope {
                 val watcher = launch { try { awaitCancellation() } finally { current.get()?.cancel() } }
                 try {
-                    authorizedOnIo(url, method, body, scoped, synthesisHttp, current)
+                    if (synthesis) authorizedOnIo(url, method, body, scoped, synthesisHttp, current)
+                    else authorizedOnIo(url, method, body, scoped, http, current, maxBytes, true)
                 } finally {
                     watcher.cancel()
                 }
@@ -249,28 +289,49 @@ class HermesDashboardClient(
     }
 
     private suspend fun authorizedOnIo(url: HttpUrl, method: String, body: JSONObject?, scoped: Boolean,
-                                       client: OkHttpClient, current: java.util.concurrent.atomic.AtomicReference<Call?>?): JSONObject {
+                                       client: OkHttpClient, current: java.util.concurrent.atomic.AtomicReference<Call?>?,
+                                       maxBytes: Long = Long.MAX_VALUE, sttBoundary: Boolean = false): JSONObject {
         val target = if (scoped && !profile.isNullOrBlank()) {
             url.newBuilder().addQueryParameter("profile", profile).build()
         } else {
             url
         }
         var session = tokens.load() ?: throw HermesAuthRequiredException("Hermes dashboard sign-in required")
+        // At the speech boundary only, the request's own I/O failure (and a body cut short) is classified by type; see
+        // [SttTransportClassifier]. Everything else, and every other route, keeps the plain IOException.
+        val callRef = current ?: if (sttBoundary) java.util.concurrent.atomic.AtomicReference<Call?>() else null
         repeat(2) { attempt ->
-            execute(request(target, method, body, session.accessToken), client, current).use { response ->
+            val response = try {
+                execute(request(target, method, body, session.accessToken), client, callRef)
+            } catch (error: IOException) {
+                throw sttTransportOr(error, callRef, sttBoundary)
+            }
+            response.use {
                 when {
-                    response.code == 401 && attempt == 0 -> session = refreshAfterRejection(session)
+                    response.code == 401 && attempt == 0 -> session = refreshAfterRejection(session, callRef)
                     response.code == 401 -> throw HermesAuthRequiredException("Hermes dashboard rejected the refreshed session")
-                    response.code !in 200..299 -> throw HermesHttpException(response.code, describeFailure(url, response))
-                    else -> return parseObject(response)
+                    response.code !in 200..299 -> throw failure(url, response).also { if (sttBoundary) currentCoroutineContext().ensureActive() }
+                    else -> return try {
+                        parseObject(response, maxBytes)
+                    } catch (error: IOException) {
+                        if (sttBoundary) currentCoroutineContext().ensureActive()
+                        throw sttTransportOr(error, callRef, sttBoundary)
+                    }
                 }
             }
         }
         throw HermesAuthRequiredException("Hermes dashboard sign-in required")
     }
 
+    private fun sttTransportOr(error: IOException, call: java.util.concurrent.atomic.AtomicReference<Call?>?, sttBoundary: Boolean): Exception {
+        if (!sttBoundary) return error
+        val transport = SttTransportClassifier.classify(error, call?.get()?.isCanceled() == true) ?: return error
+        return HermesSttTransportException(transport, error)
+    }
+
     /** Coalesced: callers that saw the same rejected access token share one refresh round trip. */
-    private suspend fun refreshAfterRejection(rejected: HermesBearerSession): HermesBearerSession = refreshLock.withLock {
+    private suspend fun refreshAfterRejection(rejected: HermesBearerSession,
+                                              call: java.util.concurrent.atomic.AtomicReference<Call?>? = null): HermesBearerSession = refreshLock.withLock {
         val current = tokens.load() ?: throw HermesAuthRequiredException("Hermes dashboard sign-in required")
         if (current.accessToken != rejected.accessToken) return current
         if (current.refreshToken.isBlank()) {
@@ -278,9 +339,9 @@ class HermesDashboardClient(
             throw HermesAuthRequiredException("Hermes dashboard session expired")
         }
         val body = JSONObject().put("refresh_token", current.refreshToken).put("provider", current.provider)
-        execute(request(endpoint.route("auth/native/refresh"), "POST", body, bearer = null)).use { response ->
+        execute(request(endpoint.route("auth/native/refresh"), "POST", body, bearer = null), http, call).use { response ->
             when (response.code) {
-                200 -> HermesBearerSession.fromJson(response.body?.string().orEmpty()).also(tokens::save)
+                200 -> HermesBearerSession.fromJson(refreshBody(response, call)).also(tokens::save)
                 400, 401 -> {
                     tokens.clear()
                     throw HermesAuthRequiredException("Hermes dashboard session expired; sign in again")
@@ -290,6 +351,14 @@ class HermesDashboardClient(
         }
     }
 
+    /** A cut-off refresh body (its call cancelled with the caller) is a cancellation, never a half-read session. */
+    private suspend fun refreshBody(response: Response, call: java.util.concurrent.atomic.AtomicReference<Call?>?): String = try {
+        response.body?.string().orEmpty()
+    } catch (error: IOException) {
+        if (call != null) currentCoroutineContext().ensureActive()
+        throw error
+    }
+
     private fun request(url: HttpUrl, method: String, body: JSONObject?, bearer: String?): Request = Request.Builder()
         .url(url)
         .method(method, body?.toString()?.toRequestBody(JSON))
@@ -297,15 +366,40 @@ class HermesDashboardClient(
         .apply { if (bearer != null) header("Authorization", "Bearer $bearer") }
         .build()
 
-    private fun parseObject(response: Response): JSONObject = try {
-        JSONObject(response.body?.string().orEmpty())
+    private fun parseObject(response: Response, maxBytes: Long = Long.MAX_VALUE): JSONObject = try {
+        JSONObject(if (maxBytes == Long.MAX_VALUE) response.body?.string().orEmpty() else boundedText(response, maxBytes))
     } catch (error: JSONException) {
         throw HermesProtocolException("dashboard returned non-JSON for ${response.request.url.encodedPath}", error)
     }
 
-    private fun describeFailure(url: HttpUrl, response: Response): String {
+    /** The body as text, refusing (before holding more than [maxBytes]) anything larger: a stored file is never read unbounded. */
+    private fun boundedText(response: Response, maxBytes: Long): String {
+        val body = response.body ?: return ""
+        if (body.contentLength() > maxBytes) throw HermesProtocolException("the response is larger than the ${maxBytes / (1024 * 1024)} MiB limit")
+        val source = body.source()
+        val buffer = okio.Buffer()
+        while (buffer.size <= maxBytes) {
+            if (source.read(buffer, 8192) == -1L) break
+        }
+        if (buffer.size > maxBytes) throw HermesProtocolException("the response is larger than the ${maxBytes / (1024 * 1024)} MiB limit")
+        return buffer.readUtf8()
+    }
+
+    private fun failure(url: HttpUrl, response: Response): HermesHttpException {
         val detail = runCatching { JSONObject(response.body?.string().orEmpty()).optString("detail") }.getOrNull()
-        return "${url.encodedPath} failed (${response.code})" + if (detail.isNullOrBlank()) "" else ": ${detail.take(200)}"
+        val path = url.encodedPath
+        // Only the transcription route carries the speech envelope, and only an allowlisted code is taken from it: the
+        // server's wording is replaced by the fixed text of that code, never shown. Any other detail on that route (a
+        // legacy or proxy answer) is dropped too: it may carry a URL, token or path and must not reach a message or UI.
+        if (path.endsWith("/api/audio/transcribe")) {
+            val code = SttSafeCode.parse(detail)
+            return if (code != null) HermesHttpException(response.code, "$path failed (${response.code}): ${SttSafeCode.message(code)}", code)
+            else HermesHttpException(response.code, "$path failed (${response.code})")
+        }
+        // The speech-synthesis failure text reaches the later-reply status line and the diagnostic log: the server's wording (it may
+        // carry a URL, token or path) is not taken there either.
+        if (path.endsWith("/api/audio/speak")) return HermesHttpException(response.code, "$path failed (${response.code})")
+        return HermesHttpException(response.code, "$path failed (${response.code})" + if (detail.isNullOrBlank()) "" else ": ${detail.take(200)}")
     }
 
     private suspend fun execute(request: Request, client: OkHttpClient = http,
