@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="280" viewBox="0 0 960 280" role="img" aria-labelledby="t d">
+  <title id="t">Hermes Voice</title>
+  <desc id="d">Decorative banner: a watch connected to a phone, which connects to a Hermes node, on a dark navy background.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1026"/>
+      <stop offset="1" stop-color="#171a3d"/>
+    </linearGradient>
+    <linearGradient id="link" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#8b5cf6"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+  </defs>
+  <rect width="960" height="280" rx="16" fill="url(#bg)"/>
+  <text x="56" y="120" fill="#f5f6ff" font-family="Helvetica, Arial, sans-serif" font-size="52" font-weight="700">Hermes Voice</text>
+  <text x="58" y="160" fill="#a5b4fc" font-family="Helvetica, Arial, sans-serif" font-size="20">Talk to Hermes from your Phone and Watch</text>
+  <g fill="none" stroke="url(#link)" stroke-width="3" stroke-linecap="round">
+    <path d="M562 140H606M702 140H746"/>
+  </g>
+  <g fill="#8b5cf6">
+    <path d="M554 140l8-6v12zM614 140l-8-6v12z"/>
+  </g>
+  <g fill="#22d3ee">
+    <path d="M694 140l8-6v12zM754 140l-8-6v12z"/>
+  </g>
+  <g fill="none" stroke="#a5b4fc" stroke-width="3">
+    <rect x="504" y="112" width="40" height="56" rx="12"/>
+    <path d="M514 112l3-14h14l3 14M514 168l3 14h14l3-14"/>
+  </g>
+  <g fill="none" stroke="#8b5cf6" stroke-width="3">
+    <rect x="628" y="96" width="56" height="88" rx="10"/>
+    <path d="M648 108h16" stroke-linecap="round"/>
+  </g>
+  <g fill="none" stroke="#22d3ee" stroke-width="3">
+    <circle cx="796" cy="140" r="28"/>
+    <path d="M786 140h20M796 130v20" stroke-linecap="round"/>
+  </g>
+  <g fill="#8b97c9" font-family="Helvetica, Arial, sans-serif" font-size="14" text-anchor="middle">
+    <text x="524" y="212">Watch</text>
+    <text x="656" y="212">Phone</text>
+    <text x="796" y="212">Hermes</text>
+  </g>
+</svg>
