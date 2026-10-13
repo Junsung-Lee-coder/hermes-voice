@@ -145,6 +145,7 @@ class WakeController(
             Log.i(TAG, "wake recognizer error gen=$gen code=$error mode=${if (onDevice) "ON_DEVICE" else "SYSTEM"}")
             // A late callback of a recognizer that was already released must not touch the current one.
             if (!guard.isCurrent(token)) return
+            com.rumi.hermesvoice.core.diag.DiagSpeechError.record(WatchApp.from(context).diag, com.rumi.hermesvoice.core.diag.DiagOrigin.WATCH, error)
             // The on-device model may lack the wake phrases' language: try the system's default recognition
             // service once, in the same window (that service may use the network).
             if (onDevice && error in LANGUAGE_ERRORS) {

@@ -16,6 +16,9 @@ object DeviceLocalFlags {
     /** The Phone's opt-in background listening for the wake phrase (off unless the user switched it on here). */
     const val KEY_PHONE_WAKE = "phone_background_wake"
     const val KEY_NOTIFICATIONS_ASKED = "notifications_asked"
+
+    /** The arrival alert's own permission ask (first text send in the visible app) was made once: never asked again. */
+    const val KEY_REPLY_ALERT_ASKED = "reply_alert_permission_asked"
     private const val KEY_LEGACY_DROPPED = "legacy_flags_dropped_v1"
 
     /** The Phone's informed opt-in to speak later replies ([LaterReplyConsent]). */

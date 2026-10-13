@@ -25,6 +25,11 @@ enum class EndpointDecision { CONTINUE, END_OF_SPEECH, NO_SPEECH }
  *   absorbed by the floor within a second or two, after which it counts. [respeechMs] of renewed
  *   speech (dips tolerated) restarts the count, which is the same bar as the first speech, so
  *   words said one at a time keep the request open like the first one did.
+ * [forWatch] alone uses elapsed non-qualified audio for trailing time and requires onset-level
+ * renewed speech support, excluding release/hangover tails. A candidate beginning just before
+ * the trailing deadline gets at most `respeechMs + maxDipMs` of grace, never a new clock per tick.
+ * Energy alone cannot reject dense/loud non-speech with the same envelope as actual syllables,
+ * or preserve speech below the onset indefinitely. Wrist-mic/car calibration is a separate gate.
  * Push-to-talk does not use this: it ends only when the user taps.
  */
 class SilenceEndpoint(
@@ -34,6 +39,8 @@ class SilenceEndpoint(
     private val calibrationMs: Long = 400,
     private val profile: VadProfile = VadProfile.HANDS_FREE,
     private val respeechMs: Long = profile.minSpeechMs,
+    /** Watch-only: transient hangover must not renew the trailing deadline. Phone keeps its default. */
+    private val rejectTransientContinuation: Boolean = false,
 ) {
     private enum class Phase { CALIBRATING, ARMED, SPEECH, SILENCE, DONE }
 
@@ -113,15 +120,25 @@ class SilenceEndpoint(
                 }
             }
             Phase.SILENCE -> {
-                if (cls == VadClass.QUIET) quietMs += frameMs
-                if (vad.qualifiedFor(respeechMs)) {
+                // Watch trailing time is elapsed non-qualified audio, not only exact QUIET frames.
+                // A tick's decaying gray tail cannot stop this clock or qualify via hangover alone.
+                if (rejectTransientContinuation || cls == VadClass.QUIET) quietMs += frameMs
+                val resumed = if (rejectTransientContinuation)
+                    vad.qualifiedOnsetFor(respeechMs)
+                else vad.qualifiedFor(respeechMs)
+                if (resumed) {
                     phase = Phase.SPEECH
                     quietMs = 0
                 }
             }
             else -> Unit
         }
-        if (phase == Phase.SILENCE && quietMs >= silenceMs) {
+        // A genuine syllable beginning immediately before the deadline gets a bounded qualification
+        // grace. The grace belongs to this trailing deadline, not each pulse, so it cannot be
+        // renewed by repetitive ticks. There is still no overall recording-duration cap.
+        val qualifying = rejectTransientContinuation && vad.onsetRunMs > 0 && cls == VadClass.VOICED &&
+            quietMs < silenceMs + respeechMs + profile.maxDipMs
+        if (phase == Phase.SILENCE && quietMs >= silenceMs && !qualifying) {
             phase = Phase.DONE
             return EndpointDecision.END_OF_SPEECH
         }
@@ -136,6 +153,10 @@ class SilenceEndpoint(
     }
 
     companion object {
+        /** Watch wrist-mic trailing endpoint: onset support excludes brief release/hangover transients. */
+        fun forWatch(silenceMs: Long, sampleRate: Int = 16_000): SilenceEndpoint =
+            SilenceEndpoint(sampleRate = sampleRate, silenceMs = silenceMs, rejectTransientContinuation = true)
+
         /** A hands-free endpoint for a validated trailing-silence setting (see VadSilence). */
         fun forSilenceSeconds(seconds: Double, sampleRate: Int = 16_000): SilenceEndpoint =
             SilenceEndpoint(sampleRate = sampleRate, silenceMs = Math.round(seconds * 1000))

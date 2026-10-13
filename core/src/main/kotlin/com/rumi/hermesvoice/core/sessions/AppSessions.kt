@@ -624,6 +624,7 @@ class AppSessionRepository(
     /** Text chat (optionally with attachments) into one of our conversations. */
     suspend fun sendMessage(storedSessionId: String, text: String, attachments: List<OutgoingAttachment> = emptyList()): SubmittedTurn {
         require(text.isNotBlank() || attachments.isNotEmpty()) { "message is empty" }
+        com.rumi.hermesvoice.core.diag.diagMark(com.rumi.hermesvoice.core.diag.DiagStage.VERIFY)
         verifyConversation(storedSessionId)
         return conversations.submit(storedSessionId, text.trim(), attachments)
     }
@@ -644,6 +645,7 @@ class AppSessionRepository(
             throw UnsupportedOperationException("create sessions through AppSessionRepository")
 
         override suspend fun submit(storedSessionId: String, text: String, attachments: List<OutgoingAttachment>): SubmittedTurn {
+            com.rumi.hermesvoice.core.diag.diagMark(com.rumi.hermesvoice.core.diag.DiagStage.VERIFY)
             val owned = registry.find(storedSessionId) ?: throw SessionNotOwnedException("session was not created by this app")
             if (owned.role == OwnedRole.ROUTER) {
                 if (owned.retired) throw SessionNotOwnedException("that routing session is no longer used")

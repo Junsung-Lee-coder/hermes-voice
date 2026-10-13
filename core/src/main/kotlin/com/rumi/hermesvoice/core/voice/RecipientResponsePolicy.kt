@@ -11,6 +11,9 @@ import com.rumi.hermesvoice.core.SpokenRole
 sealed class RecipientEvent {
     data class Interim(val text: String) : RecipientEvent()
     data class Complete(val text: String, val status: String?) : RecipientEvent()
+
+    /** What Hermes is doing right now (a tool or status line), already a bounded display label: shown, never a response and never spoken. */
+    data class Activity(val label: String) : RecipientEvent()
 }
 
 /** [speakText] is null when the response is classified but must not be spoken (switch off or already heard). */
@@ -33,6 +36,7 @@ class RecipientResponseTracker(private val settings: ResponsePlaybackSettings) {
     fun onEvent(event: RecipientEvent): ResponseDecision? = when (event) {
         is RecipientEvent.Interim -> onInterim(event.text)
         is RecipientEvent.Complete -> onComplete(event.text)
+        is RecipientEvent.Activity -> null
     }
 
     private fun onInterim(raw: String): ResponseDecision? {

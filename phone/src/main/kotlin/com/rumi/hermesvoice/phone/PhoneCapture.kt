@@ -1,12 +1,14 @@
 package com.rumi.hermesvoice.phone
 
-import android.annotation.SuppressLint
 import android.media.AudioFormat
 import android.media.AudioRecord
-import android.media.MediaRecorder
 import com.rumi.hermesvoice.core.audio.CaptureStats
 import com.rumi.hermesvoice.core.audio.PcmCaptureLoop
 import com.rumi.hermesvoice.core.audio.SilenceEndpoint
+import com.rumi.hermesvoice.core.headset.HeadsetText
+import com.rumi.hermesvoice.core.headset.MicPlan
+import com.rumi.hermesvoice.core.headset.MicReport
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * The Phone's hands-free recorder: 16 kHz mono PCM16 on the app's own `AudioRecord`, running the
@@ -20,26 +22,43 @@ class PhoneCapture(
     val captureId: String,
     private val endpoint: SilenceEndpoint,
     private val listener: PcmCaptureLoop.Listener,
+    private val records: RecordFactory,
 ) {
-    private var record: AudioRecord? = null
+    private var record: RecordPort? = null
     private var loop: PcmCaptureLoop? = null
     private var worker: Thread? = null
+    private var plan: MicPlan? = null
 
-    @SuppressLint("MissingPermission") // Checked before a hands-free capture is started.
-    fun start(): Boolean {
+    /**
+     * Starts recording. With a [MicPlan] it asks Android for the headset input before the first read and, after the first
+     * positive read, hands [onSource] the source Android's readback confirms (never the setter's result). A plan whose input
+     * cannot be requested is released and the Phone microphone is used, said so through [onSource].
+     */
+    fun start(plan: MicPlan? = null, onSource: (MicReport) -> Unit = {}): Boolean {
         val min = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-        val recorder = runCatching {
-            AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT, min.coerceAtLeast(CHUNK_BYTES * 2))
-        }.getOrNull()?.takeIf { it.state == AudioRecord.STATE_INITIALIZED } ?: return false
-        val started = runCatching { recorder.startRecording() }.isSuccess &&
-            recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING
-        if (!started) {
-            recorder.release()
+        val recorder = records.create(min.coerceAtLeast(CHUNK_BYTES * 2))?.takeIf { it.initialized }
+        if (recorder == null) {
+            plan?.release()
             return false
         }
+        val wanted = plan?.preferred
+        var requested = true
+        if (wanted != null) requested = recorder.setPreferredDevice(wanted.id)
+        if (!recorder.start()) {
+            recorder.release()
+            plan?.release()
+            return false
+        }
+        this.plan = plan
         record = recorder
-        val captureLoop = PcmCaptureLoop({ recorder.read(it, 0, it.size) }, LIMIT_BYTES, endpoint, listener, chunkBytes = CHUNK_BYTES)
+        val reported = AtomicBoolean(false)
+        val captureLoop = PcmCaptureLoop({
+            val n = recorder.read(it, 0, it.size)
+            if (n > 0 && plan != null && reported.compareAndSet(false, true)) {
+                onSource(if (wanted != null && !requested) MicReport(false, HeadsetText.NOT_ROUTED).also { plan.release() } else plan.report(recorder.routedDeviceId()))
+            }
+            n
+        }, LIMIT_BYTES, endpoint, listener, chunkBytes = CHUNK_BYTES)
         loop = captureLoop
         worker = Thread(captureLoop::run, "hermes-voice-phone-hands-free").apply { start() }
         return true
@@ -54,6 +73,8 @@ class PhoneCapture(
         if (Thread.currentThread() !== worker) runCatching { worker?.join(1_500) }
         runCatching { record?.release() }
         record = null
+        plan?.release()
+        plan = null
         return loop?.let { PcmCaptureLoop.wav(it.pcm(), SAMPLE_RATE) }
     }
 

@@ -32,23 +32,42 @@ import com.rumi.hermesvoice.core.wake.WakeEpochItem
 import com.rumi.hermesvoice.core.wake.WakeVerdictMessage
 import com.rumi.hermesvoice.core.settings.WatchSettings
 import com.rumi.hermesvoice.core.settings.WatchSettingsReplica
+import com.rumi.hermesvoice.core.notify.ReplyAlert
+import com.rumi.hermesvoice.core.notify.ConversationPresence
+import com.rumi.hermesvoice.core.notify.ReplyAlertLedger
+import com.rumi.hermesvoice.core.notify.ReplyAlertResult
 import com.rumi.hermesvoice.core.watchlink.HapticEvent
+import com.rumi.hermesvoice.core.watchlink.ReplyAlertMessage
+import com.rumi.hermesvoice.core.watchlink.ReplayRequest
 import com.rumi.hermesvoice.core.watchlink.HapticUsage
 import com.rumi.hermesvoice.core.watchlink.LaterPlaybackGuard
 import com.rumi.hermesvoice.core.watchlink.PlayProgress
 import com.rumi.hermesvoice.core.watchlink.PlayRequest
 import com.rumi.hermesvoice.core.watchlink.PlayedAck
+import com.rumi.hermesvoice.core.watchlink.PrivateAudioReceipt
 import com.rumi.hermesvoice.core.watchlink.ReaderKind
 import com.rumi.hermesvoice.core.watchlink.ReaderMessageRow
 import com.rumi.hermesvoice.core.watchlink.ReaderRequest
 import com.rumi.hermesvoice.core.watchlink.ReaderResponse
 import com.rumi.hermesvoice.core.watchlink.ReaderSessionRow
 import com.rumi.hermesvoice.core.watchlink.ReaderSurface
+import com.rumi.hermesvoice.core.diag.ApkIdentity
+import com.rumi.hermesvoice.core.diag.DiagApp
+import com.rumi.hermesvoice.core.diag.DiagCause
+import com.rumi.hermesvoice.core.diag.DiagClassify
 import com.rumi.hermesvoice.core.diag.DiagCode
 import com.rumi.hermesvoice.core.diag.DiagFail
+import com.rumi.hermesvoice.core.diag.DiagJournal
 import com.rumi.hermesvoice.core.diag.DiagLog
+import com.rumi.hermesvoice.core.diag.DiagModality
 import com.rumi.hermesvoice.core.diag.DiagOrigin
+import com.rumi.hermesvoice.core.diag.DiagStage
+import com.rumi.hermesvoice.core.diag.DiagWatchResponder
+import com.rumi.hermesvoice.core.diag.DiagWatchTransfer
+import com.rumi.hermesvoice.core.diag.DiagWireV2
 import com.rumi.hermesvoice.core.diag.DiagWire
+import com.rumi.hermesvoice.core.diag.FileDiagJournalStorage
+import com.rumi.hermesvoice.core.diag.PhoneUnreachableException
 import com.rumi.hermesvoice.core.watchlink.TurnStateMessage
 import com.rumi.hermesvoice.core.watchlink.TurnTrigger
 import com.rumi.hermesvoice.core.watchlink.WatchHapticPolicy
@@ -88,8 +107,26 @@ import kotlinx.coroutines.withTimeoutOrNull
  */
 class WatchApp : Application() {
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    /** Typed diagnostic events (bounded ring buffer): sent to the Phone only inside one user-started export. */
+    /** Typed diagnostic events (bounded ring buffer, last 24 h also kept in private storage): sent to the Phone only inside one user-started export. */
     val diag = DiagLog(clock = SystemClock::elapsedRealtime)
+
+    private val diagExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { task ->
+        Thread(task, "hv-diag-journal").apply { isDaemon = true }
+    }
+    val diagJournal: DiagJournal by lazy {
+        DiagJournal(diag, FileDiagJournalStorage(File(noBackupFilesDir, "diag-journal")), diagExecutor)
+    }
+
+    private val diagResponder: DiagWatchResponder by lazy {
+        DiagWatchResponder(diag, persistence = diagJournal::status, app = {
+            val info = runCatching { packageManager.getPackageInfo(packageName, 0) }.getOrNull()
+            DiagApp(DiagApp.safeName(info?.versionName), info?.longVersionCode?.toInt() ?: 0,
+                ApkIdentity.of(runCatching { File(applicationInfo.sourceDir) }.getOrNull()))
+        })
+    }
+
+    /** Clears this watch's saved and in-memory diagnostics only; no conversation, setting, media or Phone data. False if the file could not be removed. */
+    suspend fun clearLocalLog(): Boolean = withContext(Dispatchers.IO) { diagJournal.clearNow() }
     private val _talk = MutableStateFlow(WatchTalkState())
     val talk: StateFlow<WatchTalkState> = _talk
     private val _settings = MutableStateFlow(WatchSettings())
@@ -140,6 +177,7 @@ class WatchApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        diagJournal.attach()
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val stored = prefs.getString(KEY_SETTINGS, null)
         replica = WatchSettingsReplica(stored)
@@ -147,6 +185,7 @@ class WatchApp : Application() {
         if (stored != null && stored != replica.current.toJson()) prefs.edit().putString(KEY_SETTINGS, replica.current.toJson()).apply()
         _settings.value = replica.current
         WatchVoiceService.createChannel(this)
+        WatchReplyAlertNotifier.createChannel(this)
         voice = WatchVoiceRuntime(this)
         // The Phone's reachability is kept current by the platform's own capability events (no polling before a window).
         runCatching {
@@ -167,6 +206,22 @@ class WatchApp : Application() {
         if (result == ReplicaUpdate.APPLIED) {
             getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_SETTINGS, current.toJson()).apply()
             _settings.value = current
+            // The Phone's headset is the only output now: what plays here stops (the Phone is told it was not played).
+            if (current.privateAudio) stopPlayback(PRIVATE_HEADSET)
+        }
+        // Whatever was offered (applied, stale or invalid), the Phone is told what this Watch really holds: the revision and whether it
+        // refuses to play. A send is best effort and bounded; without a receipt the Phone claims nothing about the Watch.
+        val receipt = PrivateAudioReceipt(current.revision, current.privateAudio)
+        scope.launch {
+            val node = phoneNode() ?: return@launch
+            try {
+                withTimeoutOrNull(PROGRESS_SEND_MS) {
+                    Wearable.getMessageClient(this@WatchApp).sendMessage(node, WatchLinkPaths.PRIVATE_AUDIO, receipt.toJson().toByteArray(Charsets.UTF_8)).await()
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+            }
         }
         Log.i(TAG, "settings $result revision=${current.revision} wake_location=${current.wakeLocation} " +
             "watch_listens=${current.watchWakeEnabled} phone_standby=${current.phoneBackgroundWakeEnabled} " +
@@ -371,6 +426,22 @@ class WatchApp : Application() {
         if (turnId != null) Log.i(TAG, "turn ${turnId.take(12)} stopped on the watch reason=$reason waiting_stopped=${earlier.size}")
     }
 
+    /**
+     * "Play again": asks the Phone to play the finished request's reply again (nothing is sent to Hermes again). The control goes
+     * away at once; the Phone's next state for the request says if it failed again.
+     */
+    fun replayReply() {
+        val turnId = _talk.value.replayTurnId ?: return
+        _talk.update { it.replayRequested() }
+        scope.launch {
+            val node = phoneNode()
+            val sent = node != null && runCatching {
+                Wearable.getMessageClient(this@WatchApp).sendMessage(node, WatchLinkPaths.REPLAY, ReplayRequest(turnId).encode()).await()
+            }.isSuccess
+            if (!sent) _talk.update { if (it.replayTurnId == null && it.line == WatchTalkState.REPLAY_REQUESTED) it.copy(replayTurnId = turnId, line = "Phone not reachable - try again") else it }
+        }
+    }
+
     /** Tells the Phone that these requests of this Watch were stopped (best effort): it stops them too, wherever they are. */
     private fun tellPhoneStopped(turnIds: List<String>) {
         if (turnIds.isEmpty()) return
@@ -395,7 +466,7 @@ class WatchApp : Application() {
                     Log.i(TAG, "qa slow transfer: turn=${turnId.take(12)} waits $qaUploadDelayMs ms (debug builds only)")
                     delay(qaUploadDelayMs)
                 }
-                val phone = phoneNode() ?: error("Phone not reachable")
+                val phone = phoneNode() ?: throw PhoneUnreachableException()
                 navigationGuard.onUploadNode(turnId, phone)
                 val channels = Wearable.getChannelClient(this@WatchApp)
                 val channel = channels.openChannel(phone, WatchLinkPaths.turnPath(turnId)).await()
@@ -403,16 +474,15 @@ class WatchApp : Application() {
                 val frame = upload.toFrame().encode()
                 withContext(Dispatchers.IO) { output.use { it.write(frame); it.flush() } }
             }.exceptionOrNull()
-            diag.record(if (failure == null) DiagCode.WATCH_SENT else DiagCode.REQUEST_FAILED, DiagOrigin.WATCH, turnId,
-                fail = failure?.let { DiagFail.of(it) })
+            val stopped = if (failure != null) uploadStops.remove(turnId) else null
+            val transfer = DiagWatchTransfer.record(diag, turnId, failure, userStopped = stopped != null)
             if (failure == null) {
                 Log.i(TAG, "upload sent turn=${turnId.take(12)} trigger=${upload.trigger} kind=" +
                     (if (upload.recognizedText != null) "recognized_request" else "wav") + " bytes=${upload.audio.size}")
             } else {
-                val stopped = uploadStops.remove(turnId)
-                Log.w(TAG, "upload failed: ${stopped ?: failure.message}")
+                Log.w(TAG, "upload failed: ${stopped ?: transfer?.cause?.wire}")
                 transit.onTransferFailed(turnId)
-                _talk.update { if (it.turnId == turnId) it.sendFailed(stopped ?: failure.message ?: "Could not reach the phone") else it }
+                _talk.update { if (it.turnId == turnId) it.sendFailed(stopped ?: transfer?.status ?: "Couldn't send to the phone") else it }
             }
             uploads.remove(turnId)
             if (uploads.isEmpty()) holds.release(HoldReason.TRANSFER)
@@ -422,9 +492,9 @@ class WatchApp : Application() {
     }
 
     /** One user-started diagnostics export on the Phone asks for this Watch's events: answered to that node only, once, bounded. */
-    fun onDiagRequest(sourceNodeId: String, data: ByteArray) {
-        val salt = DiagWire.decodeRequest(data) ?: return
-        val response = DiagWire.encodeResponse(salt, diag.snapshot(), diag.dropped(), diag.now())
+    fun onDiagRequest(sourceNodeId: String, data: ByteArray, pathSchema: Int) {
+        if (DiagWire.decodeRequestAny(data)?.first != pathSchema) return
+        val response = runCatching { diagResponder.answer(data) }.getOrNull() ?: return
         scope.launch {
             runCatching {
                 withTimeoutOrNull(DIAG_SEND_MS) {
@@ -495,7 +565,7 @@ class WatchApp : Application() {
 
     fun loadSessions() {
         val reqId = newRequestId()
-        _reader.update { it.requestSessions(reqId) }
+        updateReader { it.requestSessions(reqId) }
         dispatch(ReaderRequest(reqId, ReaderKind.SESSIONS))
     }
 
@@ -503,6 +573,48 @@ class WatchApp : Application() {
      * Shows [sessionId] in chat. With the Phone's routing on, voice turns still go through the
      * router; with it off, they go to the conversation selected here ([selectedTarget]).
      */
+    /** Handled arrival alerts of this Watch (bounded, durable, device-local): one alert per identity, even across a restart. */
+    private val replyLedger by lazy { ReplyAlertLedger(localStore) }
+    private val replyNotifier by lazy { WatchReplyAlertNotifier(this) }
+
+    /** A conversation is "opened" only when it is the one shown on the chat surface AND the Watch app is in the foreground. */
+    val presence: ConversationPresence by lazy { ConversationPresence().also { it.onOpened = { id -> replyNotifier.dismissConversation(id) } } }
+
+    private fun updateReader(change: (WatchReaderState) -> WatchReaderState) {
+        _reader.update(change)
+        syncPresence()
+    }
+
+    private fun syncPresence() {
+        val state = _reader.value
+        presence.setShown(state.selectedSessionId?.takeIf { state.surface == ReaderSurface.CHAT })
+    }
+
+    fun onForeground(foreground: Boolean) {
+        syncPresence()
+        presence.setForeground(foreground)
+    }
+
+    /**
+     * The Phone says a final answer for this Watch arrived without audio ([ReplyAlertMessage]): this Watch alone shows the alert
+     * (local-only; the Phone showed none). A repeat of the same identity does nothing. Returns what was decided (null: not valid).
+     */
+    fun onReplyAlert(bytes: ByteArray): ReplyAlertResult? {
+        val message = ReplyAlertMessage.decode(bytes) ?: return null
+        val alert = ReplyAlert(message.identity, message.sessionId)
+        if (!replyLedger.claim(alert.identity)) return ReplyAlertResult.DUPLICATE
+        if (presence.isVisible(alert.storedSessionId)) {
+            refreshSelected()
+            return ReplyAlertResult.SUPPRESSED_VISIBLE
+        }
+        val shown = if (replica.current.privateAudio) replyNotifier.show(alert, null, true) else replyNotifier.show(alert)
+        if (shown && presence.isVisible(alert.storedSessionId)) replyNotifier.dismissConversation(alert.storedSessionId)
+        return if (shown) ReplyAlertResult.SHOWN_HERE else ReplyAlertResult.NOT_SHOWN_HERE
+    }
+
+    /** A tapped arrival alert: the conversation it names is opened like the user's own choice. */
+    fun openFromReplyAlert(sessionId: String) = selectSession(sessionId)
+
     fun selectSession(sessionId: String) {
         navigationGuard.onUserNavigation()
         openConversation(sessionId)
@@ -510,7 +622,7 @@ class WatchApp : Application() {
 
     private fun openConversation(sessionId: String) {
         val reqId = newRequestId()
-        _reader.update { it.select(sessionId, reqId) }
+        updateReader { it.select(sessionId, reqId) }
         dispatch(ReaderRequest(reqId, ReaderKind.HISTORY, sessionId))
     }
 
@@ -534,7 +646,7 @@ class WatchApp : Application() {
     fun refreshSelected() {
         val reqId = newRequestId()
         var request: ReaderRequest? = null
-        _reader.update { state ->
+        updateReader { state ->
             val next = state.refreshLatest(reqId)
             request = next?.selectedSessionId?.let { ReaderRequest(reqId, ReaderKind.HISTORY, it) }
             next ?: state
@@ -545,7 +657,7 @@ class WatchApp : Application() {
     fun loadOlder() {
         val reqId = newRequestId()
         var request: ReaderRequest? = null
-        _reader.update { state ->
+        updateReader { state ->
             val next = state.requestOlder(reqId)
             val history = next?.selectedHistory
             request = history?.let { ReaderRequest(reqId, ReaderKind.HISTORY, it.sessionId, offset = it.nextOlderOffset) }
@@ -556,18 +668,30 @@ class WatchApp : Application() {
 
     fun toggleReaderSurface() {
         navigationGuard.onUserNavigation()
-        _reader.update { it.toggleSurface() }
+        updateReader { it.toggleSurface() }
         if (_reader.value.surface == ReaderSurface.SESSIONS) loadSessions()
     }
 
     fun onReaderResponse(sourceNodeId: String, bytes: ByteArray) {
         val response = ReaderResponse.decode(bytes) ?: return
-        val expectedNode = readerTargets.remove(response.reqId)
+        val expectedNode = readerTargets[response.reqId]
         if (expectedNode == null || expectedNode != sourceNodeId) {
             Log.w(TAG, "reader response ignored req=${response.reqId.take(12)} (not pending from this node)")
             return
         }
-        _reader.update { it.onResponse(response) }
+        // Do not consume transport custody for a valid node's wrong kind/session/page. The
+        // reducer ignores these too, but retaining the target lets the real reply or timeout settle.
+        val pending = _reader.value
+        when (response.kind) {
+            ReaderKind.SESSIONS -> if (pending.sessions.pendingReqId != response.reqId) return
+            ReaderKind.HISTORY -> {
+                val history = pending.pendingHistoryRequest(response.reqId) ?: return
+                if (history.sessionId != response.sessionId || history.sessionId != pending.selectedSessionId) return
+                if (response.ok && response.offset != (if (history.loadingOlder) history.nextOlderOffset else 0)) return
+            }
+        }
+        readerTargets.remove(response.reqId, sourceNodeId)
+        updateReader { it.onResponse(response) }
         // A conversation turned out to be gone: reload the browser so it cannot be tapped again.
         if (_reader.value.sessions.stale) loadSessions()
         Log.i(TAG, "reader ${response.kind.wire} req=${response.reqId.take(12)} ok=${response.ok} error=${response.error} " +
@@ -579,7 +703,7 @@ class WatchApp : Application() {
             val node = phoneNode()
             if (node == null) {
                 _phoneReachable.value = false
-                _reader.update { it.onSendFailed(request.reqId) }
+                updateReader { it.onSendFailed(request.reqId) }
                 return@launch
             }
             readerTargets[request.reqId] = node
@@ -589,11 +713,11 @@ class WatchApp : Application() {
             Log.i(TAG, "reader request ${request.kind.wire} req=${request.reqId.take(12)} offset=${request.offset} sent=${sent.isSuccess}")
             if (sent.isFailure) {
                 readerTargets.remove(request.reqId)
-                _reader.update { it.onSendFailed(request.reqId) }
+                updateReader { it.onSendFailed(request.reqId) }
                 return@launch
             }
             delay(WatchReaderLimits.REQUEST_TIMEOUT_MS)
-            if (readerTargets.remove(request.reqId) != null) _reader.update { it.onTimeout(request.reqId) }
+            if (readerTargets.remove(request.reqId) != null) updateReader { it.onTimeout(request.reqId) }
         }
     }
 
@@ -609,12 +733,12 @@ class WatchApp : Application() {
         val sessionId = "qa-fixture-1"
         val sessionsReq = newRequestId()
         val rows = (1..3).map { ReaderSessionRow("qa-fixture-$it", "QA fixture $it", "qa$it", "synthetic rows", 0.0) }
-        _reader.update { it.requestSessions(sessionsReq).onResponse(ReaderResponse(sessionsReq, ReaderKind.SESSIONS, ok = true, sessions = rows)) }
+        updateReader { it.requestSessions(sessionsReq).onResponse(ReaderResponse(sessionsReq, ReaderKind.SESSIONS, ok = true, sessions = rows)) }
         val reqId = newRequestId()
         val opening = _reader.value.selectedSessionId != sessionId
         val first = if (opening) newest - count + 1 else newest - 4
         val messages = (first..newest).map { ReaderMessageRow(it, if (it % 2 == 0L) "assistant" else "user", "QA row $it: synthetic reader fixture text", false) }
-        _reader.update { state ->
+        updateReader { state ->
             val requested = if (opening) state.select(sessionId, reqId) else state.refreshLatest(reqId) ?: state
             requested.onResponse(ReaderResponse(reqId, ReaderKind.HISTORY, ok = true, sessionId = sessionId, messages = messages,
                 offset = 0, nextOffset = count, hasOlder = false))
@@ -639,6 +763,8 @@ class WatchApp : Application() {
     fun play(request: PlayRequest, nodeId: String) {
         // Reject cancelled authority before touching an unrelated player, focus, speaker or hold.
         if (request.turnId in stoppedTurns) return refusePlayback(request, nodeId, "stopped on the watch")
+        // The Phone's headset is the only output: nothing is played here, whoever asked and whatever the reply is.
+        if (replica.current.privateAudio) return refusePlayback(request, nodeId, PRIVATE_HEADSET)
         // A later reply never plays over a recording: refused as busy (not played, not failed), and what plays now goes on.
         LaterPlaybackGuard.refusal(request, recordingNow())?.let { busy -> return refusePlayback(request, nodeId, busy) }
         // Completion must not forget the authority Stop needs to revoke between utterances.
@@ -738,8 +864,15 @@ class WatchApp : Application() {
     }
 
     private fun sendPlayed(request: PlayRequest, node: String, ok: Boolean, error: String, releasePlaybackHold: Boolean = false) {
+        val refusal = when {
+            ok -> null
+            error == PlayedAck.BUSY_RECORDING || error == PRIVATE_HEADSET || error == "audio focus denied" -> DiagCause.LOCAL
+            error == "stopped on the watch" -> DiagCause.CANCELLED
+            else -> DiagCause.UNKNOWN
+        }
         diag.record(if (ok) DiagCode.PLAYBACK_DONE else DiagCode.PLAYBACK_FAILED, DiagOrigin.WATCH, request.turnId, n = request.sequence,
-            fail = if (ok) null else if (error == PlayedAck.BUSY_RECORDING) DiagFail.BUSY else DiagFail.UNKNOWN)
+            fail = if (ok) null else if (error == PlayedAck.BUSY_RECORDING) DiagFail.BUSY else refusal?.let { DiagClassify.failOf(it) } ?: DiagFail.UNKNOWN,
+            stage = if (ok) null else DiagStage.PLAYBACK, cause = refusal, modality = if (ok) null else DiagModality.VOICE)
         val token = Any()
         pendingPlayedAcks += token
         playedAckHolds.acquire(HoldReason.PLAYBACK, ACK_HOLD_MS)
@@ -814,6 +947,8 @@ class WatchApp : Application() {
         private const val TAG = "HermesVoiceWatch"
         private const val PREFS = "hermes_voice_watch"
         private const val KEY_SETTINGS = "settings_json"
+        /** The ACK error of a clip refused or stopped because the Phone's headset is the only output (never "played"). */
+        const val PRIVATE_HEADSET = "private_headset"
         private const val ACK_HOLD_MS = 10_000L
         private const val PROGRESS_INTERVAL_MS = 5_000L
         private const val PROGRESS_SEND_MS = 4_000L

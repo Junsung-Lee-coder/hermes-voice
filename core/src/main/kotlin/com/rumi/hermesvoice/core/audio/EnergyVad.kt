@@ -110,6 +110,10 @@ class EnergyVad(val profile: VadProfile, initialFloor: Double, history: DoubleAr
     var runMs: Long = 0
         private set
 
+    /** Onset-level audio in the current run, excluding release/hangover tails. */
+    var onsetRunMs: Long = 0
+        private set
+
     /** Speech qualified in this request (and was not taken back by [forgetSpeech]). */
     var heard: Boolean = false
         private set
@@ -164,6 +168,10 @@ class EnergyVad(val profile: VadProfile, initialFloor: Double, history: DoubleAr
     /** The current run has at least [voicedMs] of voiced audio and is dense enough to be (continuing) speech. */
     fun qualifiedFor(voicedMs: Long): Boolean = runMs >= voicedMs && runMs >= spanMs * profile.minDensity
 
+    /** Renewed Watch speech needs onset-level support and density, never hangover-only time. */
+    fun qualifiedOnsetFor(voicedMs: Long): Boolean = onsetRunMs >= voicedMs &&
+        onsetRunMs >= spanMs * profile.minDensity && longestSolidMs >= profile.minSolidMs
+
     fun observe(level: Double, frameMs: Long): VadClass {
         if (profile.adaptive) {
             pending?.let { primed ->
@@ -181,6 +189,7 @@ class EnergyVad(val profile: VadProfile, initialFloor: Double, history: DoubleAr
         val cls = when {
             level >= base * profile.onsetRatio -> {
                 hangMs = 0
+                onsetRunMs += frameMs
                 solidMs += frameMs
                 if (solidMs > longestSolidMs) longestSolidMs = solidMs
                 VadClass.VOICED
@@ -227,6 +236,7 @@ class EnergyVad(val profile: VadProfile, initialFloor: Double, history: DoubleAr
     /** Starts counting a new run (e.g. renewed speech after the request paused). */
     fun resetRun() {
         runMs = 0
+        onsetRunMs = 0
         spanMs = 0
         dipMs = 0
         solidMs = 0

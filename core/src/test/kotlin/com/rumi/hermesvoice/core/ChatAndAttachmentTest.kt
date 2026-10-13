@@ -19,11 +19,13 @@ class ChatAndAttachmentTest {
     private fun methods() = h.fake.rpcLog.map { it.getString("method") }
 
     @Test
-    fun `text chat returns the destination reply and uses queued submit`() = runBlocking {
+    fun `text chat returns the destination reply and submits without choosing a busy-input policy`() = runBlocking {
         val id = conversation()
         val result = h.core.chat.send(id, "  what's on today?  ") as ChatSendResult.Replied
         assertEquals("reply from $id", result.text)
         assertEquals(listOf(id to "what's on today?"), h.fake.prompts.toList())
+        val submit = h.fake.rpcLog.single { it.getString("method") == "prompt.submit" }.getJSONObject("params")
+        assertTrue("the app leaves queue/steer/interrupt to Hermes", !submit.has("queued"))
     }
 
     @Test

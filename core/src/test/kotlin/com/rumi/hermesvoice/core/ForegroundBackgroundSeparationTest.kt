@@ -24,8 +24,8 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Background standby is BACKGROUND ONLY: while the app is on screen the foreground wake location alone decides
- * whether a device listens, and a hidden armed session is decided by that device's own standby switch alone.
+ * "Listen on" selects the devices that listen, on screen and hidden alike. Background standby is BACKGROUND ONLY and additional:
+ * while the app is on screen "Listen on" alone decides, and a hidden armed session needs both "Listen on" and that device's own standby switch.
  * Every case drives the real controller, coordinator and presence through the same calls the Android adapters make.
  */
 class ForegroundBackgroundSeparationTest {
@@ -161,43 +161,39 @@ class ForegroundBackgroundSeparationTest {
     }
 
     @Test
-    fun `the same excluded Watch listens once hidden, stops when shown again, and the service survives both`() {
+    fun `the same excluded Watch stays silent hidden and shown, and the service survives both`() {
         val w = ComposedWatch(WakeLocation.PHONE, watchStandby = true)
         w.show(); w.start()
         w.hide()
-        assertTrue("hidden standby listens irrespective of the location", w.windowOpen)
-        assertTrue(HoldReason.LISTEN in w.held())
-        assertEquals(WakeContract.BACKGROUND_WINDOW_MS, w.wake.windowMs)
+        assertFalse("hidden standby does not select the Watch", w.windowOpen)
+        assertEquals(0, w.listens())
+        assertNull(w.rearmIn)
+        assertTrue(w.held().isEmpty())
         w.show()
-        assertFalse("shown again: the excluded foreground is closed", w.windowOpen)
+        assertFalse(w.windowOpen)
         assertTrue("the armed service survives the visit", w.coordinator.presence.armed)
         assertEquals("microphone|mediaPlayback", w.serviceType)
-        assertNull("no idle window is scheduled behind the visible app", w.rearmIn)
-        assertTrue(w.held().isEmpty())
         w.hide()
-        assertTrue("hidden again: standby listens again", w.windowOpen)
+        assertFalse("hidden again: still not selected", w.windowOpen)
+        assertEquals(0, w.listens())
     }
 
     @Test
-    fun `screen off while the excluded Watch app is visible and armed is the hidden standby, and screen on gives the foreground back`() {
+    fun `screen off while the excluded Watch app is visible and armed listens to nothing either, and screen on changes nothing`() {
         val w = ComposedWatch(WakeLocation.PHONE, watchStandby = true)
         w.show(); w.start()
         assertFalse(w.windowOpen)
         w.screenOn = false; w.coordinator.onScreenOff(); w.drain()
-        assertTrue("screen off: only the standby can listen", w.windowOpen)
-        w.windowTimeout()
-        assertTrue("between windows nothing is held", w.held().isEmpty())
-        assertEquals(com.rumi.hermesvoice.core.wake.ContinuousWakePolicy.REARM_MS, w.rearmIn)
-        w.rearmDue()
-        assertTrue(w.windowOpen)
+        assertFalse("screen off: the standby cannot select the Watch", w.windowOpen)
+        assertNull(w.rearmIn)
         w.screenOn = true; w.coordinator.onScreenOn(); w.drain()
-        assertFalse("screen on with the app visible: the excluded foreground is closed", w.windowOpen)
-        assertNull("and no idle window is left scheduled", w.rearmIn)
+        assertFalse(w.windowOpen)
+        assertEquals(0, w.listens())
         assertTrue(w.coordinator.presence.armed)
     }
 
     @Test
-    fun `on screen the Watch follows the location alone for all location and flag combinations`() {
+    fun `the Watch listens on screen when Listen on selects it, and hidden only with its standby switch on too, for all combinations`() {
         val violations = mutableListOf<String>()
         for (location in locations) for (watch in flags) for (phone in flags) {
             val w = ComposedWatch(location, watchStandby = watch, phoneStandby = phone)
@@ -207,7 +203,8 @@ class ForegroundBackgroundSeparationTest {
             w.start()
             if (w.windowOpen != expected) violations += "visible+started location=$location watchStandby=$watch phoneStandby=$phone: expected window=$expected was ${w.windowOpen}"
             w.hide()
-            if (w.windowOpen != watch) violations += "hidden location=$location watchStandby=$watch phoneStandby=$phone: expected window=$watch was ${w.windowOpen}"
+            val hiddenExpected = expected && watch
+            if (w.windowOpen != hiddenExpected) violations += "hidden location=$location watchStandby=$watch phoneStandby=$phone: expected window=$hiddenExpected was ${w.windowOpen}"
         }
         assertEquals("Watch eligibility by mode:\n" + violations.joinToString("\n"), emptyList<String>(), violations)
     }
@@ -228,8 +225,8 @@ class ForegroundBackgroundSeparationTest {
     }
 
     @Test
-    fun `hidden OFF then ON with an excluded location is only requested, and the next visit arms without listening on screen`() {
-        val w = ComposedWatch(WakeLocation.PHONE, watchStandby = true)
+    fun `hidden OFF then ON with a selected Watch is only requested, and the next visit arms and listens on screen`() {
+        val w = ComposedWatch(WakeLocation.WATCH, watchStandby = true)
         w.show(); w.start(); w.hide()
         w.standbyChange(watch = false)
         val requests = w.micRequests()
@@ -240,14 +237,27 @@ class ForegroundBackgroundSeparationTest {
         w.show()
         assertEquals("the visit arms the legal service", BackgroundNotice.LISTENING, w.notice)
         assertTrue(w.coordinator.presence.armed)
-        assertFalse("but the excluded foreground is not opened", w.windowOpen)
+        assertTrue("the selected foreground listens on screen", w.windowOpen)
         w.hide()
         assertTrue(w.windowOpen)
     }
 
     @Test
-    fun `an accepted hands-free recording survives a visit that excludes the foreground, and is sent as usual`() {
+    fun `hidden OFF then ON with an excluded Watch is never requested to listen at all`() {
         val w = ComposedWatch(WakeLocation.PHONE, watchStandby = true)
+        w.show(); w.start(); w.hide()
+        w.standbyChange(watch = false)
+        w.standbyChange(watch = true)
+        w.show(); w.hide()
+        assertFalse(w.windowOpen)
+        assertEquals(0, w.listens())
+        assertNull(w.rearmIn)
+        assertTrue(w.held().isEmpty())
+    }
+
+    @Test
+    fun `an accepted hands-free recording survives a visit to the app, and is sent as usual`() {
+        val w = ComposedWatch(WakeLocation.WATCH, watchStandby = true)
         w.show(); w.start(); w.hide()
         w.heard("루미")
         w.handoffDue()
@@ -260,10 +270,10 @@ class ForegroundBackgroundSeparationTest {
 
     @Test
     fun `one device in the foreground and the other in the background are still arbitrated to one turn`() {
-        val w = ComposedWatch(WakeLocation.PHONE, arbitrated = true, watchStandby = true, phoneStandby = false)
+        val w = ComposedWatch(WakeLocation.BOTH, arbitrated = true, watchStandby = true, phoneStandby = false)
         w.show(); w.start(); w.hide()
         w.heard("루미")
-        assertEquals("the Watch's background phrase asks the Phone for the claim", listOf("claim:claim-1"), w.claimsSent)
+        assertEquals("with Listen on Both the Watch's background phrase asks the Phone for the claim", listOf("claim:claim-1"), w.claimsSent)
         assertNull("nothing is recorded before the Phone grants the claim", w.handoffIn)
         w.wake.onClaimVerdict("claim-1", com.rumi.hermesvoice.core.wake.ClaimVerdict.GRANTED); w.drain()
         assertTrue("granted: recorded", w.handoffIn != null)
@@ -350,7 +360,7 @@ class ForegroundBackgroundSeparationTest {
     }
 
     @Test
-    fun `Phone location OFF with the Phone standby on listens hidden and never in the visible app`() {
+    fun `Phone location OFF with the Phone standby on never listens, in the visible app or hidden`() {
         val phone = PhoneBoth(settings(WakeLocation.OFF, phone = true, watch = false))
         phone.show()
         assertFalse("the Phone's foreground is excluded by the location", phone.foreground.listening)
@@ -359,10 +369,25 @@ class ForegroundBackgroundSeparationTest {
         assertFalse(phone.foreground.listening)
         assertFalse("not the background flow either while the app is on screen", phone.backgroundWake.listening)
         phone.hide()
-        assertTrue("hidden: the standby flow owns the microphone", phone.background.owning && phone.backgroundWake.listening)
+        assertFalse("hidden: the standby switch does not select the Phone", phone.backgroundWake.listening)
+        assertFalse(phone.bgWindow)
         phone.show()
         assertFalse(phone.backgroundWake.listening)
         assertFalse("visible again: still no foreground window under location OFF", phone.foreground.listening)
+        assertFalse("no recognizer was ever started", phone.calls.contains("listen"))
+    }
+
+    @Test
+    fun `Phone location PHONE with the standby on listens in the visible app and hidden through its two controllers`() {
+        val phone = PhoneBoth(settings(WakeLocation.PHONE, phone = true, watch = false))
+        phone.show()
+        assertTrue(phone.foreground.listening)
+        assertTrue(phone.background.start().microphone)
+        phone.hide()
+        assertTrue("hidden: the standby flow owns the microphone", phone.background.owning && phone.backgroundWake.listening)
+        phone.show()
+        assertFalse(phone.backgroundWake.listening)
+        assertTrue(phone.foreground.listening)
     }
 
     @Test

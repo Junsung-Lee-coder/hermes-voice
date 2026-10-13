@@ -26,6 +26,17 @@ class SharedPreferencesKeyValueStore(private val prefs: SharedPreferences) : Key
     override fun putInt(key: String, value: Int) { prefs.edit().putInt(key, value).apply() }
 }
 
+/** Reads nothing and refuses every durable write while [blocked] is true (a clear of the unplayed-reply cache is owed and has not succeeded yet); [source] is looked up at each call. */
+class FencedKeyValueStore(private val source: () -> KeyValueStore, private val blocked: () -> Boolean) : KeyValueStore {
+    override fun getString(key: String): String? = if (blocked()) null else source().getString(key)
+    override fun putString(key: String, value: String) { if (!blocked()) source().putString(key, value) }
+    override fun commitString(key: String, value: String): Boolean = if (blocked()) false else source().commitString(key, value)
+    override fun getBoolean(key: String, default: Boolean): Boolean = source().getBoolean(key, default)
+    override fun putBoolean(key: String, value: Boolean) { source().putBoolean(key, value) }
+    override fun getInt(key: String, default: Int): Int = source().getInt(key, default)
+    override fun putInt(key: String, value: Int) { source().putInt(key, value) }
+}
+
 /**
  * The dashboard bearer pair, AES-256-GCM encrypted under a non-exportable Android Keystore key.
  * The prefs file is excluded from backup and device transfer (res/xml backup rules): a restored

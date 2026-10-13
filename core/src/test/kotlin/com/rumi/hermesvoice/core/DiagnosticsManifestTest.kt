@@ -42,9 +42,8 @@ class DiagnosticsManifestTest {
 
         val paths = xml("phone/src/main/res/xml/diag_share_paths.xml")
         val entries = (0 until paths.childNodes.length).map { paths.childNodes.item(it) }.filter { it.nodeType == Node.ELEMENT_NODE }.map { it as Element }
-        assertEquals("exactly one shared folder", 1, entries.size)
-        assertEquals("cache-path", entries.single().tagName)
-        assertEquals("diag/", entries.single().getAttribute("path"))
+        assertEquals("exactly two shared folders: the diagnostics and the viewed attachments", listOf("diag/", "viewed/"), entries.map { it.getAttribute("path") })
+        assertTrue("both are app cache folders, never files or external storage", entries.all { it.tagName == "cache-path" })
     }
 
     @Test
@@ -69,5 +68,6 @@ class DiagnosticsManifestTest {
         val manifest = xml("watch/src/main/AndroidManifest.xml")
         val prefixes = manifest.all("data").map { it.attr("pathPrefix") }
         assertTrue("/hv/v1/diag/request" .startsWith(prefixes.first { it.isNotEmpty() && "/hv/v1/diag/request".startsWith(it) }))
+        assertTrue(prefixes.any { it.isNotEmpty() && com.rumi.hermesvoice.core.watchlink.WatchLinkPaths.DIAG_REQUEST_V2.startsWith(it) })
     }
 }

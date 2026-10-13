@@ -35,6 +35,10 @@ class PhoneRelayService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    /** True only between a successful [ServiceCompat.startForeground] and the end of this service: the platform accepted it as a foreground service. */
+    @Volatile var foregroundActive = false
+        private set
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val app = PhoneApp.from(this)
         when (intent?.action) {
@@ -49,12 +53,16 @@ class PhoneRelayService : Service() {
                 val entered = runCatching {
                     ServiceCompat.startForeground(this, NOTIFICATION_ID, notification(this, app.relay.status.copy(running = true)),
                         ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+                    foregroundActive = true
+                    app.onRelayForegroundChanged()
                     Log.i(TAG, "background relay service foreground generation=$generation")
                 }.onFailure { Log.w(TAG, "background relay service refused: ${it.javaClass.simpleName}") }.isSuccess
                 if (!entered) {
+                    foregroundActive = false
                     running = null
+                    app.onRelayForegroundChanged()
                     stopSelf()
-                    app.onRelayServiceGone(generation)
+                    app.onRelayServiceRefused(generation)
                 } else if (!app.relay.status.running) {
                     // Switched off before the platform delivered this start: it had to enter the foreground; now it ends.
                     finish()
@@ -73,18 +81,22 @@ class PhoneRelayService : Service() {
 
     /** The user's stop: leave the foreground, remove the notification, end. */
     fun finish() {
+        foregroundActive = false
         if (running === this) running = null
+        PhoneApp.from(this).onRelayForegroundChanged()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
         Log.i(TAG, "background relay service finished generation=$generation")
     }
 
     override fun onDestroy() {
+        foregroundActive = false
         if (running === this) {
             // Not the user's stop: the relay is shown as paused and resumes only when the app is opened.
             running = null
             PhoneApp.from(this).onRelayServiceGone(generation)
         }
+        PhoneApp.from(this).onRelayForegroundChanged()
         super.onDestroy()
     }
 
@@ -98,6 +110,9 @@ class PhoneRelayService : Service() {
         /** The running service of the current relay session (same process). */
         @Volatile var running: PhoneRelayService? = null
             private set
+
+        /** The platform admitted the current relay session as a foreground service (not merely that the object exists). */
+        val foregroundActive: Boolean get() = running?.foregroundActive == true
 
         fun start(context: Context): Intent = Intent(context, PhoneRelayService::class.java).setAction(ACTION_START)
 

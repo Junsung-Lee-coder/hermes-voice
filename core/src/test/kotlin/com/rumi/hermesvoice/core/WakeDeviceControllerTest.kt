@@ -82,21 +82,29 @@ class WakeDeviceControllerTest {
     }
 
     @Test
-    fun `excluding the device cancels a pending recorder handoff and stops a hands-free capture unsent`() {
+    fun `excluding the device leaves an accepted recorder handoff and hands-free capture to finish, and accepts nothing new`() {
         val phone = Device(VoiceOrigin.PHONE, settings(WakeLocation.PHONE))
         phone.controller.onResume()
         phone.controller.onResults(phone.controller.generation, listOf("루미"), final = true)
         assertTrue(phone.calls.contains("handoff_in:${WakeContract.MIC_HANDOFF_MS}"))
         phone.controller.onSettings(settings(WakeLocation.OFF, revision = 2))
-        assertFalse("the claim fails after opt-out", phone.controller.onHandoffDue(captureIdle = true))
-        assertFalse(phone.calls.any { it.startsWith("capture:") })
+        assertTrue("the accepted handoff still starts its recording", phone.controller.onHandoffDue(captureIdle = true))
+        assertTrue(phone.calls.toString(), phone.calls.any { it.startsWith("capture:") })
+        assertFalse(phone.calls.toString(), phone.calls.any { it.startsWith("cancel_capture:") })
+        val before = phone.listened()
+        phone.controller.onResults(phone.controller.generation, listOf("루미 불 꺼"), final = true)
+        assertEquals("nothing new is accepted while it records", before, phone.listened())
 
         val watch = Device(VoiceOrigin.WATCH, settings(WakeLocation.WATCH))
         watch.controller.onResume()
         watch.controller.qaSecondUtterance()
         assertTrue(watch.controller.onHandoffDue(captureIdle = true))
         watch.controller.onSettings(settings(WakeLocation.OFF, revision = 2))
-        assertEquals("cancel_capture:opt_out", watch.calls.last())
+        assertFalse(watch.calls.toString(), watch.calls.any { it.startsWith("cancel_capture:") })
+        watch.controller.onRequestCaptureEnded(sent = true)
+        watch.controller.onScreenOn()
+        watch.controller.onIdle()
+        assertEquals("and it does not listen again once it is over", 1, watch.listened())
     }
 
     @Test

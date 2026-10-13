@@ -28,6 +28,7 @@ import com.google.android.gms.wearable.DataMapItem
 import com.google.android.gms.wearable.PutDataRequest
 import com.google.android.gms.wearable.Wearable
 import com.rumi.hermesvoice.core.audio.QaAudio
+import com.rumi.hermesvoice.core.notify.ReplyAlertContent
 import com.rumi.hermesvoice.core.audio.QaLaunchGuard
 import com.rumi.hermesvoice.core.wake.WakeContract
 import com.rumi.hermesvoice.core.watchlink.HapticEvent
@@ -127,13 +128,14 @@ class WatchActivity : ComponentActivity() {
                 ) {
                     when {
                         reader.surface == ReaderSurface.SESSIONS -> SessionsSurface(reader.sessions, reader.selectedSessionId, sessionsFocus,
-                            onSelect = app::selectSession, onRefresh = app::loadSessions, onScrollStep = onScrollStep)
+                            onSelect = app::selectSession, onRefresh = app::loadSessions, onScrollStep = onScrollStep,
+                            onClearLog = app::clearLocalLog)
                         history != null -> ChatSurface(
                             title = reader.sessions.rows.firstOrNull { it.id == history.sessionId }?.title ?: "Conversation",
                             history = history, focusRequester = chatFocus, onOlder = app::loadOlder, onRetry = app::refreshSelected,
                             onScrollStep = onScrollStep,
-                        ) { TalkStatusLine(talk, listening) }
-                        else -> TalkHome(phone, talk, settings.watchWakeEnabled, listening, unavailable)
+                        ) { TalkStatusLine(talk, listening, onReplay = app::replayReply) }
+                        else -> TalkHome(phone, talk, settings.watchWakeEnabled, listening, unavailable, onReplay = app::replayReply)
                     }
                     // Bezel input goes to the list on screen; focus follows the surface.
                     LaunchedEffect(reader.surface, history != null) {
@@ -147,6 +149,7 @@ class WatchActivity : ComponentActivity() {
                 }
             }
         }
+        if (savedInstanceState == null) handleReplyAlertIntent(intent)
         handleQaIntent(intent, restored = savedInstanceState != null)
         // The screen stays on while recording and while a foreground-only window listens; never for a whole background session.
         lifecycleScope.launch {
@@ -164,7 +167,15 @@ class WatchActivity : ComponentActivity() {
             askedMicrophone = false
             askedNotifications = false
         }
+        handleReplyAlertIntent(intent)
         handleQaIntent(intent, restored = false)
+    }
+
+    /** A tapped arrival alert names one conversation; it is opened like the user's own choice, then the intent is spent. */
+    private fun handleReplyAlertIntent(intent: Intent?) {
+        val session = ReplyAlertContent.sessionOf(intent?.action, intent?.getStringExtra(ReplyAlertContent.EXTRA_SESSION_ID)) ?: return
+        app.openFromReplyAlert(session)
+        intent?.action = null
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -181,6 +192,7 @@ class WatchActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        app.onForeground(true)
         if (openPending) {
             openPending = false
             voice.onUserOpened()
@@ -221,6 +233,8 @@ class WatchActivity : ComponentActivity() {
         settingsPull = null
         // Without an armed background session this ends listening and any recording, unsent (WakePresence).
         voice.onActivityPaused()
+        app.onForeground(false)
+        app.diagJournal.requestFlush()
         super.onPause()
     }
 

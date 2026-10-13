@@ -459,38 +459,38 @@ class WakeClaimTransferTest {
     // ── P3-1: the wake location changes while a request is being recorded ────────────────────
 
     @Test
-    fun `changing the wake location during a wake recording cancels it with a notice and nothing is sent`() {
-        // Recording on and refusing the finished recording (it has no claim) would waste what the user said.
+    fun `changing the wake location during an accepted wake recording or handoff leaves it to finish, and a request only heard is still cancelled`() {
+        // Accepted (the recorder runs or its handoff is pending): it completes under the settings it was accepted under.
         rig(WakeLocation.WATCH) { r ->
             r.watch.hears("루미", final = true)
             assertTrue(r.watch.controller.onHandoffDue(captureIdle = true))
             assertNull("one listener: no claim", r.watch.captureClaim)
             r.h.settings.saveWatchSettings(r.h.settings.watchSettings().copy(wakeLocation = WakeLocation.BOTH))
             r.watch.controller.onSettings(r.h.settings.watchSettings())
-            assertTrue(r.watch.calls.toString(), r.watch.calls.containsAll(listOf("cancel_capture:wake_mode_changed", "closed:wake_mode_changed")))
-            assertEquals(0, r.delivered())
-            // The next wake is a new episode under the new mode, with a claim.
-            r.watch.reopen()
-            r.watch.hears("루미 불 꺼", final = true)
-            assertTrue(r.watch.recognized?.second != null)
+            assertFalse(r.watch.calls.toString(), r.watch.calls.any { it.startsWith("cancel_capture") || it.startsWith("closed") })
+            val upload = r.watch.handOver("turn-watch-moved-alone", 1_000)
+            assertTrue(r.watch.arrives(upload) is VoiceTurnOutcome.Completed)
+            assertEquals(1, r.delivered())
         }
-        // Both → Watch while the Watch records with a claim: cancelled the same way, and the claim is given back.
+        // Both -> Watch while the Watch records with a claim: the recording goes on and is delivered once with its claim.
         rig { r ->
             r.watch.hears("루미", final = true)
             assertTrue(r.watch.controller.onHandoffDue(captureIdle = true))
             r.h.settings.saveWatchSettings(r.h.settings.watchSettings().copy(wakeLocation = WakeLocation.WATCH))
             r.watch.controller.onSettings(r.h.settings.watchSettings())
-            assertTrue(r.watch.calls.toString(), r.watch.calls.containsAll(listOf("cancel_capture:wake_mode_changed", "closed:wake_mode_changed", "release_claim")))
-            assertNull(r.h.core.wakeAdmission.holder())
+            assertFalse(r.watch.calls.toString(), r.watch.calls.any { it.startsWith("cancel_capture") || it.startsWith("closed") || it == "release_claim" })
+            val upload = r.watch.handOver("turn-watch-moved-both", 1_000)
+            assertTrue(r.watch.arrives(upload) is VoiceTurnOutcome.Completed)
+            assertEquals(1, r.delivered())
         }
-        // In the pause before the recorder starts: the handoff is dropped and the recorder never starts.
+        // In the pause before the recorder starts: the accepted handoff is kept and the recorder starts.
         rig(WakeLocation.WATCH) { r ->
             r.watch.hears("루미", final = true)
             r.h.settings.saveWatchSettings(r.h.settings.watchSettings().copy(wakeLocation = WakeLocation.BOTH))
             r.watch.controller.onSettings(r.h.settings.watchSettings())
-            assertTrue(r.watch.calls.contains("closed:wake_mode_changed"))
-            assertFalse(r.watch.controller.onHandoffDue(captureIdle = true))
-            assertFalse(r.watch.calls.contains("capture"))
+            assertFalse(r.watch.calls.contains("closed:wake_mode_changed"))
+            assertTrue(r.watch.controller.onHandoffDue(captureIdle = true))
+            assertTrue(r.watch.calls.toString(), r.watch.calls.contains("capture"))
         }
         // The same on the Phone.
         rig(WakeLocation.PHONE) { r ->
@@ -498,7 +498,16 @@ class WakeClaimTransferTest {
             assertTrue(r.phone.controller.onHandoffDue(captureIdle = true))
             r.h.settings.saveWatchSettings(r.h.settings.watchSettings().copy(wakeLocation = WakeLocation.BOTH))
             r.phone.controller.onSettings(r.h.settings.watchSettings())
-            assertTrue(r.phone.calls.toString(), r.phone.calls.containsAll(listOf("cancel_capture:wake_mode_changed", "closed:wake_mode_changed")))
+            assertFalse(r.phone.calls.toString(), r.phone.calls.any { it.startsWith("cancel_capture") || it.startsWith("closed") })
+        }
+        // Only heard (a claim asked on a partial, nothing accepted): another mode still ends it with a notice and nothing is sent.
+        rig { r ->
+            r.watch.hears("루미 불", final = false)
+            r.h.settings.saveWatchSettings(r.h.settings.watchSettings().copy(wakeLocation = WakeLocation.WATCH))
+            r.watch.controller.onSettings(r.h.settings.watchSettings())
+            assertTrue(r.watch.calls.toString(), r.watch.calls.contains("closed:wake_mode_changed"))
+            assertEquals(0, r.delivered())
+            assertNull(r.h.core.wakeAdmission.holder())
         }
     }
 

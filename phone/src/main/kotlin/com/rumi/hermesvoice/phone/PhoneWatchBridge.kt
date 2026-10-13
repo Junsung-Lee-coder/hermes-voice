@@ -1,5 +1,11 @@
 package com.rumi.hermesvoice.phone
 
+import com.rumi.hermesvoice.core.diag.DiagCause
+import com.rumi.hermesvoice.core.diag.DiagClassify
+import com.rumi.hermesvoice.core.diag.DiagCode
+import com.rumi.hermesvoice.core.diag.DiagModality
+import com.rumi.hermesvoice.core.diag.DiagOrigin
+import com.rumi.hermesvoice.core.diag.DiagStage
 import android.content.Context
 import android.util.Log
 import com.google.android.gms.wearable.CapabilityClient
@@ -16,6 +22,7 @@ import com.rumi.hermesvoice.core.watchlink.PhoneReaderService
 import com.rumi.hermesvoice.core.watchlink.ReaderError
 import com.rumi.hermesvoice.core.watchlink.ReaderRequest
 import com.rumi.hermesvoice.core.watchlink.ReaderResponse
+import com.rumi.hermesvoice.core.watchlink.ReplayRequest
 import com.rumi.hermesvoice.core.watchlink.TurnStateMessage
 import com.rumi.hermesvoice.core.watchlink.WatchLinkPaths
 import com.rumi.hermesvoice.core.watchlink.WatchTransport
@@ -70,8 +77,13 @@ class PhoneWatchListenerService : WearableListenerService() {
             val bytes = try {
                 val input = client.getInputStream(channel).await()
                 withContext(Dispatchers.IO) { BoundedRead.readAtMost(input, BoundedRead.FRAME_LIMIT) }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
             } catch (error: Exception) {
-                Log.w(TAG, "watch turn read failed: ${error.javaClass.simpleName}")
+                val cause = DiagClassify.of(error).cause.let { if (it == DiagCause.UNKNOWN) DiagClassify.causeOfName(error.javaClass.simpleName) else it }
+                Log.w(TAG, "watch turn read failed cause=${cause.wire}")
+                app.diagnostics.log.record(DiagCode.REQUEST_FAILED, DiagOrigin.WATCH, turnId, fail = DiagClassify.failOf(cause),
+                    stage = DiagStage.TRANSFER, cause = cause, modality = DiagModality.VOICE)
                 null
             } finally {
                 runCatching { client.close(channel).await() }
@@ -103,6 +115,23 @@ class PhoneWatchListenerService : WearableListenerService() {
                     PhoneApp.from(this).wiring().core.watchIntake.cancelTurn(request.turnId, event.sourceNodeId)
                 }.getOrNull() == true
                 Log.i(TAG, "watch stop request from=${event.sourceNodeId.take(8)} stopped=$stopped")
+            }
+            WatchLinkPaths.REPLAY -> {
+                val request = ReplayRequest.decode(event.data)
+                if (request == null) Log.i(TAG, "watch replay request ignored: unreadable")
+                else {
+                    val app = PhoneApp.from(this)
+                    val transport = DataLayerWatchTransport(applicationContext, event.sourceNodeId)
+                    val node = event.sourceNodeId
+                    app.appScope.launch {
+                        val accepted = runCatching { app.wiring().core.watchIntake.replayReply(request, node, transport) }.getOrNull() == true
+                        Log.i(TAG, "watch replay request accepted=$accepted")
+                    }
+                }
+            }
+            WatchLinkPaths.PRIVATE_AUDIO -> {
+                val confirmed = runCatching { PhoneApp.from(this).privateAudio.onReceipt(event.data) }.getOrDefault(false)
+                Log.i(TAG, "watch private-audio receipt from=${event.sourceNodeId.take(8)} confirmed=$confirmed")
             }
             WatchLinkPaths.DIAG_RESPONSE -> PhoneApp.from(this).diagnostics.onWatchResponse(event.sourceNodeId, event.data)
             WatchLinkPaths.READER_REQUEST -> answerReader(event.sourceNodeId, event.data)

@@ -23,8 +23,8 @@ class LaterReplyWindowSettingTest {
         assertEquals("later_reply_window_minutes", AppSettings.KEY_LATER_REPLY_WINDOW_MINUTES)
         assertEquals(30, settings().laterReplyWindowMinutes)
         assertEquals(VoiceTurnOrchestrator.LATER_WINDOW_MS, settings().laterReplyWindowMillis)
-        assertTrue(LaterReplyWindow.presets.all { it in 1..4320 })
-        assertTrue(LaterReplyWindow.presets.contains(30) && LaterReplyWindow.presets.contains(4320))
+        assertTrue("the quick-choice presets were removed; the typed number and unit are the only editor",
+            LaterReplyWindow::class.java.methods.none { it.name == "getPresets" })
     }
 
     @Test

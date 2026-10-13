@@ -30,14 +30,29 @@ open class HermesException(message: String, cause: Throwable? = null) : Exceptio
 /** No usable bearer session: the user must run the dashboard sign-in again. Never bypassed. */
 class HermesAuthRequiredException(message: String) : HermesException(message)
 
-class HermesHttpException(val status: Int, message: String) : HermesException(message)
+class HermesHttpException(val status: Int, message: String, val sttCode: com.rumi.hermesvoice.core.net.SttCode? = null) : HermesException(message)
 
-class HermesProtocolException(message: String, cause: Throwable? = null) : HermesException(message, cause)
+open class HermesProtocolException(message: String, cause: Throwable? = null) : HermesException(message, cause)
+
+/** The gateway socket was closed by the server with a WebSocket close code (the code, not the reason text, is what diagnostics keep). */
+class HermesGatewayClosedException(val closeCode: Int, message: String) : HermesProtocolException(message)
+
+/** No gateway activity for the whole inactivity bound while waiting for a reply. */
+class HermesInactivityTimeoutException(message: String) : HermesProtocolException(message)
+
+/** The gateway event stream ended before the reply completed. */
+class HermesStreamEndedException(message: String) : HermesProtocolException(message)
+
+/** Hermes itself reported the turn as failed (an error event or an error completion). */
+class HermesTurnFailedException(message: String) : HermesProtocolException(message)
 
 class HermesRpcException(val code: Int, message: String) : HermesException(message)
 
 /** The originating device could not play (or confirm playing) an utterance. */
 open class HermesPlaybackException(message: String) : HermesException(message)
+
+/** A playback failure that happened before any speech was heard and is worth trying again (a player or route that was not ready yet). */
+class HermesPlaybackTransientException(message: String) : HermesPlaybackException(message)
 
 /** The device didn't play a later reply because its microphone is recording: not played, to be tried again. */
 class HermesPlaybackBusyException(message: String) : HermesPlaybackException(message)

@@ -1,6 +1,10 @@
 package com.rumi.hermesvoice.core.watchlink
 
+import com.rumi.hermesvoice.core.diag.DiagCause
+import com.rumi.hermesvoice.core.diag.DiagClassify
 import com.rumi.hermesvoice.core.diag.DiagCode
+import com.rumi.hermesvoice.core.diag.DiagModality
+import com.rumi.hermesvoice.core.diag.DiagStage
 import com.rumi.hermesvoice.core.diag.DiagFail
 import com.rumi.hermesvoice.core.diag.DiagLog
 import com.rumi.hermesvoice.core.diag.DiagOrigin
@@ -135,6 +139,15 @@ class WatchPlaybackSink(
 ) : PlaybackSink {
     override suspend fun play(audio: SpokenAudio, cue: PlaybackCue) = playConfirmed(audio, cue) {}
 
+    override suspend fun deliverReplyAlert(alert: com.rumi.hermesvoice.core.notify.ReplyAlert): Boolean = try {
+        transport.sendMessage(WatchLinkPaths.REPLY, ReplyAlertMessage(alert.identity, alert.storedSessionId).encode())
+        true
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: Exception) {
+        false
+    }
+
     /** [finished] runs when the registry accepts this exact node's successful PLAYED ack, before this call resumes. */
     override suspend fun playConfirmed(audio: SpokenAudio, cue: PlaybackCue, finished: () -> Unit) {
         // The chunks of one long reply get distinct wire sequence numbers, so each chunk has its own exact ACK.
@@ -149,17 +162,21 @@ class WatchPlaybackSink(
                 throw cancelled
             } catch (error: Exception) {
                 // Data Layer failures (e.g. ApiException) must surface as a playback failure, not escape the turn.
+                diag?.recordFailure(DiagCode.PLAYBACK_FAILED, error, DiagOrigin.WATCH, cue.turnId, stage = DiagStage.TRANSFER, modality = DiagModality.VOICE)
                 throw HermesPlaybackException("watch unreachable: ${error.javaClass.simpleName}")
             }
             val ack = awaitAck(waiter, ackTimeoutMs(audio)) ?: run {
-                diag?.record(DiagCode.ACK_TIMEOUT, DiagOrigin.WATCH, cue.turnId, fail = DiagFail.TIMEOUT)
+                diag?.record(DiagCode.ACK_TIMEOUT, DiagOrigin.WATCH, cue.turnId, fail = DiagFail.TIMEOUT,
+                    stage = DiagStage.PLAYBACK, cause = DiagCause.TIMEOUT, modality = DiagModality.VOICE)
                 throw HermesPlaybackException("watch did not confirm playback of ${cue.role.name.lowercase()}")
             }
             if (!ack.ok && ack.error == PlayedAck.BUSY_RECORDING) {
-                diag?.record(DiagCode.ACK_REFUSED, DiagOrigin.WATCH, cue.turnId, fail = DiagFail.BUSY)
+                diag?.record(DiagCode.ACK_REFUSED, DiagOrigin.WATCH, cue.turnId, fail = DiagFail.BUSY,
+                    stage = DiagStage.PLAYBACK, cause = DiagCause.LOCAL, modality = DiagModality.VOICE)
                 throw HermesPlaybackBusyException("watch is recording")
             }
-            if (!ack.ok) diag?.record(DiagCode.ACK_REFUSED, DiagOrigin.WATCH, cue.turnId, fail = DiagFail.UNKNOWN)
+            if (!ack.ok) diag?.record(DiagCode.ACK_REFUSED, DiagOrigin.WATCH, cue.turnId, fail = DiagFail.UNKNOWN,
+                stage = DiagStage.PLAYBACK, cause = DiagCause.UNKNOWN, modality = DiagModality.VOICE)
             if (!ack.ok) throw HermesPlaybackException("watch playback failed: ${ack.error.ifBlank { "unknown" }}")
         } catch (cancelled: CancellationException) {
             withContext(NonCancellable) {
@@ -231,12 +248,45 @@ class WatchTurnIntake(
     fun cancelTurn(turnId: String, sourceNodeId: String): Boolean =
         origins[turnId] == sourceNodeId && orchestrator.stopTurn(turnId)
 
+    /**
+     * The Watch's "Play again" for the final reply of one of its own requests ([WatchLinkPaths.REPLAY]): only the node that sent the
+     * request may ask (the orchestrator compares the node it recorded), and only for a Watch request whose reply ended without audio. Nothing is sent to Hermes again; the output
+     * is decided afresh by the orchestrator. Returns when the replay has ended and the Watch was told its result (a result that cannot be
+     * sent because this call was cancelled is still attempted). False: not accepted (unknown turn, other node, nothing to replay, already replaying).
+     */
+    suspend fun replayReply(request: ReplayRequest, sourceNodeId: String, transport: WatchTransport): Boolean {
+        val result = CompletableDeferred<Pair<Boolean, String>>()
+        val accepted = orchestrator.replayAudio(com.rumi.hermesvoice.core.notify.ReplyAlert.identityOf(request.turnId, "final"), sourceNodeId,
+            WatchPlaybackSink(transport, acks, diag = diag)) { heard, detail -> result.complete(heard to detail) }
+        if (!accepted) {
+            runCatching { transport.sendMessage(WatchLinkPaths.STATE, TurnStateMessage(request.turnId, "done", REPLAY_UNAVAILABLE, true).encode()) }
+            return false
+        }
+        val (heard, detail) = try {
+            result.await()
+        } catch (cancelled: CancellationException) {
+            withContext(NonCancellable) { runCatching { transport.sendMessage(WatchLinkPaths.STATE, replayState(request.turnId, false, "stopped")) } }
+            throw cancelled
+        }
+        runCatching { transport.sendMessage(WatchLinkPaths.STATE, replayState(request.turnId, heard, detail)) }
+        return true
+    }
+
+    private fun replayState(turnId: String, heard: Boolean, detail: String): ByteArray {
+        val text = if (heard) REPLAYED else "Reply audio did not play: " +
+            (com.rumi.hermesvoice.core.headset.HeadsetText.fixedNote(detail)?.removePrefix("not played: ") ?: "play it again, or read the text")
+        return TurnStateMessage(turnId, "done", text, true, replay = !heard).encode()
+    }
+
     suspend fun onTurnChannel(path: String, bytes: ByteArray?, transport: WatchTransport): VoiceTurnOutcome? {
         val upload = try {
             if (bytes == null) throw LinkProtocolException("recording transfer failed or too large")
             WatchTurnUpload.fromFrame(path, LinkFrame.decode(bytes))
         } catch (error: LinkProtocolException) {
             WatchLinkPaths.turnIdFromPath(path)?.let { turnId ->
+                diag?.record(DiagCode.REQUEST_FAILED, DiagOrigin.WATCH, turnId,
+                    fail = if (bytes == null) DiagFail.IO else DiagFail.PROTOCOL, stage = DiagStage.TRANSFER,
+                    cause = if (bytes == null) DiagCause.DISCONNECT else DiagCause.LOCAL, modality = DiagModality.VOICE)
                 val detail = if (bytes == null) "Recording transfer failed" else "Bad recording"
                 runCatching { transport.sendMessage(WatchLinkPaths.STATE, TurnStateMessage(turnId, "rejected", detail, true).encode()) }
             }
@@ -309,13 +359,16 @@ class WatchTurnIntake(
             navigator.join()
             runCatching {
                 transport.sendMessage(WatchLinkPaths.STATE,
-                    TurnStateMessage(upload.turnId, "done", VoiceOutcomeText.describe(outcome), true).encode())
+                    TurnStateMessage(upload.turnId, "done", VoiceOutcomeText.describe(outcome), true,
+                        replay = outcome is VoiceTurnOutcome.DeliveredResponseFailed).encode())
             }
             outcome
         }
 
     companion object {
         const val STOPPED_ON_PHONE = "Stopped on the phone"
+        const val REPLAYED = "Reply played"
+        const val REPLAY_UNAVAILABLE = "That reply can't be played again now. Read it on the phone"
     }
 }
 
@@ -328,13 +381,18 @@ object VoiceOutcomeText {
         is VoiceTurnOutcome.DeliveredUnattributed ->
             "Delivered to ${outcome.route.destination.alias}; reply not spoken (destination busy)"
         is VoiceTurnOutcome.DeliveredResponseFailed ->
-            "Delivered to ${outcome.route.destination.alias}; reply playback failed"
+            "Delivered to ${outcome.route.destination.alias}; reply playback failed" +
+                (outcome.note?.let { ": ${it.removePrefix("not played: ")}" }
+                    ?: com.rumi.hermesvoice.core.diag.DiagLabels.detail(outcome.diagStage, outcome.diagCause)?.let { " ($it)" } ?: "")
         is VoiceTurnOutcome.RoutingRejected -> "Not delivered: routing rejected (${outcome.reason})"
         is VoiceTurnOutcome.NotDelivered -> when {
             outcome.authRequired -> "Not delivered: sign in on the phone"
             outcome.reason == TurnRouting.TARGET_UNAVAILABLE ->
                 "Not sent: routing is off and the selected conversation isn't available. Select another"
-            else -> "Not delivered: ${outcome.reason.take(120)}"
+            outcome.diagCause == com.rumi.hermesvoice.core.diag.DiagCause.STT_UNAVAILABLE ->
+                "Not delivered: the speech server stayed unavailable; the recording was discarded. Say it again"
+            else -> com.rumi.hermesvoice.core.diag.DiagLabels.detail(outcome.diagStage, outcome.diagCause)
+                ?.let { "Not delivered: $it" } ?: "Not delivered: ${outcome.reason.take(120)}"
         }
         VoiceTurnOutcome.NoSpeech -> "No speech detected"
         is VoiceTurnOutcome.Duplicate -> "Duplicate turn ignored"

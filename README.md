@@ -143,12 +143,22 @@ each, which keeps base64 frames under the 16 MiB WebSocket frame limit of older 
   with the Phone. Its conversation reader goes through the Phone with the same checks (see
   [Watch conversation reader](#watch-conversation-reader)).
 
+## Headset controls
+
+Every accepted headset PLAY or PAUSE (key or MediaSession transport callback), as well as PLAY_PAUSE/HEADSETHOOK, toggles the current Phone recording: idle starts; recording or pending preparation stops/cancels. Duplicate delivery of one press remains suppressed for 350 ms. Explicit controller START/STOP requests remain idempotent.
+
+Use headset is off by default. With it on and a connected personal output, live Phone controls may record after HOME or screen lock if Android delivers the media button and admits the current capture's microphone foreground service. The on-screen mic and headset share one Application-owned recorder; removing the Activity does not dispose it. Open a signed-in conversation first. A pending start opens no microphone; Stop cancels it. The recording notification's Stop sends only the exact active capture and leaves Watch input and other requests alone.
+
+One private ding marks a real start and two a real stop after mic release; cue audio is excluded from the request. One brief connection sound may play at a newly observed disconnected-to-connected personal output while Use headset is on. Startup, enabling the switch on an existing connection, and repeated reports do not replay it; a busy microphone skips that epoch. Every cue stays muted until the exact output route is confirmed, and ends on route, focus or noisy-output loss without speaker fallback.
+
+The connection cue is real playback, not guaranteed media-button ownership; another music app may become the recipient later. There is no looping silence, fake recording-as-PLAYING state, idle microphone, forced focus, display wake or battery-policy bypass. OS process death, force-stop and OEM power policy can end controls: reopen the app. Interrupted PCM is never automatically resumed or sent. Actual physical button delivery, microphone exemption, audible privacy and screen-off power behavior need device verification.
+
 ## Voice turns
 
 The flow is the same whether a turn starts on the Phone or the Watch:
 
 1. **Record a WAV.** On the Phone, the Talk button toggles push-to-talk recording; the Phone
-   push-to-talk recorder keeps at most the first 2 minutes of a recording (a Phone-only limit). On
+   manual recorder ends and sends after 13 minutes, releasing the microphone and bounded CPU hold (a Phone-only safety bound). On
    the Watch there is no Talk button: hold a finger still anywhere on the main screen for one
    second to start recording, and hold again (a new press) to stop and send; there is no time
    limit (see [Watch conversation reader](#watch-conversation-reader)). On either device the
@@ -305,6 +315,87 @@ No fixed total time ends a healthy reply. Every wait in the path was traced and 
   over a recording) is ignored by an older Watch and absent from older Phones' requests. There is
   no backend or schema change.
 
+### Speech-server recovery
+
+When the speech server is temporarily unavailable, the app waits and transcribes the same recording
+again instead of dropping the turn.
+
+- **What is retried.** Only the transcription step, and only for two kinds of failure.
+  (1) The three transient codes the speech plugin emits in its error text (`[hermes-stt:stt_unavailable]`,
+  `stt_busy`, `stt_timeout`). (2) A temporary *transport* failure of that one request, at the exact place the
+  Phone's dashboard client sends the recording to `/api/audio/transcribe`: the server name could not be
+  resolved (DNS), the connection could not be made (connection refused / no route), an established
+  connection was cut (reset / end of stream), or a connect/read/write/call time ran out. These four are a closed
+  list, recognised by the failure's Java *type* and the phase it happened in, never by message text; they are
+  treated as `stt_unavailable` (the time-out as `stt_timeout`) and use the same budget below. What is
+  **not** retried: a plain HTTP 400 without the envelope, a TLS certificate or trust refusal, any other
+  I/O or protocol error, sign-in or permission failures (401/403), oversized or unsupported audio, a
+  permanent refusal the plugin names (`input_rejected`, `auth_rejected`, `transcription_failed`,
+  `config_invalid`, `cancelled`), a call cancelled by Stop or `Call.cancel`, a 200 reply whose body is not valid JSON, a response body cut short in an untyped way (a protocol violation),
+  and everything after a transcript exists (the conversation submit is never repeated and the audio is
+  never re-transcribed). The text, upload, synthesis and session routes keep their plain I/O errors.
+- **Budget.** Up to 180 seconds in total and at most 6 attempts, with waits of 5, 15, 30, 60 and 60
+  seconds as the remaining time allows. Real call time counts, a tighter deadline of the caller wins, and
+  nested layers do not restart the clock. When the budget is spent the turn fails exactly as a failed transcription did before.
+  The production caller (the Phone and the Watch relay) sets **no** extra caller deadline: the real bound is the 180 s / 6 attempt
+  budget above. `callerDeadlineMs` exists on the request and is exercised only by tests (it can only shorten the budget); no
+  production path sets it, so do not read it as a shipped shorter limit.
+- **Visible and cancellable.** The pending request shows "waiting for the speech server, will try again" (the Watch
+  shows "Waiting for the speech server…"). Stop on that exact request cancels the wait or the call, never starts another
+  attempt, and is recorded as a cancel, not a failure. The microphone, speaker and wake claims are not
+  held while waiting, and other requests are not blocked.
+- **Delivered once.** The turn is submitted to the conversation only after a transcript arrives, exactly once.
+  The audio is kept in memory only while the request is active, and every retry uploads that same in-memory recording.
+  **If the app process is killed or restarted while a request waits, that recording is lost: there is no durable
+  replay, and nothing is re-sent after a restart.** A Watch recording is relayed to the
+  Phone, which does the transcribing; the Watch does not retry on its own.
+- **Stop is client-side only.** Stop abandons the app's own HTTP call (the OkHttp call is cancelled), prevents any retry and any
+  submit. The Hermes dashboard does not hand its request-cancel signal to the transcription plugin, so a Stop does **not**
+  reach the server: a transcription already running there is not aborted and finishes (or times out) on its own, its result
+  discarded. The plugin bounds that work itself (below), and nothing is claimed about remote cancellation. Closing this gap
+  needs a dashboard change that passes its cancel signal to the provider; it stays a release gate for the server side.
+  The local call is closed at the budget or on Stop **also after the reply headers arrived**, while a status or body is still
+  being read (the reply body, an HTTP error body and the sign-in refresh round trip of that request included); no retry follows. A
+  cancel during a refresh round trip can leave a rotated refresh token unsaved, so the next request may ask you to sign in again.
+  On the transcription route the server's free-form error text is never kept: only the fixed wording of a recognised
+  `[hermes-stt:<code>]` envelope reaches a message, the screen, the diagnostics or the recovery events.
+- **Server side.** The `remote-whisper` plugin (0.7.1) can keep an ordered list of backends: the
+  configured primary first, then standbys. One request carries a real monotonic wall deadline covering
+  queueing, connect, upload, response headers, the body and the optional polishing step. The time is split
+  so a primary that connects but then hangs cannot use it all: every later eligible standby keeps its share
+  and, if the primary hangs, the *same* request is answered by a standby. Unhealthy backends (including a
+  half-open probe) get only a short capped attempt. A backend that cannot serve (connection, readiness, timeout, busy)
+  is skipped for a short, growing time; real input rejections and credential failures do not switch backend,
+  and a request cancelled by its caller (where the host provides that signal) never touches another backend.
+  Concurrency and outstanding workers are capped; resource slots stay held (and visible in the admission snapshot) while
+  work the plugin does not own is still running, instead of being released early. Polishing is skipped with a fixed status
+  when the budget is gone. An HTTP 200 whose body says `ok=false` returns a fixed, non-retryable `transcription_failed`;
+  the server's own error text, URLs, tokens and file paths are never copied into the returned error, logs or diagnostics.
+  A TLS certificate, hostname or protocol refusal from a backend is a configuration error (`config_invalid`, not retried and
+  not an outage); that backend is skipped for five minutes while a trusted standby still serves, and validation is never weakened.
+  If every backend is unavailable the plugin returns the stable transient code above. The primary's token is never
+  sent to a standby. A legacy single-endpoint configuration works unchanged.
+
+### Markdown in messages
+
+Messages on the Phone and the Watch render Markdown: bold, italic, strike-through, headings,
+bulleted, numbered and checkbox lists, block quotes, inline code and fenced code blocks, rules, links and tables.
+
+- Rendering is presentation only. Stored text, history, spoken text, voice prompts and diagnostics are
+  unchanged, and old and new messages render alike. Text without Markdown is shown exactly as before.
+- Nothing is executed or fetched: no HTML, no images loaded from the network, no scripts. Only
+  `http`/`https` links are tappable (a short tap opens, a long press still selects); other schemes stay as
+  literal text. A link shows its address host next to its label.
+- Text selection and Copy keep working (copying yields the text as displayed). Tables scroll
+  sideways inside the Phone bubble; the Watch shows each row on one line with the cells separated by " · ".
+  All cell text is kept: a row with more cells than the header folds the extra cells into its last column
+  (` | ` between them) rather than dropping them, and a shorter row is padded. The Watch shows link labels only.
+- A backslash before ASCII punctuation is a Markdown escape (`\*` shows `*`, `\\server` shows `\server`);
+  a backslash before any other character (a Windows path such as `C:\Users\name`) stays as written, and
+  inline code always keeps its backslashes exactly.
+- Unclosed or dangling Markers (for example while a reply is still arriving) fall back to plain
+  text and never hide content.
+
 ### Share diagnostics
 
 Settings → **Share diagnostics** builds a local report only when you ask, shows a
@@ -330,6 +421,16 @@ endpoint exists.
   kept and anything older than 24 hours is removed (at app start and with each export). The
   `FileProvider` (`<applicationId>.diagshare`) is not exported, covers only that folder, and
   grants read-only access to the one file shared. The event log itself is in memory only, and the report folder is app cache, which Android does not back up.
+- **Speech recovery and request words (schema 3).** New fixed events record attempt started/ok/failed,
+  waiting, recovered, exhausted and cancelled for transcription, with the caller (Phone/Watch), the
+  safe code, HTTP status, elapsed time, audio size and a coarse audio type, and the wait length. The
+  backend and model are recorded as `unknown`, because the dashboard returns neither; the speech
+  server's own log names them. `request_delivered` now means only that the conversation accepted the
+  message; the former cleanup moment is `request_transmission_ended`. Exports from older builds
+  can show `request_failed` followed by `request_delivered` for the same request; those old events are
+  not rewritten. The report states the schema version and the app version of each device, and the
+  per-device coverage (kept, dropped, pruned, restored). Each device keeps up to 256 events for 24
+  hours, also in a small private journal that survives an app restart.
 - **Not measured.** The Android share sheet, `FileProvider` grant at runtime and the Settings UI
   were not exercised on a device or emulator here (see Validation).
 
@@ -620,6 +721,33 @@ not reproduced, and physical verification is still pending.
   process's monotonic clock; whether that keeps pace with the wall clock while the phone sleeps
   deeply was not checked on a device.
 
+### New-reply alerts (when an answer is not spoken)
+
+When the app receives a final assistant answer that it does **not** speak, it posts one notification: title "New reply",
+text "A new reply is ready" (nothing of the answer; lock-screen version "Hermes Voice" / "New reply"). Tapping it opens
+exactly the conversation the answer was delivered to, through the app's normal conversation navigation; it never switches the
+visible screen by itself, and it is independent of "route and notify" versus "automatically open the routed conversation".
+
+- **What counts.** A completed final answer (not progress, an ACK, interim text, an empty, errored or interrupted completion).
+  Not alerted: an answer that was played to the end (on either device, including remote audio), one whose audio is still being
+  synthesized or played, a Stop or "later replies off" cancellation, and old history loaded on a cold start. Alerted: a text
+  chat reply (never spoken), and a voice answer or later reply that ended without audio (policy, no audio, playback failure,
+  unreachable Watch, queue full, superseded).
+- **Once per answer.** The identity is the turn id plus the answer's position (`<turn>#final`, `<turn>#later<n>`) or one text
+  send; it is never derived from the text, so two answers with identical words each alert, and a replayed gateway frame, a
+  history reload or a restart does not alert again. A bounded ledger of 256 identities is kept in each device's local
+  preferences (`reply_alert_ledger_v1`). A notification the system refuses (permission, channel or app notifications off) still
+  counts as handled: the reply, request, audio and history are unaffected and it is not retried later.
+- **Who alerts.** A Phone-origin answer or text reply: the Phone (a standard notification, so the paired-system bridge to the
+  Watch is the platform's, not this app's). An answer meant for the Watch: the Phone sends only the identity and conversation id
+  over `/hv/v1/reply`; the Watch posts a **local-only** notification and the Phone posts none. If that message cannot be sent,
+  the Phone alerts instead. Delivery of the message is not proof the Watch displayed it.
+- **System behavior.** Its own channel "New replies" (default importance: the system's vibration and sound, Do Not Disturb and the
+  channel settings apply; the app plays no sound or speech for it). It is separate from the quiet background-service channels.
+  The Android notification permission is requested on the Phone only from the visible chat screen, before the first text send,
+  once (`reply_alert_permission_asked`); declining changes nothing else. No new permission, server API, polling or tracking.
+- **Limits.** Reply arrival is when the app receives it, not a server push. A text reply is alerted even while the chat is open.
+
 ## Watch conversation reader
 
 The Watch shows the app's conversations without ever calling Hermes itself:
@@ -685,9 +813,9 @@ signed in, Watch not reachable).
 By default it works only while that device's app is open on screen (foreground) and needs no
 permission beyond the microphone. Each time the app is shown, or the screen turns back on with the
 app shown, the platform `SpeechRecognizer` listens for 5 seconds. Each device can also
-listen with its app closed or the screen off through its own, separate background standby switch
-(off by default, see [Background standby](#background-standby-separate-from-listen-on)); **Listen on**
-alone decides whether a device listens while its app is open. On-device
+listen with its app closed or the screen off through its own background standby switch
+(off by default, see [Background standby](#background-standby-additional-to-listen-on)); **Listen on**
+is the master gate: a device it does not select never listens, with its app open or closed. On-device
 recognition is used when available; if it reports that it lacks the wake phrases' language, the
 app falls back once to the system's default recognition service, which may send audio over the
 network. It never runs while recording, sending, waiting for a reply, playing
@@ -860,20 +988,24 @@ routing preferences apply, and the reply plays on the Phone). It never opens the
   background, through the system vibrator (Do Not Disturb and vibration settings apply). With the
   app closed the recording start and end cues are vibrations too.
 
-### Background standby (separate from Listen on)
+### Background standby (additional to Listen on)
 
 Settings → Wake phrase has two switches, **Phone background wake standby** and **Watch background
 wake standby**, both off by default (also after an update and on a new install). They are standby
-switches, not a second **Listen on**:
+switches, an additional condition on top of **Listen on**, never a replacement for it:
 
 - **Visible app: Listen on alone decides.** While a device's app is open with the screen on, it
   listens only if **Listen on** includes it. Turning its standby switch on never makes it listen
   while its app is open, and turning it off never stops a device that **Listen on** selects.
   Settings says so ("not listening while the app is open ... background standby below is on").
-- **Hidden app: the device's own standby switch decides**, and only in a session the app armed
-  while it was open (Android lets a microphone start only from the visible app). **Listen on**
-  may exclude the device and its standby still works. With that device's own screen off, the
-  screen-off switches below also have to allow it.
+- **Hidden app: Listen on AND the device's own standby switch**, and only in a session the app armed
+  while it was open (Android lets a microphone start only from the visible app). If **Listen on**
+  excludes the device, its standby, screen-off flag and an armed session change nothing: it
+  starts no recognition and re-arms none, and deselecting it tears down any idle window, retry,
+  backoff or alarm (a request already accepted or recorded is not cut). Re-selecting it within the
+  same screen activation continues with the time left of that 5-second budget; only a new screen
+  activation opens a new one. With that device's own screen off, the screen-off switches below also
+  have to allow it.
 - **Requested is not running.** A switch that is on is a request. A hidden Watch stays pending
   until its app is next opened with the screen on, which arms the session without making the
   excluded app listen; the Settings line says "requested" until then.
@@ -898,11 +1030,16 @@ own screen, and a value is kept while its standby switch is off (the switch is t
 disabled, with a note).
 
 - **Background only.** They never change what an open app does: with the app open and the screen
-  on, **Listen on** alone decides, as before. A screen that is off does not count as an app that
+  on, **Listen on** decides, as before. A screen that is off does not count as an app that
   is open, and it never bypasses that rule.
-- **Actual background:** a device listens when its own standby switch is on and either its screen
-  is on or its own screen-off switch is on. Screen-off on never turns standby on and never grants
-  the microphone permission or a platform exemption; on means requested, not armed.
+- **Actual background:** with its own standby switch on, a device whose screen-off switch is **on**
+  listens continuously, screen on or off. With the screen-off switch **off** it waits for the wake
+  phrase for only **5 seconds** after its own screen turns on (one budget per screen turn-on; a
+  recognizer restart, an alarm, a repeated screen-on or settings callback, or the app moving to
+  the background does not restart it), then waits for the next turn-on. A phrase heard inside
+  the 5 seconds is followed through as usual; the request itself is not cut at 5 seconds.
+  Screen-off on never turns standby on and never grants the microphone permission or a platform
+  exemption; on means requested, not armed.
 - **Watch always-on (ambient) display** counts as screen off: it listens there only when the
   Watch's screen-off switch is on.
 - **When it is not allowed.** If the screen turns off, or the switch is turned off while the
@@ -1057,7 +1194,7 @@ or closes. Closing the keyboard keeps the draft; switching conversations keeps e
   synced; off by default, see
   [Phone: listening with the app closed](#phone-listening-with-the-app-closed-or-the-screen-off-opt-in)),
   and the two standby switches under Wake phrase (synced; see
-  [Background standby](#background-standby-separate-from-listen-on)). The Watch's background
+  [Background standby](#background-standby-additional-to-listen-on)). The Watch's background
   operation (relay) has no switch: it is on whenever its app is opened (see
   [Background operation](#background-operation)).
 - **Dark by default.** On the Phone, sign-in, lists, chat, Settings and dialogs follow the
@@ -1086,6 +1223,33 @@ is a simulated recognizer result for the window open at that moment (again never
 
 ## Validation
 
+### Version 20 (versionCode 20, `0.1.19-dev`)
+
+> **R2 repair status.** The counts, APK facts and server test numbers in this section were measured on the earlier source
+> (R1) and are **not** evidence for this repaired source. For the R2 repair only these were run: the server plugin
+> suite (126 tests, isolated pytest), and a focused isolated-JVM run of the speech-route falsifier against the repaired
+> client (Kotlin 2.0.21 / language 1.9, not the project's Gradle build). The full Core/Watch Gradle suites, lint and
+> the APK assemblies of this source are **pending**; no APK of this source exists yet.
+
+Adds speech-server recovery, Markdown rendering and the extended diagnostics described above. Results come from
+native Android builds and tests on Windows with JDK 17, Gradle 8.13 and one worker; they establish source and build
+behavior, not physical-device behavior.
+
+- **Full tests:** 1,761 passing, none failing, erroring or skipped: Core 1,326, Phone 269, Watch 166. Of these,
+  1,684 are the inherited tests (Core 1,265, Phone 259, Watch 160) and 77 are new. Three inherited tests were
+  changed because their meaning changed on purpose: the diagnostics wire now asks for schema 3 first (two tests
+  in the network contract suite and one in the export suite); their names are unchanged.
+- **Before/after:** three tests that use only interfaces present before this version run against the previous
+  production code and fail there (a temporarily unavailable speech server is not waited out; a failed request is
+  reported delivered when its transmission ends); with identical test files they pass on this source.
+- **Server plugin:** 62 tests against loopback fixture workers and the real dashboard handler in an isolated
+  environment. Failover was also observed with a real local CPU standby and a real GPU standby on another machine.
+- **APKs:** Phone and Watch debug assembly and lint succeed (lint: 0 errors; 33 Phone and 28 Watch warnings); both are
+  `com.rumi.hermesvoice` versionCode 20 / `0.1.19-dev`, signed with the Android Debug certificate.
+- **Not exercised:** a device or emulator, real microphone/speaker, Wear synchronization, the share sheet, touch
+  selection and link taps on real screens, a real Wear OS renderer, battery. No installation or publication is
+  established by these tests.
+
 ### Version 19 (versionCode 19, `0.1.18-dev`)
 
 The results below come from native Android builds and tests on Windows with JDK 17, Gradle 8.13
@@ -1108,6 +1272,34 @@ bundle. They establish source/build behavior, not physical-device behavior.
   behavior, Wear synchronization, Android share-sheet/FileProvider grants, battery effects, a model's
   compliance with the leading-marker convention, and physical reproduction or resolution of a
   reported issue. No installation or publication is established by these tests.
+
+### Version 19 with new-reply alerts and the accepted-capture repair (same versionCode 19 / `0.1.18-dev`)
+
+This candidate adds the arrival alert described under "New-reply alerts" and keeps the five-second screen-on
+budget, the device-independent "Listen on" gate and the accepted-capture preservation. It is a candidate
+awaiting independent review, not an approved or installed release.
+
+- **Full native tests (Windows, JDK 17, Gradle 8.13, one worker):** 959 Core + 129 Watch + 13 Phone, all
+  passing. Against the inherited 940 Core + 119 Watch baseline that is exactly +19 Core and +10 Watch (the
+  new alert tests); the 13 Phone tests are new and run through a task-scoped Robolectric overlay that is not
+  part of the product tree.
+- **Semantic red/green:** the same alert tests on the immutable repair baseline fail by assertion (Core 7 of
+  15, Watch 7 of 10, Phone 6 of 8, with the guard tests passing); on this source they all pass.
+  Compilation failures and harness failures during development are kept as separate receipts, not counted
+  as red.
+- **Alert path covered:** the real receive, decision, durable once-per-answer claim, notification and tap path
+  on both devices, against the production wiring (Core with the contract double of the dashboard; Phone and
+  Watch classes under Robolectric). Identical text in two answers gives two alerts; replays, history, failed
+  or interrupted sends and cancels give none; a denied permission or disabled channel shows nothing and
+  leaves the reply intact; warm and cold taps open exactly the named owned conversation without changing the
+  optional auto-switch preference.
+- **APKs:** Phone and Watch debug assembly and lint succeed (lint: 0 errors; 31 Phone and 28 Watch warnings);
+  both are `com.rumi.hermesvoice` versionCode 19 / `0.1.18-dev`, signed with the Android Debug certificate.
+  No permission or manifest component was added (`POST_NOTIFICATIONS` was already declared).
+- **Simulated in the tests, not real:** the Data Layer, the hardware key store, and the system notification
+  policy (Do Not Disturb, sound, vibration, lock screen). **Not exercised:** a device or emulator, the actual
+  notification shade or tap, whether the paired system bridges a Phone alert to the Watch, and battery.
+  A successful Watch send is delivery of the message, not proof the Watch displayed the alert.
 
 ### Historical validation (earlier candidates)
 
@@ -1657,3 +1849,15 @@ as "no speech" and were repeated.
 ## License
 
 This repository doesn't include a license file yet.
+
+## R7 — Always listen while charging / 충전 중 항상 듣기
+
+Phone and Watch have independent Phone-owned opt-ins, both OFF by default, in the same revisioned atomic settings record. Watch accepts only a valid newer snapshot and persists a normalized mirror. Each device independently observes its own sticky/current Android battery broadcasts: external power plus CHARGING or FULL is eligible; disconnected, missing, unknown, DISCHARGING and NOT_CHARGING are not.
+
+For a selected device with an already admitted background standby, this exception lifts only screen-off/ambient and the ordinary expired five-second screen-activation restriction. It does not enable standby, select a device, sign in, bypass microphone permission/OS admission, arbitration, busy recording/transfer/playback, or Stop. It uses existing bounded recognizer windows, gaps, alarms and retry backoff, not guaranteed gapless recognition. No new daemon, forced display-on or unbounded wake lock is introduced.
+
+Unplug or live OFF reevaluates ordinary eligibility and removes ineligible idle LISTEN/retry resources, without a new screen epoch or cancelling accepted work. Existing screen-off recognition is independent. Stop or the current service ending unregisters the local battery receiver and fences queued callbacks; an explicit user open restarts sticky observation. While the Phone Activity is interactive, its existing foreground controller alone owns recognition and repeats bounded windows only with local charging, selected Phone standby and actual foreground-service admission; its background twin stays dormant. Unplug returns to ordinary one-window foreground behavior without a new screen epoch. Application-process observation is not a process-death background microphone grant.
+
+R5 wake selection, screen budgets, queued voice/text/history/headset behavior and R6 Watch endpoint/noise and reader corrections are inherited. The R6 full-suite failure of the old generic `SilenceEndpoint` source witness is retained in predecessor evidence; the R7 witness requires the specialized Watch factory with its exact passed silence snapshot.
+
+Verification is source-bound native JVM/Robolectric plus APK assembly, not proof of physical charging, Samsung ambient/Doze behavior, real microphone recognition, battery effect, paired-device transport, installation or publication. Exact execution counts, raw failures and artifact hashes are in the R7 implementation handoff.

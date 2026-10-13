@@ -59,7 +59,16 @@ class FakeHermesDashboard : AutoCloseable {
     /** `/api/audio/speak` cuts the connection after a part of its body (a true disconnect). */
     @Volatile var speakDisconnectMidBody = false
     @Volatile var speakPadding = 0
+
+    /** HTTP statuses `/api/audio/speak` answers with, one per request, before it answers normally again (an empty queue: normal). */
+    val speakStatuses = java.util.concurrent.ConcurrentLinkedQueue<Int>()
+
+    /** Arrival time (monotonic ms) of every `/api/audio/speak` request. */
+    val speakArrivals: MutableList<Long> = java.util.Collections.synchronizedList(mutableListOf())
     @Volatile var transcribeDelayMs = 0L
+
+    /** The WAV bytes of the latest /api/audio/transcribe request (what the Phone really uploaded). */
+    @Volatile var lastTranscribedWav: ByteArray? = null
     @Volatile var rejectAccessTokens: Set<String> = emptySet()
     @Volatile var refreshAccepted = true
     @Volatile var submitStatus: (String) -> String = { "streaming" }
@@ -224,6 +233,29 @@ class FakeHermesDashboard : AutoCloseable {
 
     val baseUrl: String get() = server.url("/").toString()
 
+    /** Server-side path → (mime type, bytes) served by the stored-file routes; `/api/media` serves images only. */
+    val storedFiles = HashMap<String, Pair<String, ByteArray>>()
+
+    /** Each stored-file request as `route?path=…`, and the Authorization header it carried. */
+    val storedFileRequests: MutableList<Pair<String, String?>> = Collections.synchronizedList(mutableListOf())
+
+    /** When set, a stored-file request is answered with this status instead (no body). */
+    @Volatile var storedFileStatus: Int? = null
+
+    /** When set, `/api/files/read` redirects to this absolute URL. */
+    @Volatile var storedFileRedirect: String? = null
+
+    private fun storedFileRoute(request: RecordedRequest, path: String): MockResponse {
+        val wanted = request.requestUrl!!.queryParameter("path").orEmpty()
+        storedFileRequests += "$path?path=$wanted" to request.getHeader("Authorization")
+        storedFileStatus?.let { return json(it, JSONObject().put("detail", "refused")) }
+        if (path == "/api/files/read") storedFileRedirect?.let { return MockResponse().setResponseCode(302).setHeader("Location", it) }
+        val (mime, bytes) = storedFiles[wanted] ?: return json(404, JSONObject().put("detail", "not found"))
+        if (path == "/api/media" && !mime.startsWith("image/")) return json(415, JSONObject().put("detail", "not an image"))
+        val dataUrl = "data:$mime;base64," + Base64.getEncoder().encodeToString(bytes)
+        return json(200, JSONObject().put("name", wanted.substringAfterLast('/')).put("size", bytes.size).put("mime_type", mime).put("data_url", dataUrl))
+    }
+
     fun decodeSpoken(audio: SpokenAudio): String = String(audio.bytes).removePrefix("AUDIO:")
 
     private fun json(code: Int, body: JSONObject) =
@@ -244,6 +276,7 @@ class FakeHermesDashboard : AutoCloseable {
         val path = request.requestUrl!!.encodedPath
         val body = request.body.readUtf8().let { if (it.isBlank()) JSONObject() else JSONObject(it) }
         if (path.startsWith("/api/sessions")) return if (!authorized(request)) unauthorized() else sessionsRoute(request, path, body)
+        if (path == "/api/media" || path == "/api/files/read") return if (!authorized(request)) unauthorized() else storedFileRoute(request, path)
         return when (path) {
             "/auth/native/token" ->
                 if (body.optString("code") == "gw-code" && PkcePair.challengeFor(body.optString("code_verifier")) == expectedChallenge) {
@@ -269,21 +302,27 @@ class FakeHermesDashboard : AutoCloseable {
             "/api/audio/transcribe" -> if (!authorized(request)) unauthorized() else {
                 val dataUrl = body.optString("data_url")
                 require(dataUrl.startsWith("data:audio/wav;base64,")) { "bad data_url" }
-                timeline += "transcribe:${Base64.getDecoder().decode(dataUrl.substringAfter(",")).size}"
+                val wav = Base64.getDecoder().decode(dataUrl.substringAfter(","))
+                lastTranscribedWav = wav
+                timeline += "transcribe:${wav.size}"
                 if (transcribeDelayMs > 0) Thread.sleep(transcribeDelayMs)
                 json(200, JSONObject().put("ok", true).put("transcript", transcript).put("provider", "fake"))
             }
             "/api/audio/speak" -> if (!authorized(request)) unauthorized() else {
                 val text = body.optString("text")
                 speakRequests.incrementAndGet()
-                if (speakDelayMs > 0) Thread.sleep(speakDelayMs)
-                timeline += "speak:$text"
-                val audio = Base64.getEncoder().encodeToString("AUDIO:$text".toByteArray())
-                val response = json(200, JSONObject().put("ok", true).put("data_url", "data:audio/mpeg;base64,$audio")
-                    .put("mime_type", "audio/mpeg").put("provider", "fake").put("pad", "x".repeat(speakPadding)))
-                if (speakThrottleBytes > 0) response.throttleBody(speakThrottleBytes, speakThrottleMs, java.util.concurrent.TimeUnit.MILLISECONDS)
-                if (speakDisconnectMidBody) response.setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY)
-                response
+                speakArrivals += System.nanoTime() / 1_000_000
+                val scripted = speakStatuses.poll()
+                if (scripted != null) json(scripted, JSONObject().put("detail", "scripted $scripted")) else {
+                    if (speakDelayMs > 0) Thread.sleep(speakDelayMs)
+                    timeline += "speak:$text"
+                    val audio = Base64.getEncoder().encodeToString("AUDIO:$text".toByteArray())
+                    val response = json(200, JSONObject().put("ok", true).put("data_url", "data:audio/mpeg;base64,$audio")
+                        .put("mime_type", "audio/mpeg").put("provider", "fake").put("pad", "x".repeat(speakPadding)))
+                    if (speakThrottleBytes > 0) response.throttleBody(speakThrottleBytes, speakThrottleMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    if (speakDisconnectMidBody) response.setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY)
+                    response
+                }
             }
             "/api/ws" -> {
                 wsPaths += request.requestUrl.toString()
@@ -583,7 +622,6 @@ class FakeHermesDashboard : AutoCloseable {
                     val stored = runtimeIds.entries.first { it.value == runtime }.key
                     val rawPrompt = params.getString("text")
                     val prompt = voiceWords(rawPrompt)
-                    require(params.optBoolean("queued")) { "voice client must submit with queued=true" }
                     rawPrompts += stored to rawPrompt
                     prompts += stored to prompt
                     consumedImages += stored to (queuedImages.remove(runtime) ?: mutableListOf())

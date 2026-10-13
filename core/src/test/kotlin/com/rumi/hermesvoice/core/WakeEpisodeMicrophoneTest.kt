@@ -153,12 +153,11 @@ class WakeEpisodeMicrophoneTest {
     }
 
     @Test
-    fun `every other end of an episode gives the hold back - busy, pause, screen off, mode change, a refused or failed capture`() {
+    fun `every other end of an episode gives the hold back - busy, pause, screen off, a refused or failed capture`() {
         val ends = mapOf<String, (Device) -> Unit>(
             "busy" to { it.controller.onBusy() },
             "pause" to { it.controller.onPause() },
             "screen_off" to { it.controller.onScreenOff() },
-            "mode" to { it.controller.onSettings(WatchSettings(WakeLocation.BOTH, "루미", revision = 2)) },
             "not_idle" to { it.controller.onHandoffDue(captureIdle = false) },
             "capture_failed" to { it.captureResult = false; it.controller.onHandoffDue(captureIdle = true) },
         )
@@ -171,5 +170,28 @@ class WakeEpisodeMicrophoneTest {
             assertFalse("$name: given back", phone.claimed)
             assertEquals(name, "hold:false", phone.holds().last())
         }
+    }
+
+    @Test
+    fun `a mode change gives the hold back from a phrase only heard, and leaves an accepted episode its hold until it ends`() {
+        // Only heard: a claim asked in Both, not granted. Another mode ends it and the hold goes back.
+        val heard = Device(WakeLocation.BOTH, arbitrated = true)
+        heard.controller.onResume()
+        heard.phrase("루미")
+        assertTrue(heard.claimed)
+        heard.controller.onSettings(WatchSettings(WakeLocation.PHONE, "루미", revision = 2))
+        assertFalse("mode: given back", heard.claimed)
+        assertEquals("hold:false", heard.holds().last())
+
+        // Accepted: the handoff pause and the recording keep the hold under their original settings.
+        val accepted = Device(WakeLocation.PHONE)
+        accepted.controller.onResume()
+        accepted.phrase("루미")
+        accepted.controller.onSettings(WatchSettings(WakeLocation.BOTH, "루미", revision = 2))
+        assertTrue("held through the mode change", accepted.claimed)
+        assertTrue(accepted.controller.onHandoffDue(captureIdle = true))
+        assertNotNull(accepted.captured)
+        accepted.captured!!.release()
+        assertFalse(accepted.claimed)
     }
 }

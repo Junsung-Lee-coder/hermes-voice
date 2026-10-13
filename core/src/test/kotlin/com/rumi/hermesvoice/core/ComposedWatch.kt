@@ -79,6 +79,9 @@ internal class ComposedWatch(
     var windowOpen = false
     var handoffIn: Long? = null
     var rearmIn: Long? = null
+
+    /** Every scheduleRearm / cancelRearm the host received, in order ("in:<delay>" / "cancel"), so a test can place the alarm on its own clock. */
+    val rearmLog = mutableListOf<String>()
     var capturing = false
     val posted = ArrayDeque<() -> Unit>()
     val statuses = mutableListOf<WatchVoiceStatus>()
@@ -137,8 +140,8 @@ internal class ComposedWatch(
         override fun notifications() = notifications
         override fun recognizerAvailable() = recognizer
         override fun settings() = settings
-        override fun scheduleRearm(delayMs: Long) { rearmIn = delayMs }
-        override fun cancelRearm() { rearmIn = null }
+        override fun scheduleRearm(delayMs: Long) { rearmIn = delayMs; rearmLog += "in:$delayMs" }
+        override fun cancelRearm() { rearmIn = null; rearmLog += "cancel" }
         override fun cancelCapture(reason: String) { if (capturing) { log += "cancel_capture:$reason"; capturing = false; holds.release(HoldReason.CAPTURE) } }
         override fun post(block: () -> Unit) { posted.addLast(block) }
         override fun statusChanged(status: WatchVoiceStatus) { statuses += status }
