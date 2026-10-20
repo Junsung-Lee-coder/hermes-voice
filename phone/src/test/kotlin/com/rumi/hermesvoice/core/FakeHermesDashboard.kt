@@ -61,10 +61,16 @@ class FakeHermesDashboard : AutoCloseable {
     @Volatile var speakPadding = 0
     @Volatile var transcribeDelayMs = 0L
 
+    /** HTTP status and `detail` `/api/audio/transcribe` answers with, one per request, before it answers normally again (an empty queue: normal). */
+    val transcribeStatuses = java.util.concurrent.ConcurrentLinkedQueue<Pair<Int, String>>()
+
     /** The WAV bytes of the latest /api/audio/transcribe request (what the Phone really uploaded). */
     @Volatile var lastTranscribedWav: ByteArray? = null
     @Volatile var rejectAccessTokens: Set<String> = emptySet()
     @Volatile var refreshAccepted = true
+    @Volatile var beforeAsyncReply: (() -> Unit)? = null
+    /** Synthetic wire fault after the fixture has recorded a prompt effect. Null preserves all legacy behavior. */
+    @Volatile var submitReplyFault: ((JSONObject) -> Unit)? = null
     @Volatile var submitStatus: (String) -> String = { "streaming" }
     @Volatile var resumeQueued = false
 
@@ -80,12 +86,62 @@ class FakeHermesDashboard : AutoCloseable {
      * - "error_before_start": a bare `error` and no message.start (_admit_prompt_turn refusal,
      *   or "Turn cancelled before the agent was ready");
      * - "init_failed": message.complete status=error and no message.start (_emit_terminal_turn_error);
-     * - "session_limit": prompt.submit answers JSON-RPC error 4090 (the active session cap).
+     * - "session_limit": prompt.submit answers JSON-RPC error 4090 (the active session cap);
+     * - "not_owned": prompt.submit answers 4090 with data.reason SESSION_NOT_OWNED (another process holds the session).
+     * - "hold": message.start, then nothing until [finishHeldTurn] (the server keeps running the turn; its events are stamped and ringed).
      */
     @Volatile var turnBehavior: (String) -> String = { "start_first" }
 
     /** Close the socket right after answering `session.create` (the next call reconnects). */
     @Volatile var dropAfterCreateReply = false
+
+    /** tui_gateway event_replay: `replay_epoch` (gateway.ready and session.events.since) changes when the server process restarts. */
+    @Volatile var replayEpoch = "e1"
+
+    /** Events one runtime session keeps for `session.events.since`; older ones are evicted (and `truncated` is then reported). */
+    @Volatile var ringCapacity = 512
+
+    private val ringLock = Any()
+    private val seqs = HashMap<String, Long>()
+    private val rings = HashMap<String, ArrayList<JSONObject>>()
+    private val evictedThrough = HashMap<String, Long>()
+    private val gatewaySockets: MutableSet<WebSocket> = Collections.synchronizedSet(LinkedHashSet())
+
+    /** A turn the server has started but not finished ("hold" behavior): [finishHeldTurn] runs its scripted events later. */
+    class HeldTurn(val runtime: String, val events: List<Pair<String, JSONObject?>>)
+
+    val heldTurns: MutableMap<String, HeldTurn> = Collections.synchronizedMap(HashMap())
+
+    /** The server drops every open gateway connection (the sessions and their ring stay). */
+    fun dropGateway() {
+        val open = synchronized(gatewaySockets) { gatewaySockets.toList().also { gatewaySockets.clear() } }
+        open.forEach { it.close(1011, "dropped by fixture") }
+    }
+
+    /** The held turn of [stored] finishes: its events are stamped and ringed, and sent to the socket the session last used (a dead one loses them). */
+    fun finishHeldTurn(stored: String, finalUid: String? = null, finalTimestamp: Double? = null) {
+        val held = heldTurns.remove(stored) ?: error("no held turn for $stored")
+        held.events.forEach { (type, payload) ->
+            if (type == "message.complete") addMessage(stored, "assistant", payload!!.optString("text"), finalUid = finalUid, timestamp = finalTimestamp)
+            val frame = event(type, held.runtime, payload)
+            sessionSockets[stored]?.first?.send(frame)
+        }
+    }
+
+    /** The ring of [runtime] no longer holds its older events (eviction): every watermark below the latest is now truncated. */
+    fun evictRing(runtime: String) = synchronized(ringLock) {
+        evictedThrough[runtime] = seqs[runtime] ?: 0L
+        rings[runtime]?.clear()
+    }
+
+    private fun stamp(sid: String, params: JSONObject) = synchronized(ringLock) {
+        val seq = (seqs[sid] ?: 0L) + 1
+        seqs[sid] = seq
+        params.put("seq", seq)
+        val ring = rings.getOrPut(sid) { ArrayList() }
+        ring += JSONObject(params.toString())
+        while (ring.size > ringCapacity) evictedThrough[sid] = ring.removeAt(0).getLong("seq")
+    }
 
     /**
      * A session's runtime model/provider/reasoning (tui_gateway session record + model_config). A
@@ -176,8 +232,15 @@ class FakeHermesDashboard : AutoCloseable {
     val turnModels: MutableList<Pair<String, Runtime>> = Collections.synchronizedList(mutableListOf())
 
     /** Stored sessions (the dashboard's state.db rows): id → row fields, plus their transcript. */
-    class Row(val id: String, val source: String, var title: String, var archived: Boolean, val hidden: Boolean) {
+    class Row(val id: String, var source: String, var title: String, var archived: Boolean, val hidden: Boolean) {
         val messages: MutableList<JSONObject> = Collections.synchronizedList(mutableListOf())
+
+        /** sessions.created_source: stamped with the source when the row is created and kept when `source` changes; null is an unstamped row. */
+        var createdSource: String? = source
+        var parentId: String? = null
+        var endReason: String? = null
+        var endedAt: Double? = null
+        var startedAt: Double = 1_700_000_000.0
     }
     /** Script for sessions created with a given source (e.g. the router), set before they exist. */
     val sourceScripts = HashMap<String, (String) -> List<Pair<String, JSONObject?>>>()
@@ -188,6 +251,7 @@ class FakeHermesDashboard : AutoCloseable {
 
     /** Per runtime id: images queued by image.attach_bytes, consumed by the next prompt.submit. */
     val queuedImages = HashMap<String, MutableList<String>>()
+    val notOwnedRefusals: MutableList<String> = Collections.synchronizedList(mutableListOf())
     val consumedImages: MutableList<Pair<String, List<String>>> = Collections.synchronizedList(mutableListOf())
     val stagedFiles: MutableList<Pair<String, ByteArray>> = Collections.synchronizedList(mutableListOf())
     @Volatile var failFileAttach = false
@@ -205,10 +269,111 @@ class FakeHermesDashboard : AutoCloseable {
     }
 
     /** Adds a row created elsewhere (another client or source) that the app must never touch. */
-    fun addForeignRow(id: String, source: String, archived: Boolean = false) {
-        rows[id] = Row(id, source, "foreign $id", archived, hidden = false)
+    fun addForeignRow(id: String, source: String, archived: Boolean = false, title: String = "foreign $id") {
+        rows[id] = Row(id, source, title, archived, hidden = false)
         scripts[id] = { listOf(complete("foreign reply")) }
     }
+
+    /** Someone (an operator, or the server stamping a row) set `sessions.created_source`; null leaves it unstamped. */
+    fun setCreatedSource(id: String, value: String?) { rows.getValue(id).createdSource = value }
+
+    /** An older server without the created_source column: list and detail rows do not carry the field at all. */
+    @Volatile var omitCreatedSource = false
+
+    /** `GET /api/sessions` takes this long to answer (0: at once). */
+    @Volatile var listDelayMs = 0L
+
+    /** `GET /api/sessions` answers 503 from this offset on (-1: never). */
+    @Volatile var failListFromOffset = -1
+
+    /** Called with the offset and the archived filter of every `GET /api/sessions`, before the page is built (a test latches the page or changes the rows here). */
+    @Volatile var listPageHook: ((Int, String) -> Unit)? = null
+
+    /** Called with the session id and the requested archived flag of every `PATCH /api/sessions/{id}`, before it is answered (a test latches the request here). */
+    @Volatile var archiveHook: ((String, Boolean) -> Unit)? = null
+
+    /** UI reader faults. Independent reconciliation has its own hook so it cannot consume a UI-only latch. */
+    @Volatile var messagesHook: ((String, Int, Int) -> Int)? = null
+    @Volatile var reconciliationMessagesHook: ((String, Int, Int) -> Int)? = null
+    /** Exact metadata request boundary, before taking the session row snapshot. */
+    @Volatile var sessionDetailHook: ((String) -> Unit)? = null
+
+    /** Maps the requested history offset to the offset that is actually served (a mis-serving server); null serves what was asked. */
+    @Volatile var messagesOffsetOverride: ((String, Int) -> Int)? = null
+
+    /** Called with the session id and requested offset of every `GET /api/sessions/{id}/messages` AFTER its page was read, before the answer is sent (a test latches a stale answer here). */
+    @Volatile var messagesServedHook: ((String, Int) -> Unit)? = null
+
+    /** `PATCH /api/sessions/{id}` answers with this status instead of applying the flag (0: applies it). */
+    @Volatile var failArchiveStatus = 0
+
+    /** Scripted answer for a `GET /api/sessions...` read: called with "list", "detail", "messages" or "reconciliation" and the offset; a non-null answer replaces the normal one. */
+    @Volatile var readFault: ((String, Int) -> MockResponse?)? = null
+
+    /** Every `GET /api/sessions...` read on arrival: its kind ("list", "detail", "messages", "reconciliation"), its offset and a monotonic millisecond clock. */
+    val readArrivals: MutableList<Triple<String, Int, Long>> = Collections.synchronizedList(mutableListOf())
+
+    /**
+     * Automatic compression: [id] ends with end_reason compression and its continuation starts under a new id. The continuation's
+     * created_source is the source at that moment (the server stamps it at insert; it is not inherited), so it can differ from the root's.
+     */
+    fun compress(id: String): String {
+        val root = rows.getValue(id)
+        val tip = "c${createCounter.incrementAndGet()}"
+        root.endReason = "compression"
+        root.endedAt = root.startedAt + 100.0
+        val child = Row(tip, root.source, root.title, false, root.hidden)
+        child.parentId = id
+        child.startedAt = root.endedAt!! + 1.0
+        synchronized(root.messages) { root.messages.forEach { child.messages += JSONObject(it.toString()) } }
+        rows[tip] = child
+        scripts[tip] = scripts[id] ?: { listOf(complete("reply from $tip")) }
+        runtimes[tip] = runtimes[id] ?: profileDefault
+        return tip
+    }
+
+    /** A branch (not a compression continuation) of [id]: it has the parent link only. */
+    fun branch(id: String, branchId: String) {
+        val root = rows.getValue(id)
+        val child = Row(branchId, root.source, "branch of $id", false, false)
+        child.parentId = id
+        child.startedAt = root.startedAt + 500.0
+        rows[branchId] = child
+        scripts[branchId] = { listOf(complete("branch reply")) }
+    }
+
+    private fun isCompressionChild(row: Row): Boolean {
+        val parent = row.parentId?.let { rows[it] } ?: return false
+        val ended = parent.endedAt ?: return false
+        return parent.endReason == "compression" && row.startedAt >= ended
+    }
+
+    private fun lineage(root: Row): List<String> {
+        val chain = mutableListOf(root.id)
+        var cur = root
+        while (cur.endReason == "compression") {
+            val next = synchronized(rows) { rows.values.toList() }.firstOrNull { it.parentId == cur.id && isCompressionChild(it) } ?: break
+            chain += next.id
+            cur = next
+        }
+        return chain
+    }
+
+    /** One `GET /api/sessions` row: a compression root is projected onto its tip (root source and created_source kept), as the server does. */
+    private fun listRowJson(row: Row): JSONObject {
+        val chain = lineage(row)
+        if (chain.size == 1) return rowJson(row)
+        val tip = rows.getValue(chain.last())
+        return rowJson(row).put("id", tip.id).put("title", tip.title).put("message_count", tip.messages.size)
+            .put("preview", tip.messages.lastOrNull()?.optString("content").orEmpty()).put("end_reason", JSONObject.NULL)
+            .put("_lineage_root_id", row.id).put("_lineage_ids", org.json.JSONArray(chain)).put("continuation_kind", "compression")
+    }
+
+    /** Another client (TUI, Desktop, Discord) rewrote the mutable `sessions.source` of a stored row. */
+    fun changeSource(id: String, source: String) { rows.getValue(id).source = source }
+
+    /** `GET /api/sessions/{id}` takes this long to answer (0: at once). */
+    @Volatile var sessionDetailDelayMs = 0L
 
     /** Stored session id → scripted events (type to payload) emitted for each prompt on it. */
     val scripts = HashMap<String, (String) -> List<Pair<String, JSONObject?>>>()
@@ -300,7 +465,9 @@ class FakeHermesDashboard : AutoCloseable {
                 lastTranscribedWav = wav
                 timeline += "transcribe:${wav.size}"
                 if (transcribeDelayMs > 0) Thread.sleep(transcribeDelayMs)
-                json(200, JSONObject().put("ok", true).put("transcript", transcript).put("provider", "fake"))
+                val scripted = transcribeStatuses.poll()
+                if (scripted != null) json(scripted.first, JSONObject().put("detail", scripted.second))
+                else json(200, JSONObject().put("ok", true).put("transcript", transcript).put("provider", "fake"))
             }
             "/api/audio/speak" -> if (!authorized(request)) unauthorized() else {
                 val text = body.optString("text")
@@ -336,13 +503,31 @@ class FakeHermesDashboard : AutoCloseable {
     /** hermes_cli/web_routers/sessions.py: list (source/archived/limit/offset), detail, messages, PATCH flags. */
     private fun sessionsRoute(request: RecordedRequest, path: String, body: JSONObject): MockResponse {
         val url = request.requestUrl!!
-        restLog += "${request.method} ${url.encodedPath}?${url.encodedQuery.orEmpty()}"
+        // Keep every request, but distinguish the independent reconciliation actor from UI reader traffic.
+        restLog += (if (url.queryParameter("hv_read")=="reconciliation") "RECONCILE " else "") + "${request.method} ${url.encodedPath}?${url.encodedQuery.orEmpty()}"
         val segments = url.pathSegments.drop(2)
+        if (request.method == "GET") {
+            val kind = when {
+                segments.isEmpty() -> "list"
+                segments.size == 1 && segments[0] != "search" -> "detail"
+                segments.size == 2 && segments[1] == "messages" -> if (url.queryParameter("hv_read") == "reconciliation") "reconciliation" else "messages"
+                else -> null
+            }
+            if (kind != null) {
+                val at = url.queryParameter("offset")?.toIntOrNull() ?: 0
+                readArrivals += Triple(kind, at, System.nanoTime() / 1_000_000)
+                readFault?.invoke(kind, at)?.let { return it }
+            }
+        }
         if (segments.isEmpty() && request.method == "GET") {
             val archived = url.queryParameter("archived") ?: "exclude"
+            listPageHook?.invoke(url.queryParameter("offset")?.toInt() ?: 0, archived)
             val source = url.queryParameter("source")
+            val sources = csv(url, "sources")
+            val excluded = csv(url, "exclude_sources")
             val matching = synchronized(rows) { rows.values.toList() }.filter { row ->
-                !row.hidden && (source == null || row.source == source) && when (archived) {
+                !isCompressionChild(row) && !row.hidden && (source == null || row.source == source) && (sources.isEmpty() || row.source in sources) &&
+                    row.source !in excluded && when (archived) {
                     "only" -> row.archived
                     "include" -> true
                     else -> !row.archived
@@ -350,44 +535,91 @@ class FakeHermesDashboard : AutoCloseable {
             }.reversed()
             val limit = url.queryParameter("limit")?.toInt() ?: 20
             val offset = url.queryParameter("offset")?.toInt() ?: 0
+            if (listDelayMs > 0) Thread.sleep(listDelayMs)
+            if (failListFromOffset in 0..offset) return json(503, JSONObject().put("detail", "database is busy"))
             val page = matching.drop(offset).take(limit)
-            return json(200, JSONObject().put("sessions", org.json.JSONArray().apply { page.forEach { put(rowJson(it)) } })
+            return json(200, JSONObject().put("sessions", org.json.JSONArray().apply { page.forEach { put(listRowJson(it)) } })
                 .put("total", matching.size).put("limit", limit).put("offset", offset))
         }
+        if (segments == listOf("search") && request.method == "GET") {
+            val q = url.queryParameter("q").orEmpty().lowercase()
+            val source = url.queryParameter("source")
+            val sources = csv(url, "sources")
+            val excluded = csv(url, "exclude_sources")
+            val limit = url.queryParameter("limit")?.toInt() ?: 20
+            val found = synchronized(rows) { rows.values.toList() }.filter { row ->
+                !row.hidden && (source == null || row.source == source) && (sources.isEmpty() || row.source in sources) &&
+                    row.source !in excluded && (row.title.lowercase().contains(q) || row.id.lowercase().contains(q) ||
+                    row.messages.any { it.optString("content").lowercase().contains(q) })
+            }.reversed().take(limit)
+            return json(200, JSONObject().put("results", org.json.JSONArray().apply { found.forEach { put(rowJson(it)) } }))
+        }
+        if(segments.size==1 && request.method=="GET") sessionDetailHook?.invoke(segments.first())
         val row = rows[segments.first()] ?: return json(404, JSONObject().put("detail", "Session not found"))
         return when {
-            segments.size == 1 && request.method == "GET" -> json(200, rowJson(row))
+            segments.size == 1 && request.method == "GET" -> {
+                if (sessionDetailDelayMs > 0) Thread.sleep(sessionDetailDelayMs)
+                json(200, rowJson(row))
+            }
             segments.size == 1 && request.method == "PATCH" -> {
+                archiveHook?.invoke(row.id, body.optBoolean("archived"))
+                if (failArchiveStatus != 0) return json(failArchiveStatus, JSONObject().put("detail", "synthetic archive failure"))
                 if (body.has("archived")) row.archived = body.getBoolean("archived")
                 json(200, JSONObject().put("ok", true).put("title", row.title).put("archived", row.archived))
             }
             segments.size == 2 && segments[1] == "messages" -> {
                 val limit = url.queryParameter("limit")?.toInt() ?: 500
-                val offset = url.queryParameter("offset")?.toInt() ?: 0
-                val all = synchronized(row.messages) { row.messages.toList() }
+                val requested = url.queryParameter("offset")?.toInt() ?: 0
+                val recovery=url.queryParameter("hv_read")=="reconciliation"
+                (if(recovery) reconciliationMessagesHook else messagesHook)?.invoke(row.id, requested, limit)?.takeIf { it != 0 }?.let { return json(it, JSONObject().put("detail", "synthetic history failure")) }
+                val offset = (if(recovery) null else messagesOffsetOverride)?.invoke(row.id, requested) ?: requested
+                val all = synchronized(row.messages) { row.messages.map { JSONObject(it.toString()) } }
                 val end = (all.size - offset).coerceAtLeast(0)
                 val page = all.subList((end - limit).coerceAtLeast(0), end)
-                json(200, JSONObject().put("session_id", row.id).put("messages", org.json.JSONArray(page))
+                val answer = json(200, JSONObject().put("session_id", row.id).put("messages", org.json.JSONArray(page))
                     .put("pagination", JSONObject().put("limit", limit).put("offset", offset).put("order", "latest")
                         .put("returned", page.size)))
+                if(!recovery) messagesServedHook?.invoke(row.id, requested)
+                answer
             }
             else -> json(404, JSONObject().put("detail", "Not found"))
         }
     }
 
+    private fun csv(url: okhttp3.HttpUrl, name: String): Set<String> =
+        url.queryParameter(name)?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }?.toSet().orEmpty()
+
     private fun rowJson(row: Row) = JSONObject().put("id", row.id).put("source", row.source).put("title", row.title)
-        .put("archived", row.archived).put("started_at", 1_700_000_000.0).put("last_active", 1_700_000_100.0)
+        .put("archived", row.archived).put("started_at", row.startedAt).put("last_active", 1_700_000_100.0)
         .put("message_count", row.messages.size).put("preview", row.messages.lastOrNull()?.optString("content").orEmpty())
+        .put("parent_session_id", row.parentId ?: JSONObject.NULL).put("end_reason", row.endReason ?: JSONObject.NULL)
+        .put("ended_at", row.endedAt ?: JSONObject.NULL)
+        .apply { if (!omitCreatedSource) put("created_source", row.createdSource ?: JSONObject.NULL) }
 
     /** A transcript row written by something other than this app (another client, the dashboard): stored verbatim like any row. */
-    fun injectRow(stored: String, role: String, content: Any, hiddenKind: Boolean = false) = addMessage(stored, role, content, hiddenKind)
+    fun injectRow(stored: String, role: String, content: Any, hiddenKind: Boolean = false, id: Long? = null, displayContent: String? = null) =
+        addMessage(stored, role, content, hiddenKind, id, displayContent)
 
-    private fun addMessage(stored: String, role: String, content: Any, hiddenKind: Boolean = false) {
+    /** Complete before publication; REST cannot observe a half-mutated JSONObject. */
+    fun injectFinalRow(stored: String, text: String, timestamp: Double, uid: String, reason: String = "stop") {
+        val row = rows.getValue(stored)
+        synchronized(row.messages) {
+            row.messages += JSONObject().put("id", row.messages.size + 1).put("session_id", stored)
+                .put("role", "assistant").put("content", text).put("timestamp", timestamp)
+                .put("finish_reason", reason).put("message_uid", uid)
+        }
+    }
+
+    private fun addMessage(stored: String, role: String, content: Any, hiddenKind: Boolean = false, id: Long? = null, displayContent: String? = null, finalUid: String? = null, timestamp: Double? = null) {
         val row = rows[stored] ?: return
-        val message = JSONObject().put("id", row.messages.size + 1).put("session_id", stored).put("role", role)
-            .put("content", content).put("timestamp", 1_700_000_000.0 + row.messages.size)
+        synchronized(row.messages) {
+        val message = JSONObject().put("id", id ?: (row.messages.size + 1).toLong()).put("session_id", stored).put("role", role)
+            .put("content", content).put("timestamp", timestamp ?: (1_700_000_000.0 + row.messages.size))
         if (hiddenKind) message.put("display_kind", "hidden")
+        if (displayContent != null) message.put("display_content", displayContent)
+        if (finalUid != null) message.put("finish_reason", "stop").put("message_uid", finalUid)
         row.messages += message
+        }
     }
 
     /** The gateway socket each stored session was last used on, and its runtime id (for [pushLaterTurn]). */
@@ -403,7 +635,7 @@ class FakeHermesDashboard : AutoCloseable {
         val (socket, runtime) = sessionSockets.getValue(stored)
         if (withStart) socket.send(event("message.start", runtime, null))
         events.forEach { (type, payload) ->
-            if (type == "message.complete") addMessage(stored, "assistant", payload!!.optString("text"))
+            if (type == "message.complete") addMessage(stored, "assistant", payload!!.optString("text"), finalUid = payload.optString("message_uid").takeIf { it.isNotBlank() })
             socket.send(event(type, runtime, payload))
         }
     }
@@ -412,11 +644,13 @@ class FakeHermesDashboard : AutoCloseable {
         private val runtimeIds = HashMap<String, String>()
 
         override fun onOpen(webSocket: WebSocket, response: Response) {
+            gatewaySockets += webSocket
             webSocket.send(event("gateway.ready", "", JSONObject().put("skin", JSONObject())
-                .put("change_events", true).put("replay_epoch", "e1").put("heartbeat", true)))
+                .put("change_events", true).put("replay_epoch", replayEpoch).put("heartbeat", true)))
         }
 
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+            gatewaySockets -= webSocket
             webSocket.close(1000, null)
         }
 
@@ -426,8 +660,8 @@ class FakeHermesDashboard : AutoCloseable {
             val params = frame.optJSONObject("params") ?: JSONObject()
             rpcLog += JSONObject().put("method", frame.optString("method")).put("params", params)
             fun reply(result: JSONObject) = webSocket.send(JSONObject().put("jsonrpc", "2.0").put("id", id).put("result", result).toString())
-            fun fail(code: Int, message: String) = webSocket.send(JSONObject().put("jsonrpc", "2.0").put("id", id)
-                .put("error", JSONObject().put("code", code).put("message", message)).toString())
+            fun fail(code: Int, message: String, data: JSONObject? = null) = webSocket.send(JSONObject().put("jsonrpc", "2.0").put("id", id)
+                .put("error", JSONObject().put("code", code).put("message", message).apply { if (data != null) put("data", data) }).toString())
             when (frame.optString("method")) {
                 "session.create" -> {
                     val behavior = createBehavior(params)
@@ -610,6 +844,13 @@ class FakeHermesDashboard : AutoCloseable {
                 "prompt.submit" -> {
                     val runtime = params.getString("session_id")
                     val stored = runtimeIds.entries.first { it.value == runtime }.key
+                    if (turnBehavior(stored) == "not_owned") {
+                        // tui_gateway's cross-process lease: refused before the prompt is accepted, queued images stay queued.
+                        notOwnedRefusals += stored
+                        fail(4090, "This chat is open in another Hermes window/terminal. Use it there, or start a new chat here.",
+                            JSONObject().put("reason", "SESSION_NOT_OWNED"))
+                        return
+                    }
                     val rawPrompt = params.getString("text")
                     val prompt = voiceWords(rawPrompt)
                     rawPrompts += stored to rawPrompt
@@ -624,9 +865,12 @@ class FakeHermesDashboard : AutoCloseable {
                         return
                     }
                     val status = submitStatus(stored)
-                    if (status == "streaming" && behavior in setOf("start_first", "double_start")) webSocket.send(event("message.start", runtime, null))
-                    webSocket.send(JSONObject().put("jsonrpc", "2.0").put("id", id)
-                        .put("result", JSONObject().put("status", status)).toString())
+                    if (behavior == "async_hold") beforeAsyncReply?.invoke()
+                    if (status == "streaming" && behavior in setOf("start_first", "double_start", "hold")) webSocket.send(event("message.start", runtime, null))
+                    val submitReply = JSONObject().put("jsonrpc", "2.0").put("id", id)
+                        .put("result", JSONObject().put("status", status))
+                    submitReplyFault?.invoke(submitReply)
+                    webSocket.send(submitReply.toString())
                     when (behavior) {
                         "error_before_start" -> { webSocket.send(event("error", runtime, JSONObject().put("message", "Turn cancelled before the agent was ready"))); return }
                         "init_failed" -> {
@@ -637,10 +881,21 @@ class FakeHermesDashboard : AutoCloseable {
                         "start_after_reply" -> { Thread.sleep(200); webSocket.send(event("message.start", runtime, null)) }
                         "double_start" -> webSocket.send(event("message.start", runtime, null))
                     }
+                    if (behavior == "async_hold") return
+                    if (behavior == "hold") { heldTurns[stored] = HeldTurn(runtime, scripts.getValue(stored)(prompt)); return }
                     scripts.getValue(stored)(prompt).forEach { (type, payload) ->
-                        if (type == "message.complete") addMessage(stored, "assistant", payload!!.optString("text"))
+                        if (type == "message.complete") addMessage(stored, "assistant", payload!!.optString("text"), finalUid = payload.optString("message_uid").takeIf { it.isNotBlank() })
                         webSocket.send(event(type, runtime, payload))
                     }
+                }
+                "session.events.since" -> {
+                    val runtime = params.optString("session_id")
+                    val last = params.optLong("last_seen", 0L)
+                    val (frames, latest, truncated) = synchronized(ringLock) {
+                        Triple(rings[runtime].orEmpty().filter { it.getLong("seq") > last }, seqs[runtime] ?: 0L, last < (evictedThrough[runtime] ?: 0L))
+                    }
+                    reply(JSONObject().put("events", org.json.JSONArray(frames)).put("latest_seq", latest).put("truncated", truncated)
+                        .put("count", frames.size).put("epoch", replayEpoch).put("open_requests", org.json.JSONArray()))
                 }
                 else -> webSocket.send(JSONObject().put("jsonrpc", "2.0").put("id", id)
                     .put("error", JSONObject().put("code", -32601).put("message", "unknown method")).toString())
@@ -651,6 +906,7 @@ class FakeHermesDashboard : AutoCloseable {
     fun event(type: String, sid: String, payload: JSONObject?): String {
         val params = JSONObject().put("type", type).put("session_id", sid)
         if (payload != null) params.put("payload", payload)
+        if (sid.isNotBlank()) stamp(sid, params)
         return JSONObject().put("jsonrpc", "2.0").put("method", "event").put("params", params).toString()
     }
 

@@ -63,7 +63,7 @@ class ChatPaneUiTest {
         }
         rule.setContent {
             HermesVoiceTheme(dark = true) {
-                PhoneChrome(title = "Fixture", tab = Tab.CHAT, onTab = {}, statusLines = emptyList(),
+                PhoneChrome(title = "Fixture", tab = Tab.CHAT, onBack = {}, statusLines = emptyList(),
                     talkBar = { TalkBar(PhoneUiState(signedIn = true)) {} }) {
                     ChatPane(
                         sessionKey = f.session, history = f.history, hasOlder = f.hasOlder, draft = f.draft,
@@ -278,7 +278,7 @@ class ChatPaneUiTest {
             "screen_h=${rule.activity.resources.displayMetrics.heightPixels} ime_bottom=${imeBottom()} " +
             "nav_bottom=${root.getInsets(WindowInsetsCompat.Type.navigationBars()).bottom} " +
             "composer=${bounds("composer_row").top}..${bounds("composer_row").bottom} list=${bounds("chat_list").top}..${bounds("chat_list").bottom} " +
-            "tabs=${bounds("tab_chat").top}..${bounds("tab_chat").bottom} density=${rule.activity.resources.displayMetrics.density}")
+            "talk=${bounds("talk").top}..${bounds("talk").bottom} density=${rule.activity.resources.displayMetrics.density}")
         // A compact IME (e.g. the toolbar shown with a hardware keyboard) is lower than the bottom bar: nothing to lift.
         Log.i(TAG, "real keyboard height=${imeBottom()} px; full keyboard above the bottom bar=${imeTop < bounds("bottom_bar").top}")
         assertComposerJustAbove(imeTop.toFloat(), "real keyboard")

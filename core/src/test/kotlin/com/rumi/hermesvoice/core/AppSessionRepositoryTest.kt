@@ -46,10 +46,12 @@ class AppSessionRepositoryTest {
         val mine = repo.createConversation("Work", "work", "")
         repo.ensureRoutingSession()
         h.fake.addForeignRow("other-install", AppSources.CONVERSATION)
+        h.fake.setCreatedSource("other-install", null)
         h.fake.addForeignRow("desktop-chat", "desktop")
         val listed = repo.listConversations(archived = false)
         assertEquals(listOf(mine.storedSessionId), listed.map { it.stored.id })
-        assertTrue(h.fake.restLog.any { it.contains("source=${AppSources.CONVERSATION}") && it.contains("archived=exclude") })
+        val queries = h.fake.restLog.filter { it.contains("/api/sessions?") }
+        assertTrue(queries.toString(), queries.isNotEmpty() && queries.all { it.contains("archived=exclude") && !it.contains("source=") && !it.contains("sources=") })
         val router = h.registry.router()!!
         assertEquals(AppSources.ROUTER, h.fake.rows.getValue(router.storedSessionId).source)
         assertTrue(h.fake.rows.getValue(router.storedSessionId).hidden)

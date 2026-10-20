@@ -5,7 +5,7 @@ package com.rumi.hermesvoice.core.notify
  * collapsed card and a longer [expanded] body for the expanded one. It is a copy for display only; the complete answer stays in
  * the conversation. Its [toString] never shows the text, so it cannot reach a log through string templates.
  */
-class ReplyPreview private constructor(val summary: String, val expanded: String) {
+class ReplyPreview private constructor(val summary: String, val expanded: String, val title: String? = null) {
     override fun toString(): String = "ReplyPreview(summary=${summary.length} chars, expanded=${expanded.length} chars)"
 
     companion object {
@@ -13,6 +13,12 @@ class ReplyPreview private constructor(val summary: String, val expanded: String
         /** Below Android's own 1024-character cut of notification text, so the preview ends with its own ellipsis. */
         const val EXPANDED_MAX = 1000
         private const val ELLIPSIS = "…"
+
+        /** A notice that no answer arrived for a send: [title] heads the card and [text] is the notice itself. Null when there is no text. */
+        fun notice(title: String, text: String?): ReplyPreview? {
+            val body = of(text) ?: return null
+            return ReplyPreview(body.summary, body.expanded, title)
+        }
 
         /** Null when there is nothing readable to show (the notifier then keeps its generic text). */
         fun of(text: String?): ReplyPreview? {

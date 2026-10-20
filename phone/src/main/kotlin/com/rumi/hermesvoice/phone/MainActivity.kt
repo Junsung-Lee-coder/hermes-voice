@@ -22,7 +22,24 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.isSystemInDarkTheme
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.saveable.Saver
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.changedToUp
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -107,6 +124,20 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.layout.offset
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.unit.IntOffset
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -299,7 +330,11 @@ class MainActivity : ComponentActivity() {
                 onDispose {}
             }
             HermesVoiceTheme(dark) {
-                PhoneScreen(model, recognizerAvailable, onTalk = ::onTalk)
+                // The phone-local text size multiplies the Android system font scale; dp density is left alone.
+                val system = LocalDensity.current
+                CompositionLocalProvider(LocalDensity provides Density(system.density, system.fontScale * state.fontScalePercent / 100f)) {
+                    PhoneScreen(model, recognizerAvailable, onTalk = ::onTalk)
+                }
             }
         }
         // Phone-owned settings: a mode that excludes the Phone stops listening and any hands-free capture at once.
@@ -473,13 +508,23 @@ internal enum class Tab(val label: String) { CONVERSATIONS("Conversations"), CHA
 private fun PhoneScreen(model: PhoneViewModel, recognizerAvailable: Boolean, onTalk: () -> Unit) {
     val state by model.state.collectAsStateWithLifecycle()
     var tab by rememberSaveable { mutableStateOf(Tab.CONVERSATIONS) }
+    var creating by rememberSaveable { mutableStateOf(false) }
     // A routed turn's conversation was opened for the user ("Open the routed conversation"): show it,
     // once per request (not again when the screen is recreated).
     var shownOpenRequest by rememberSaveable { mutableStateOf(0L) }
     LaunchedEffect(state.chatOpenRequest) {
         if (state.chatOpenRequest != shownOpenRequest) {
             shownOpenRequest = state.chatOpenRequest
+            creating = false
             tab = Tab.CHAT
+        }
+    }
+    // A conversation was created but could not be opened: the dialog closes and the list (with the new card and the status) stays.
+    var shownCreateClosed by rememberSaveable { mutableStateOf(0L) }
+    LaunchedEffect(state.createClosedRequest) {
+        if (state.createClosedRequest != shownCreateClosed) {
+            shownCreateClosed = state.createClosedRequest
+            creating = false
         }
     }
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -503,14 +548,23 @@ private fun PhoneScreen(model: PhoneViewModel, recognizerAvailable: Boolean, onT
         }
     }
     val requestBackgroundAnswers = rememberBackgroundRelayRequest(model)
+    val goBack: () -> Unit = {
+        if (tab != Tab.CONVERSATIONS) {
+            model.onUserNavigated()
+            tab = Tab.CONVERSATIONS
+        }
+    }
+    // Back leaves Chat and Settings for the list (nothing is cancelled or changed); only from the list does it send the task to the background.
+    BackHandler(enabled = tab != Tab.CONVERSATIONS) { goBack() }
+    BackHandler(enabled = tab == Tab.CONVERSATIONS) { context.findActivity()?.moveTaskToBack(true) }
+    val chatKey = state.selected?.storedSessionId.orEmpty()
+    val chatList = rememberSaveable(chatKey, saver = LazyListState.Saver) { LazyListState() }
+    val chatFollow = rememberSaveable(chatKey, saver = ChatFollowSaver) { ChatFollow() }
     PhoneChrome(
         title = state.selected?.title?.takeIf { tab == Tab.CHAT } ?: "Hermes Voice",
         tab = tab,
-        onTab = { item ->
-            if (item != tab) model.onUserNavigated()
-            tab = item
-        },
-        statusLines = listOf(state.status, state.voiceStatus, state.micNotice.orEmpty()),
+        onBack = goBack,
+        statusLines = listOf(state.status, state.voiceStatus, state.micNotice.orEmpty(), state.recoveryNotice.orEmpty(), state.cacheNotice.orEmpty()),
         talkBar = if (!state.signedIn) null else ({
             TalkBar(state, onStopPending = model::stopPending, onPlayAgain = model::playAgain, onBackgroundAnswers = requestBackgroundAnswers) {
                 val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
@@ -518,54 +572,80 @@ private fun PhoneScreen(model: PhoneViewModel, recognizerAvailable: Boolean, onT
                 if (granted) onTalk() else micPermission.launch(Manifest.permission.RECORD_AUDIO)
             }
         }),
+        onSettings = {
+            if (tab != Tab.SETTINGS) model.onUserNavigated()
+            tab = Tab.SETTINGS
+        },
+        onNewConversation = if (state.signedIn) ({ creating = true }) else null,
     ) {
         when (tab) {
             Tab.CONVERSATIONS -> ConversationsTab(state, model, onOpen = {
                 model.onUserNavigated()
-                model.open(it.owned)
+                model.openOrResume(it.owned)
                 tab = Tab.CHAT
             })
-            Tab.CHAT -> ChatTab(state, model)
+            Tab.CHAT -> ChatTab(state, model, chatList, chatFollow, goBack)
             Tab.SETTINGS -> SettingsTab(state, model, recognizerAvailable)
         }
     }
+    if (creating && tab == Tab.CONVERSATIONS && state.signedIn) NewConversationDialog(state, model) { creating = false }
+}
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
 }
 
 /**
- * The Phone's frame: title bar, content, and at the bottom the Talk bar (when signed in) above the
- * tabs. The keyboard lifts the content (e.g. the chat composer) by exactly what the bottom bar
- * doesn't already cover: the bar's height is consumed as insets, so nothing is padded twice.
+ * The Phone's frame: title bar (a back arrow on Chat and Settings; on the list the New conversation plus and the Settings gear at the
+ * far right), content, and at the bottom the one Talk bar (when signed in). The keyboard lifts the content (e.g. the chat composer)
+ * by exactly what the bottom bar doesn't already cover: the bar's height is consumed as insets, so nothing is padded twice.
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 internal fun PhoneChrome(
     title: String,
     tab: Tab,
-    onTab: (Tab) -> Unit,
+    onBack: () -> Unit,
     statusLines: List<String>,
     talkBar: (@Composable () -> Unit)?,
+    onSettings: (() -> Unit)? = null,
+    onNewConversation: (() -> Unit)? = null,
     content: @Composable () -> Unit,
 ) {
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
-                title = { Text(title, maxLines = 1) },
+                title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                navigationIcon = {
+                    if (tab != Tab.CONVERSATIONS) {
+                        IconButton(onClick = onBack, modifier = Modifier.size(48.dp).testTag("back_button")) {
+                            Icon(ComposerIcons.Back, contentDescription = "Back")
+                        }
+                    }
+                },
+                actions = {
+                    if (tab == Tab.CONVERSATIONS) {
+                        if (onNewConversation != null) {
+                            IconButton(onClick = onNewConversation, modifier = Modifier.size(48.dp).testTag("new_conversation_button")) {
+                                Icon(ComposerIcons.Plus, contentDescription = "New conversation")
+                            }
+                        }
+                        if (onSettings != null) {
+                            IconButton(onClick = onSettings, modifier = Modifier.size(48.dp).testTag("settings_button")) {
+                                Icon(ComposerIcons.Gear, contentDescription = "Settings")
+                            }
+                        }
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
             )
         },
         bottomBar = {
-            // The Talk bar sits above the navigation bar, never over the chat composer or the tabs.
-            Column(Modifier.testTag("bottom_bar")) {
-                talkBar?.invoke()
-                NavigationBar(containerColor = MaterialTheme.colorScheme.surfaceContainer) {
-                    Tab.values().forEach { item ->
-                        NavigationBarItem(selected = tab == item, onClick = { onTab(item) }, icon = {},
-                            label = { Text(item.label, fontWeight = if (tab == item) FontWeight.SemiBold else FontWeight.Normal) },
-                            modifier = Modifier.testTag("tab_${item.name.lowercase()}"))
-                    }
-                }
-            }
+            // The one Talk bar sits at the bottom, above the system navigation inset, never over the chat composer.
+            if (talkBar != null) Column(Modifier.testTag("bottom_bar")) { talkBar() }
         },
     ) { padding ->
         Column(Modifier.padding(padding).consumeWindowInsets(padding).imePadding().fillMaxSize()) {
@@ -578,7 +658,7 @@ internal fun PhoneChrome(
     }
 }
 
-/** Full-width push-to-talk, centered within the horizontal safe area, with where replies will play. */
+/** Full-width push-to-talk (a 40dp button inside a 48dp touch target), within the horizontal safe area and above the navigation inset. */
 @Composable
 internal fun TalkBar(
     state: PhoneUiState,
@@ -590,19 +670,11 @@ internal fun TalkBar(
     Surface(color = MaterialTheme.colorScheme.surfaceContainerLow) {
         Column(
             Modifier.fillMaxWidth()
+                .windowInsetsPadding(WindowInsets.navigationBars.only(WindowInsetsSides.Bottom))
                 .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal))
-                .padding(horizontal = 16.dp, vertical = 8.dp),
+                .padding(horizontal = 16.dp, vertical = 4.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Text(
-                when (state.playbackDevice) {
-                    VoiceOrigin.WATCH -> "Voice replies play on the Watch (last voice request)"
-                    VoiceOrigin.PHONE -> "Voice replies play on this phone (last voice request)"
-                    null -> "Voice replies play on the device you last talked to"
-                },
-                style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                textAlign = TextAlign.Center, modifier = Modifier.padding(bottom = 6.dp),
-            )
             PendingTurnsList(state.pending, onStopPending)
             UnplayedRepliesList(state.unplayed, onPlayAgain)
             if (state.unplayed.isNotEmpty()) BackgroundAnswersStatus(state, tag = "unplayed_background", onlyWhenNeeded = true, onTurnOn = onBackgroundAnswers)
@@ -626,15 +698,24 @@ internal fun TalkBar(
                     textAlign = TextAlign.Center, modifier = Modifier.padding(bottom = 6.dp).testTag("hands_free"))
             }
             val capturing = state.handsFree == HandsFree.GET_READY || state.handsFree == HandsFree.SPEAK_NOW
-            val colors = if (state.recording || capturing) {
-                ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error,
-                    contentColor = MaterialTheme.colorScheme.onError)
-            } else {
-                ButtonDefaults.buttonColors()
-            }
-            Button(onClick = onTalk, colors = colors, shape = RoundedCornerShape(28.dp),
-                modifier = Modifier.fillMaxWidth().height(60.dp).testTag("talk")) {
-                Text(if (state.recording) "Stop & send" else if (capturing) "Send now" else "Talk", fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+            val urgent = state.recording || capturing
+            // The whole 48dp row is the touch target; the visible button inside it is 40dp (taller only when the text size needs it).
+            Box(
+                Modifier.fillMaxWidth().heightIn(min = 48.dp).clip(RoundedCornerShape(24.dp))
+                    .clickable(role = Role.Button, onClick = onTalk).testTag("talk"),
+                contentAlignment = Alignment.Center,
+            ) {
+                Surface(
+                    color = if (urgent) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                    contentColor = if (urgent) MaterialTheme.colorScheme.onError else MaterialTheme.colorScheme.onPrimary,
+                    shape = RoundedCornerShape(20.dp),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 40.dp).testTag("talk_visual"),
+                ) {
+                    Box(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), contentAlignment = Alignment.Center) {
+                        Text(if (state.recording) "Stop & send" else if (capturing) "Send now" else "Talk",
+                            fontSize = 20.sp, lineHeight = 24.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                }
             }
         }
     }
@@ -726,50 +807,139 @@ private fun ConversationsTab(state: PhoneUiState, model: PhoneViewModel, onOpen:
         SignInScreen(state, model)
         return
     }
-    var title by remember { mutableStateOf("") }
-    var alias by remember { mutableStateOf("") }
-    var description by remember { mutableStateOf("") }
-    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         item {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilterChip(selected = !state.showArchived, onClick = { model.setShowArchived(false) }, label = { Text("Active") })
                 FilterChip(selected = state.showArchived, onClick = { model.setShowArchived(true) }, label = { Text("Archived") })
                 TextButton(onClick = model::refresh) { Text("Refresh") }
+                InfoHelpButton(SettingsHelp.sessionMarker())
             }
         }
         items(state.conversations, key = { it.owned.storedSessionId }) { conversation ->
-            Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
-                Column(Modifier.padding(12.dp)) {
-                    Text(conversation.stored.title.ifBlank { conversation.owned.title }, style = MaterialTheme.typography.titleMedium)
-                    Text("Voice alias: ${conversation.owned.alias}" +
-                        conversation.owned.description.takeIf { it.isNotBlank() }?.let { " — $it" }.orEmpty(),
-                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    if (conversation.stored.preview.isNotBlank()) Text(conversation.stored.preview.take(120), maxLines = 2)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (!state.showArchived) TextButton(onClick = { onOpen(conversation) }) { Text("Open") }
-                        TextButton(onClick = { model.setArchived(conversation.owned, !state.showArchived) }) {
-                            Text(if (state.showArchived) "Unarchive" else "Archive")
-                        }
-                    }
-                }
-            }
+            val id = conversation.owned.storedSessionId
+            ConversationRow(
+                id = id,
+                title = conversation.stored.title.ifBlank { conversation.owned.title }.ifBlank { "Untitled" },
+                archivedView = state.showArchived,
+                busy = id in state.archiving,
+                unread = conversation.unread,
+                onOpen = { onOpen(conversation) },
+                onToggleArchive = { model.setArchived(conversation.owned, !state.showArchived) },
+            )
         }
         if (state.conversations.isEmpty()) item {
-            Text(if (state.showArchived) "No archived conversations." else "No conversations yet. Create one below, or just talk: one is created when nothing fits.",
+            Text(if (state.showArchived) "No archived conversations." else "No conversations yet. Tap + to start one, or just talk: one is created when nothing fits.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        if (!state.showArchived) item {
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                HorizontalDivider()
-                Text("New conversation", style = MaterialTheme.typography.titleSmall)
-                OutlinedTextField(title, { title = it }, label = { Text("Title") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+    }
+}
+
+/** The compact creation form behind the plus: the existing title, alias and description inputs. Cancel or dismiss creates nothing. */
+@Composable
+private fun NewConversationDialog(state: PhoneUiState, model: PhoneViewModel, onClose: () -> Unit) {
+    var title by rememberSaveable { mutableStateOf("") }
+    var alias by rememberSaveable { mutableStateOf("") }
+    var description by rememberSaveable { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var failed by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = { if (!busy) onClose() },
+        // The window is sized by the dialog itself (the platform default width cannot lay out the text inputs under Robolectric).
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+        modifier = Modifier.padding(horizontal = 16.dp).testTag("create_dialog"),
+        title = { Text("New conversation") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                OutlinedTextField(title, { title = it }, label = { Text("Title") }, singleLine = true,
+                    modifier = Modifier.fillMaxWidth().testTag("create_title"))
                 OutlinedTextField(alias, { alias = it }, label = { Text("Voice alias (e.g. work)") }, singleLine = true,
-                    modifier = Modifier.fillMaxWidth())
+                    modifier = Modifier.fillMaxWidth().testTag("create_alias"))
                 OutlinedTextField(description, { description = it }, label = { Text("What goes here (helps voice routing)") },
-                    modifier = Modifier.fillMaxWidth())
-                Button(onClick = { model.createConversation(title, alias, description); title = ""; alias = ""; description = "" },
-                    enabled = alias.isNotBlank()) { Text("Create") }
-                Spacer(Modifier.height(12.dp))
+                    modifier = Modifier.fillMaxWidth().testTag("create_description"))
+                if (failed && state.status.isNotBlank()) {
+                    Text(state.status, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.testTag("create_error"))
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    busy = true
+                    failed = false
+                    model.createConversation(title, alias, description) { created ->
+                        busy = false
+                        if (!created) failed = true
+                    }
+                },
+                enabled = alias.isNotBlank() && !busy,
+                modifier = Modifier.testTag("create_submit"),
+            ) { Text("Create") }
+        },
+        dismissButton = { TextButton(onClick = onClose, enabled = !busy, modifier = Modifier.testTag("create_cancel")) { Text("Cancel") } },
+    )
+}
+
+private const val SWIPE_COMMIT_FRACTION = 0.4f
+
+/**
+ * One compact title-only conversation row. Active rows open on a tap and archive on a committed left swipe; archived rows only
+ * restore, on a committed right swipe. A release short of the commit distance, a cancelled gesture or the wrong direction snaps
+ * back and does nothing. The same actions are offered to accessibility services as custom actions, so no button is drawn.
+ */
+@Composable
+private fun ConversationRow(
+    id: String, title: String, archivedView: Boolean, busy: Boolean, onOpen: () -> Unit, onToggleArchive: () -> Unit,
+    unread: Boolean = false,
+) {
+    val toggle by rememberUpdatedState(onToggleArchive)
+    val label = if (archivedView) "Unarchive" else "Archive"
+    val sign = if (archivedView) 1f else -1f
+    var widthPx by remember { mutableStateOf(0) }
+    var dx by remember { mutableStateOf(0f) }
+    var dragging by remember { mutableStateOf(false) }
+    val shown by animateFloatAsState(dx, if (dragging) snap() else tween(120), label = "conversation_row_offset")
+    Box(Modifier.fillMaxWidth().onSizeChanged { widthPx = it.width }.pointerInput(archivedView, busy) {
+        if (busy) return@pointerInput
+        try {
+            detectHorizontalDragGestures(
+                onDragStart = { dragging = true },
+                onDragEnd = {
+                    val travelled = dx * sign
+                    dragging = false
+                    dx = 0f
+                    if (widthPx > 0 && travelled >= widthPx * SWIPE_COMMIT_FRACTION) toggle()
+                },
+                onDragCancel = { dragging = false; dx = 0f },
+                onHorizontalDrag = { change, amount ->
+                    change.consume()
+                    dx = ((dx + amount) * sign).coerceIn(0f, widthPx.toFloat()) * sign
+                },
+            )
+        } finally {
+            if (dragging) { dragging = false; dx = 0f }
+        }
+    }) {
+        if (shown != 0f) {
+            Box(Modifier.matchParentSize().background(MaterialTheme.colorScheme.secondaryContainer, MaterialTheme.shapes.medium)
+                .padding(horizontal = 16.dp), contentAlignment = if (archivedView) Alignment.CenterStart else Alignment.CenterEnd) {
+                Text(label, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSecondaryContainer)
+            }
+        }
+        Surface(
+            color = MaterialTheme.colorScheme.surfaceContainerHigh, shape = MaterialTheme.shapes.medium,
+            modifier = Modifier.fillMaxWidth().offset { IntOffset(shown.roundToInt(), 0) }.alpha(if (busy) 0.5f else 1f)
+                .testTag("conversation_row_$id")
+                .semantics(mergeDescendants = true) {
+                    customActions = if (busy) emptyList() else listOf(CustomAccessibilityAction(label) { onToggleArchive(); true })
+                }
+                .then(if (archivedView) Modifier else Modifier.clickable(enabled = !busy, onClickLabel = "Open", onClick = onOpen)),
+        ) {
+            Box(Modifier.heightIn(min = 48.dp).padding(horizontal = 16.dp, vertical = 12.dp), contentAlignment = Alignment.CenterStart) {
+                Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium,
+                    fontWeight = if (unread) FontWeight.Bold else FontWeight.Normal,
+                    modifier = Modifier.testTag("conversation_title_$id"))
             }
         }
     }
@@ -820,7 +990,7 @@ private fun ConnectionFields(state: PhoneUiState, model: PhoneViewModel, primary
 }
 
 @Composable
-private fun ChatTab(state: PhoneUiState, model: PhoneViewModel) {
+private fun ChatTab(state: PhoneUiState, model: PhoneViewModel, listState: LazyListState, follow: ChatFollow, onBack: () -> Unit) {
     val selected = state.selected
     if (selected == null) {
         Text("Open a conversation first.", Modifier.padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -828,6 +998,26 @@ private fun ChatTab(state: PhoneUiState, model: PhoneViewModel) {
     }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let(model::addAttachment) }
     val appContext = androidx.compose.ui.platform.LocalContext.current
+    val openMessageAttachment: (HistoryMessage, AttachmentRef) -> Unit = remember(selected.storedSessionId, state.history, state.historyNamespace) {
+        if(state.historyNamespace != null && state.historyNamespace == PhoneApp.from(appContext).bodyScope()) model.attachmentOpener(selected.storedSessionId)
+        else { _, _ -> }
+    }
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    var resumed by remember { mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, _ ->
+            resumed = lifecycleOwner.lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    LaunchedEffect(selected.storedSessionId, state.history, state.historyNamespace, resumed) {
+        if (resumed) {
+            androidx.compose.runtime.withFrameNanos { }
+            snapshotFlow { listState.layoutInfo.visibleItemsInfo.filter { it.size > 0 && it.offset < listState.layoutInfo.viewportEndOffset && it.offset + it.size > listState.layoutInfo.viewportStartOffset }.map { it.key }.toSet() }
+                .collect { keys -> model.contentDisplayed(selected.storedSessionId, state.history.filter { it.rowId in keys }, state.historyNamespace) }
+        }
+    }
     // The first text send asks, visibly, whether a reply that is not spoken may alert; the message is sent whatever the answer.
     val replyAlertPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { model.send() }
     ChatPane(
@@ -840,6 +1030,12 @@ private fun ChatTab(state: PhoneUiState, model: PhoneViewModel) {
         pendingSends = state.pendingSends.filter { it.send.sessionId == selected.storedSessionId },
         activity = state.activity.filter { it.sessionId == selected.storedSessionId },
         onLoadOlder = model::loadOlder,
+        olderLoading = state.olderLoading,
+        olderError = state.olderError,
+        onRetryOlder = model::loadOlder,
+        onBack = onBack,
+        listState = listState,
+        follow = follow,
         onDraft = model::setDraft,
         onSend = {
             if (PhoneApp.from(appContext).askReplyAlertsOnce()) replyAlertPermission.launch(Manifest.permission.POST_NOTIFICATIONS) else model.send()
@@ -850,9 +1046,55 @@ private fun ChatTab(state: PhoneUiState, model: PhoneViewModel) {
         onDismissFailed = model::dismissFailedSend,
         onPreviewAttachment = model::previewAttachment,
         onOpenLink = { url -> LinkOpener.open(appContext, url)?.let(model::reportStatus) },
-        onOpenAttachment = model::openAttachment,
+        onOpenMessageAttachment = openMessageAttachment,
     )
     AttachmentViewerHost(state.viewer, model)
+}
+
+/** Where a rightward swipe may start, measured from the left edge of the chat list, which is the physical screen edge (the 16dp side margin is content padding). */
+internal const val EDGE_SWIPE_REGION_DP = 40
+
+/** How far right the finger must have moved on release for the swipe to go back. */
+internal const val EDGE_SWIPE_COMMIT_DP = 72
+
+internal val ChatFollowSaver: Saver<ChatFollow, Boolean> =
+    Saver(save = { it.atLatest }, restore = { saved -> ChatFollow().also { it.atLatest = saved } })
+
+/**
+ * A rightward swipe that starts at the list's left edge and is released well to the right, mostly horizontally, goes back. It only
+ * watches (after the content has had the gesture) and never consumes: a vertical scroll, a drag a child already took (selection,
+ * a horizontally scrolled code block), a press held before moving, a second finger or a cancelled gesture never go back.
+ */
+@Composable
+private fun Modifier.edgeSwipeBack(onBack: (() -> Unit)?): Modifier {
+    val latest by rememberUpdatedState(onBack)
+    if (onBack == null) return this
+    return pointerInput(Unit) {
+        val region = EDGE_SWIPE_REGION_DP.dp.toPx()
+        val commit = EDGE_SWIPE_COMMIT_DP.dp.toPx()
+        awaitEachGesture {
+            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+            if (down.position.x > region) return@awaitEachGesture
+            val slop = viewConfiguration.touchSlop
+            val patience = viewConfiguration.longPressTimeoutMillis
+            var moving = false
+            while (true) {
+                val event = awaitPointerEvent(PointerEventPass.Final)
+                val change = event.changes.firstOrNull { it.id == down.id } ?: return@awaitEachGesture
+                if (event.changes.size > 1 || change.isConsumed) return@awaitEachGesture
+                val dx = change.position.x - down.position.x
+                val dy = change.position.y - down.position.y
+                if (!moving && (kotlin.math.abs(dx) > slop || kotlin.math.abs(dy) > slop)) {
+                    if (change.uptimeMillis - down.uptimeMillis > patience) return@awaitEachGesture
+                    moving = true
+                }
+                if (change.changedToUp()) {
+                    if (dx >= commit && dx >= 2 * kotlin.math.abs(dy)) latest?.invoke()
+                    return@awaitEachGesture
+                }
+            }
+        }
+    }
 }
 
 /**
@@ -878,8 +1120,11 @@ internal class ChatFollow {
         }
     }
 
+    /** True while a scroll this pane did not start is in progress (touch, fling, accessibility or keyboard). */
+    var userScrolling by mutableStateOf(false)
+        private set
+
     suspend fun track(list: LazyListState) {
-        var userScrolling = false
         // Reverse layout: "backward" is toward item 0, the newest message; none left means it is fully shown.
         // (Should one of this pane's own jumps be taken for the user's, it ends at the newest message anyway.)
         snapshotFlow { list.isScrollInProgress to list.canScrollBackward }.collect { (scrolling, canGoNewer) ->
@@ -918,13 +1163,36 @@ internal fun ChatPane(
     onPreviewAttachment: (Int) -> Unit = {},
     onOpenLink: (String) -> Unit = {},
     onOpenAttachment: (AttachmentRef) -> Unit = {},
+    onOpenMessageAttachment: ((HistoryMessage, AttachmentRef) -> Unit)? = null,
     pendingSends: List<PendingSend> = emptyList(),
     activity: List<ActivityBubble> = emptyList(),
+    olderLoading: Boolean = false,
+    olderError: Boolean = false,
+    onRetryOlder: () -> Unit = {},
+    onBack: (() -> Unit)? = null,
+    listState: LazyListState = remember(sessionKey) { LazyListState() },
+    follow: ChatFollow = remember(sessionKey) { ChatFollow() },
 ) {
-    val listState = remember(sessionKey) { LazyListState() }
-    val follow = remember(sessionKey) { ChatFollow() }
     val scope = rememberCoroutineScope()
     LaunchedEffect(listState) { follow.track(listState) }
+    // Older history is asked for only when the reader's own scroll has brought the top of the loaded rows into view: not on open,
+    // not on a remeasure, not while a read is running or after one failed.
+    val olderAllowed by rememberUpdatedState(hasOlder && !olderLoading && !olderError)
+    val askOlder by rememberUpdatedState(onLoadOlder)
+    LaunchedEffect(listState, follow) {
+        // One chance per touch gesture: a fling that carries on over a page that has just arrived does not pull the next one.
+        var spent = false
+        snapshotFlow { follow.userScrolling to listState.layoutInfo.visibleItemsInfo.any { it.key == "load_older" } }
+            .distinctUntilChanged()
+            .collect { (scrolling, atTop) ->
+                if (!scrolling) {
+                    spent = false
+                } else if (atTop && !spent) {
+                    spent = true
+                    if (olderAllowed) askOlder()
+                }
+            }
+    }
     val newest = history.lastOrNull()
     val anything = history.isNotEmpty() || pendingSends.isNotEmpty() || activity.isNotEmpty()
     LaunchedEffect(listState, history.size, newest?.rowId, newest?.text?.length, pendingSends.size, activity.size) {
@@ -934,74 +1202,80 @@ internal fun ChatPane(
         follow.atLatest = true
         if (anything) scope.launch { follow.toLatest(listState) }
     }
-    Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
-        LazyColumn(Modifier.weight(1f).fillMaxWidth().testTag("chat_list"), state = listState, reverseLayout = true,
-            verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.Bottom)) {
+    Column(Modifier.fillMaxSize()) {
+        LazyColumn(Modifier.weight(1f).fillMaxWidth().testTag("chat_list").edgeSwipeBack(onBack), state = listState, reverseLayout = true,
+            contentPadding = PaddingValues(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.Bottom)) {
             // Newest first: the transient receiving bubble, then the just-sent messages, then the conversation's own rows.
             items(activity.asReversed(), key = { "activity_${it.key}" }) { bubble ->
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
-                    Card(
-                        Modifier.fillMaxWidth(0.85f).semantics(mergeDescendants = true) {}.testTag("activity_${bubble.key}"),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-                            contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                        ),
-                    ) {
-                        Text(bubble.label, Modifier.padding(10.dp), style = MaterialTheme.typography.bodyMedium)
-                    }
+                Card(
+                    Modifier.fillMaxWidth().semantics(mergeDescendants = true) {}.testTag("activity_${bubble.key}"),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                    ),
+                ) {
+                    Text(bubble.label, Modifier.padding(10.dp), style = MaterialTheme.typography.bodyMedium)
                 }
             }
             items(pendingSends.asReversed(), key = { "pending_${it.send.id}" }) { pending ->
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                    Card(
-                        Modifier.fillMaxWidth(0.85f).semantics(mergeDescendants = true) {}.testTag("pending_send_${pending.send.id}"),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.primaryContainer,
-                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
-                        ),
-                    ) {
-                        Column(Modifier.padding(10.dp)) {
-                            if (pending.send.text.isNotBlank()) SentMessageText(pending.send.text, onOpenLink)
-                            pending.send.attachments.forEach { Text("📎 ${it.name}", style = MaterialTheme.typography.bodySmall) }
-                            Text(if (pending.delivered) "Sent" else "Sending…", style = MaterialTheme.typography.labelSmall)
-                        }
+                Card(
+                    Modifier.fillMaxWidth().semantics(mergeDescendants = true) {}.testTag("pending_send_${pending.send.id}"),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.primaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                    ),
+                ) {
+                    Column(Modifier.padding(10.dp)) {
+                        if (pending.send.text.isNotBlank()) SentMessageText(pending.send.text, onOpenLink)
+                        pending.send.attachments.forEach { Text("📎 ${it.name}", style = MaterialTheme.typography.bodySmall) }
+                        Text(if (pending.delivered) "Sent" else "Sending…", style = MaterialTheme.typography.labelSmall)
                     }
                 }
             }
             items(history.asReversed(), key = { it.rowId }) { message ->
                 val mine = message.role == "user"
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
-                    Card(
-                        Modifier.fillMaxWidth(0.85f).testTag("message_${message.rowId}"),
-                        colors = CardDefaults.cardColors(
-                            containerColor = if (mine) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
-                            contentColor = if (mine) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
-                        ),
-                    ) {
-                        MessageBody(message.text, "message_text_${message.rowId}", onOpenLink, onOpenAttachment, Modifier.padding(10.dp))
-                    }
+                Card(
+                    Modifier.fillMaxWidth().testTag("message_${message.rowId}"),
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (mine) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
+                        contentColor = if (mine) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
+                    ),
+                ) {
+                    MessageBody(message.text, "message_text_${message.rowId}", onOpenLink,
+                        { ref -> if (onOpenMessageAttachment != null) onOpenMessageAttachment(message, ref) else onOpenAttachment(ref) }, Modifier.padding(10.dp))
                 }
             }
             if (hasOlder) item(key = "load_older") {
-                TextButton(onClick = onLoadOlder, modifier = Modifier.testTag("load_older")) { Text("Load older") }
+                if (olderLoading) {
+                    Text("Loading older messages…", Modifier.fillMaxWidth().padding(vertical = 12.dp).testTag("load_older_loading"),
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+                } else if (olderError) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Couldn't load older messages", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error)
+                        TextButton(onClick = onRetryOlder, modifier = Modifier.heightIn(min = 48.dp).testTag("load_older_retry")) { Text("Retry") }
+                    }
+                } else {
+                    TextButton(onClick = onLoadOlder, modifier = Modifier.testTag("load_older")) { Text("Load older") }
+                }
             }
         }
         failedSends.forEach { failed ->
-            Row(Modifier.fillMaxWidth().testTag("failed_send_${failed.send.id}"), verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp).testTag("failed_send_${failed.send.id}"), verticalAlignment = Alignment.CenterVertically) {
                 Text("Not sent: ${failed.reason}", Modifier.weight(1f), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                 TextButton(onClick = { onRetry(failed.send.id) }, modifier = Modifier.heightIn(min = 48.dp).testTag("retry_${failed.send.id}")) { Text("Retry") }
                 TextButton(onClick = { onDismissFailed(failed.send.id) }, modifier = Modifier.heightIn(min = 48.dp).testTag("dismiss_${failed.send.id}")) { Text("Dismiss") }
             }
         }
         attachments.forEachIndexed { index, attachment ->
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = { onPreviewAttachment(index) }, modifier = Modifier.weight(1f).heightIn(min = 48.dp).testTag("attachment_$index")) {
                     Text("📎 ${attachment.name} (${attachment.bytes.size / 1024} KiB)", maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
                 TextButton(onClick = { onRemoveAttachment(index) }, modifier = Modifier.heightIn(min = 48.dp).testTag("remove_attachment_$index")) { Text("Remove") }
             }
         }
-        Row(Modifier.padding(vertical = 8.dp).testTag("composer_row"), verticalAlignment = Alignment.Bottom,
+        Row(Modifier.padding(horizontal = 16.dp, vertical = 8.dp).testTag("composer_row"), verticalAlignment = Alignment.Bottom,
             horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             IconButton(onClick = onAttach, modifier = Modifier.size(48.dp).testTag("attach")) {
                 Icon(ComposerIcons.Plus, contentDescription = "Attach file")
@@ -1032,6 +1306,28 @@ internal fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerA
             listOf(ThemeMode.DARK to "Dark", ThemeMode.LIGHT to "Light", ThemeMode.SYSTEM to "System").forEach { (mode, label) ->
                 FilterChip(selected = state.themeMode == mode, onClick = { model.setThemeMode(mode) }, label = { Text(label) })
             }
+        }
+        Text("Text size", style = MaterialTheme.typography.labelLarge)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(
+                onClick = { model.setFontScalePercent(state.fontScalePercent - PhoneDisplaySettings.STEP) },
+                enabled = state.fontScalePercent > PhoneDisplaySettings.MIN,
+                modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp).testTag("font_scale_down").semantics { contentDescription = "Smaller text" },
+                contentPadding = PaddingValues(horizontal = 12.dp),
+            ) { Text("−") }
+            Text("${state.fontScalePercent}%", Modifier.widthIn(min = 56.dp).testTag("font_scale_value"), textAlign = TextAlign.Center,
+                style = MaterialTheme.typography.titleMedium)
+            OutlinedButton(
+                onClick = { model.setFontScalePercent(state.fontScalePercent + PhoneDisplaySettings.STEP) },
+                enabled = state.fontScalePercent < PhoneDisplaySettings.MAX,
+                modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp).testTag("font_scale_up").semantics { contentDescription = "Larger text" },
+                contentPadding = PaddingValues(horizontal = 12.dp),
+            ) { Text("+") }
+            TextButton(
+                onClick = model::resetFontScale,
+                enabled = state.fontScalePercent != PhoneDisplaySettings.DEFAULT,
+                modifier = Modifier.heightIn(min = 48.dp).testTag("font_scale_reset"),
+            ) { Text("Reset") }
         }
 
         HorizontalDivider()

@@ -5,6 +5,7 @@ import com.rumi.hermesvoice.core.notify.FinalReplySource
 import com.rumi.hermesvoice.core.notify.ReplyAlert
 import com.rumi.hermesvoice.core.notify.ReplyAlertContent
 import com.rumi.hermesvoice.core.notify.ReplyAlertLedger
+import com.rumi.hermesvoice.core.notify.ReplyAlertPort
 import com.rumi.hermesvoice.core.notify.ReplyAlertResult
 import com.rumi.hermesvoice.core.notify.ReplyAlerts
 import com.rumi.hermesvoice.core.watchlink.ReplyAlertMessage
@@ -53,9 +54,35 @@ class ReplyArrivalAlertTest {
     fun `a refused or throwing notification surface leaves the answer handled once, and never throws`() = runBlocking {
         val refused = ReplyAlerts(ReplyAlertLedger(InMemoryKeyValueStore()), { false }, scope)
         assertEquals(ReplyAlertResult.NOT_SHOWN_HERE, refused.dispatch(reply()))
-        assertEquals(ReplyAlertResult.DUPLICATE, refused.dispatch(reply()))
+        // Migrated (review F03): the previous contract answered DUPLICATE here, which spent the identity though nothing was shown.
+        assertEquals(ReplyAlertResult.NOT_SHOWN_HERE, refused.dispatch(reply()))
         val throwing = ReplyAlerts(ReplyAlertLedger(InMemoryKeyValueStore()), { error("boom") }, scope)
         assertEquals(ReplyAlertResult.NOT_SHOWN_HERE, throwing.dispatch(reply()))
+        assertEquals(ReplyAlertResult.NOT_SHOWN_HERE, throwing.dispatch(reply()))
+    }
+
+    @Test
+    fun `a refused or throwing surface keeps the identity unspent, a later working surface shows it exactly once, also after a restart`() = runBlocking {
+        var mode = "refuse"
+        val shown = ArrayList<ReplyAlert>()
+        val port = ReplyAlertPort { alert ->
+            when (mode) {
+                "refuse" -> false
+                "throw" -> error("boom")
+                else -> { shown += alert; true }
+            }
+        }
+        val alerts = ReplyAlerts(ReplyAlertLedger(ledgerStore), port, scope)
+        assertEquals(ReplyAlertResult.NOT_SHOWN_HERE, alerts.dispatch(reply()))
+        mode = "throw"
+        assertEquals(ReplyAlertResult.NOT_SHOWN_HERE, alerts.dispatch(reply()))
+        assertTrue("nothing was shown, so nothing was recorded", shown.isEmpty())
+        val restarted = ReplyAlerts(ReplyAlertLedger(ledgerStore), port, scope)
+        mode = "ok"
+        assertEquals(ReplyAlertResult.SHOWN_HERE, restarted.dispatch(reply()))
+        assertEquals(ReplyAlertResult.DUPLICATE, restarted.dispatch(reply()))
+        assertEquals(ReplyAlertResult.DUPLICATE, ReplyAlerts(ReplyAlertLedger(ledgerStore), port, scope).dispatch(reply()))
+        assertEquals(listOf("t-1#final"), shown.map { it.identity })
     }
 
     @Test

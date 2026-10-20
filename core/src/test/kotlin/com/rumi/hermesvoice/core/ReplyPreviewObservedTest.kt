@@ -86,10 +86,26 @@ class ReplyPreviewObservedTest {
         rig.harness().use { h ->
             val work = existing(h, "work", "Spoken answer text.")
             assertTrue(phoneTurn(h, "p-spoken-0001", work, speaks) is VoiceTurnOutcome.Completed)
-            h.fake.scripts[work] = { listOf(FakeHermesDashboard.complete("stopped halfway", "interrupted")) }
-            phoneTurn(h, "p-stopped-0001", work, finalFails)
             settle()
-            assertTrue("$shown", shown.isEmpty())
+            assertTrue("successful speech has no arrival preview: $shown", shown.isEmpty())
+            val cues = java.util.concurrent.CopyOnWriteArrayList<SpokenRole>()
+            val stoppedSink = PlaybackSink { _, cue ->
+                cues += cue.role
+                if (cue.role == SpokenRole.FINAL) throw IOException("no audio output")
+            }
+            h.fake.scripts[work] = { listOf(FakeHermesDashboard.complete("stopped halfway", "interrupted")) }
+            phoneTurn(h, "p-stopped-0001", work, stoppedSink)
+            settle()
+            // Retained node name: remote interruption is not client Stop or a delivered final.
+            val body = com.rumi.hermesvoice.core.net.AcceptedTurnReconciler.NOTICE_NO_ANSWER
+            assertEquals(listOf(ShownAlert("p-stopped-0001#notice@$work", body, body)), shown.toList())
+            assertFalse("incomplete text must never become final speech: $cues", SpokenRole.FINAL in cues)
+            assertFalse(shown.toString().contains("stopped halfway"))
+            assertEquals(2, h.fake.rawPrompts.size)
+            h.core.reconcileAccepted()
+            settle()
+            assertEquals("reconciliation cannot duplicate or resubmit", 1, shown.size)
+            assertEquals(2, h.fake.rawPrompts.size)
         }
     }
 

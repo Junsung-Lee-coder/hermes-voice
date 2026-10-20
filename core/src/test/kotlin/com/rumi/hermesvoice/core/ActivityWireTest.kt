@@ -179,13 +179,21 @@ class ActivityWireTest {
         val result = async(Dispatchers.IO) { h.core.chat.send(id, "go") }
         waitFor("begin") { seen.any { it is ActivityEvent.Begin } }
         val key = seen.filterIsInstance<ActivityEvent.Begin>().single().key
+        val accepted = com.rumi.hermesvoice.core.net.AcceptedTurnStore(h.store).pending().single()
+        assertEquals(id, accepted.storedSessionId)
         h.fake.pushLaterTurn(id, tool("tool.start", "terminal", "ls"), "error" to JSONObject().put("message", "boom"), withStart = false)
         assertTrue(result.await() is ChatSendResult.Failed)
         waitFor("end") { seen.any { it is ActivityEvent.End } }
         assertEquals(ActivityEvent.End(key, replied = false), seen.last())
         assertTrue(h.core.activity.snapshot().bubbles.isEmpty())
         settle()
-        assertTrue(rig.shown.isEmpty())
+        assertEquals(listOf("${accepted.id}#notice@$id"), rig.shown.toList())
+        assertEquals(1, seen.count { it is ActivityEvent.End })
+        assertEquals(listOf(id to "go"), h.fake.rawPrompts.toList())
+        h.core.reconcileAccepted()
+        settle()
+        assertEquals("no duplicate notice or guessed successful reply", listOf("${accepted.id}#notice@$id"), rig.shown.toList())
+        assertEquals(listOf(id to "go"), h.fake.rawPrompts.toList())
     }
 
     @Test

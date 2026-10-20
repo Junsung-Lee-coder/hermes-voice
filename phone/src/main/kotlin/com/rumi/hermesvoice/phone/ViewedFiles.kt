@@ -40,8 +40,13 @@ internal object ViewedFiles {
         val dir = dir(context).also { it.mkdirs() }
         val file = File(dir, "${counter.incrementAndGet()}-${FilePreview.safeStorageName(name)}")
         check(file.canonicalFile.parentFile == dir.canonicalFile) { "unsafe cache name" }
-        file.writeBytes(bytes)
-        return file
+        try {
+            file.writeBytes(bytes)
+            return file
+        } catch (error: Throwable) {
+            runCatching { file.delete() } // A partial write has not transferred ownership to the caller.
+            throw error
+        }
     }
 
     fun clear(context: Context) {

@@ -61,7 +61,7 @@ class ComposerDispatchTest {
         val send = (ComposerDispatch.admit("conv-1", ComposerDraft("hello"), 1) as SendAdmission.Admitted).send
         assertNull(ComposerDispatch.failure(send, ChatSendResult.Replied("hi", "complete")))
         assertNull(ComposerDispatch.failure(send, ChatSendResult.Accepted("queued")))
-        assertNull(ComposerDispatch.failure(send, ChatSendResult.Failed("sent, but the connection dropped: IOException")))
+        assertNull(ComposerDispatch.failure(send, ChatSendResult.Failed("sent, but the connection dropped: IOException", acceptanceObserved = true)))
         val failed = ComposerDispatch.failure(send, ChatSendResult.Failed("network: SocketTimeoutException"))!!
         assertSame(send, failed.send)
         assertEquals("network: SocketTimeoutException", failed.reason)

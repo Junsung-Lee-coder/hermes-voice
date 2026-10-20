@@ -24,6 +24,7 @@ import com.rumi.hermesvoice.core.activity.ActivityReducer
 import com.rumi.hermesvoice.core.activity.ActivityState
 import com.rumi.hermesvoice.core.audio.CaptureEnd
 import com.rumi.hermesvoice.core.chat.PendingSend
+import com.rumi.hermesvoice.core.notify.FinalReply
 import com.rumi.hermesvoice.core.diag.DiagClassify
 import com.rumi.hermesvoice.core.diag.DiagLabels
 import com.rumi.hermesvoice.core.chat.PendingSends
@@ -51,6 +52,7 @@ import com.rumi.hermesvoice.core.net.HistoryPages
 import com.rumi.hermesvoice.core.net.OutgoingAttachment
 import com.rumi.hermesvoice.core.sessions.AppConversation
 import com.rumi.hermesvoice.core.sessions.OwnedSession
+import com.rumi.hermesvoice.core.sessions.withReadRetries
 import com.rumi.hermesvoice.core.settings.ThemeMode
 import com.rumi.hermesvoice.core.settings.VadSilence
 import com.rumi.hermesvoice.core.settings.WakeLocation
@@ -82,13 +84,27 @@ data class PhoneUiState(
     val profile: String = "",
     val signedIn: Boolean = false,
     val status: String = "",
+    val recoveryNotice: String? = null,
+    val cacheNotice: String? = null,
     val showArchived: Boolean = false,
     val conversations: List<AppConversation> = emptyList(),
+    /** Stored ids whose archive or unarchive request is in flight; such a row ignores further gestures. */
+    val archiving: Set<String> = emptySet(),
     val selected: OwnedSession? = null,
     val history: List<HistoryMessage> = emptyList(),
+    /** Authority provenance of the displayed body, including cached rows; never a file grant. */
+    val historyNamespace: String? = null,
     val hasOlder: Boolean = false,
     /** Raw transcript rows fetched so far (the server's offset unit; includes rows we do not display). */
     val rawLoaded: Int = 0,
+    /** Bumped when the raw cursor restarts from the newest page; an older read made for an earlier cursor is dropped when it lands. */
+    val olderEpoch: Int = 0,
+    /** The oldest RAW row id (shown or not) the cursor has walked past; a page that reaches below it is moving toward older rows. */
+    val olderBound: Long = Long.MAX_VALUE,
+    /** An older page is being read (one at a time per open conversation). */
+    val olderLoading: Boolean = false,
+    /** The last older-page read failed or returned nothing new; shown with a Retry, never retried by itself. */
+    val olderError: Boolean = false,
     val draft: String = "",
     val attachments: List<OutgoingAttachment> = emptyList(),
     /** Text requests dispatched and not yet answered or failed; never blocks the composer. */
@@ -107,6 +123,8 @@ data class PhoneUiState(
     val playMiddle: Boolean = false,
     val watch: WatchSettings = WatchSettings(),
     val themeMode: ThemeMode = ThemeMode.DARK,
+    /** This phone's text size as a percent of the Android system font scale (80..140, default 100). */
+    val fontScalePercent: Int = PhoneDisplaySettings.DEFAULT,
     /** Where spoken acks and replies play: the device of the latest accepted voice request. */
     val playbackDevice: VoiceOrigin? = null,
     /** Whether the Watch app is reachable over the Data Layer; null until checked. */
@@ -132,6 +150,8 @@ data class PhoneUiState(
     val autoNavigate: Boolean = false,
     /** Bumped when a routed turn's conversation was opened for the user: the screen shows Chat. */
     val chatOpenRequest: Long = 0,
+    /** Bumped when a conversation was created but not opened: the creation dialog closes and the list stays. */
+    val createClosedRequest: Long = 0,
     /** Speak later replies (Settings; informed opt-in, off by default). */
     val speakLater: Boolean = false,
     /** Use headset (Settings; Phone-only, off by default): a connected headset takes the Phone's spoken answers and recordings. */
@@ -228,19 +248,73 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
     /** Bumped for every selection; a history read made for an earlier selection is dropped when it lands. */
     private val selection = AtomicLong(0)
 
+    /** The one older-page read of the open conversation, and a counter that tells a finished read whether it is still the current one. */
+    private var olderJob: Job? = null
+    private val olderSeq = AtomicLong(0)
+
+    /** A conversation is being created; a second request meanwhile is ignored. */
+    private var creating = false
+
+    /** Bumped for every list refresh and every connection change; a scan of an earlier one is cancelled and never shown. */
+    private val listing = AtomicLong(0)
+    private val readLog: (String) -> Unit = { Log.i(TAG, it) }
+    private var listJob: Job? = null
+    private var displayedListScope: String? = app.sessionListScope()
+
+    /** Bumped by a changed connection or a sign-out; an archive request of an earlier one never touches the state again. */
+    private val connectionEpoch = AtomicLong(0)
+    private val archivingIds = HashSet<String>()
+
     /** Unsent text and attachments of conversations switched away from, so changing conversations never loses them. */
     private val drafts = HashMap<String, Pair<String, List<OutgoingAttachment>>>()
 
-    private val sendIds = AtomicLong(0)
+    private val sendScreen = object : TextSends.Screen {
+        override fun accepted(send: DispatchedSend, origin: PhoneApp.AsyncActionOrigin) {
+            viewModelScope.launch { if (app.asyncActionCurrent(origin)) onSendAccepted(send) }
+        }
+
+        override fun finished(send: DispatchedSend, result: ChatSendResult, origin: PhoneApp.AsyncActionOrigin) {
+            viewModelScope.launch { onSendFinished(send, result, origin) }
+        }
+    }
+
+    private val display = object : ConversationDisplay {
+        override suspend fun confirmArrival(reply: FinalReply): Boolean {
+            val text = reply.text?.trim()?.takeIf { it.isNotEmpty() } ?: return false
+            // A pre-existing equal answer is not evidence that this final was displayed. The
+            // supported local row cursor proves only a positively new latest row; without one,
+            // keep the conservative exact-identity alert (while still refreshing the real view).
+            val before = _state.value.takeIf { it.selected?.storedSessionId == reply.storedSessionId }
+                ?.history?.maxOfOrNull { it.rowId }
+            val page = refreshVisible(reply.storedSessionId) ?: return false
+            return before != null && page.messages.any { it.rowId > before && it.role == "assistant" && it.text.trim() == text }
+        }
+
+        override suspend fun confirmOpened(storedSessionId: String): Boolean = refreshVisible(storedSessionId) != null
+    }
 
     init {
+        // A request still waiting (or failed) when the screen before this one went away is shown again, and its outcome comes here.
+        val sends = app.textSends.attach(sendScreen) { app.asyncActionCurrent(it) }
+        if (sends.active.isNotEmpty() || sends.failed.isNotEmpty()) {
+            _state.update {
+                it.copy(pendingSends = sends.active, sendsInFlight = sends.active.size, failedSends = sends.failed,
+                    status = if (sends.active.isNotEmpty()) "Sending…" else it.status)
+            }
+        }
+        app.conversationDisplay = display
         ViewedFiles.clear(app)
+        viewModelScope.launch { app.finalRecovery.revision.collect {
+            _state.update { it.copy(conversations = app.finalRecovery.decorate(it.conversations)) }
+        } }
+        viewModelScope.launch { app.finalRecovery.notice.collect { note -> _state.update { it.copy(recoveryNotice = note) } } }
+        viewModelScope.launch { app.cacheNotice.collect { note -> _state.update { it.copy(cacheNotice = note) } } }
         viewModelScope.launch { app.playbackDevice.collect { device -> _state.update { it.copy(playbackDevice = device) } } }
         // "Open the routed conversation": only requests made while this screen exists (never a replayed old one).
         viewModelScope.launch { app.routedOpen.collect { storedSessionId -> openRouted(storedSessionId) } }
         // A tapped arrival alert: open exactly that conversation once this screen is signed in (kept until then; not the routed preference).
         viewModelScope.launch {
-            combine(app.pendingOpen, _state.map { it.signedIn }.distinctUntilChanged()) { id, signedIn -> id.takeIf { signedIn } }
+            combine(app.pendingOpen, app.pendingOpenTaps, _state.map { it.signedIn }.distinctUntilChanged()) { id, _, signedIn -> id.takeIf { signedIn } }
                 .collect { id -> if (id != null) openFromReplyAlert(id) }
         }
         // A voice turn (from the Phone or the Watch) created a conversation: show it.
@@ -319,10 +393,12 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
         }
         val baseline = PendingSends.baseline(_state.value.history)
         val generation = selection.get()
+        val wiring = app.existingWiring() ?: return
+        val origin = actionOrigin(wiring)
         viewModelScope.launch {
             for ((attempt, wait) in FINAL_LOOKUP_WAITS_MS.withIndex()) {
                 if (wait > 0) delay(wait)
-                val wiring = app.existingWiring() ?: break
+                if (!actionCurrent(origin)) break
                 if (selection.get() != generation || _state.value.selected?.storedSessionId != sessionId) break
                 val page = try {
                     wiring.core.sessions.history(sessionId, limit = HISTORY_PAGE)
@@ -332,7 +408,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
                     continue
                 }
                 val done = page.messages.any { it.role != "user" && it.rowId > baseline } || attempt == FINAL_LOOKUP_WAITS_MS.lastIndex
-                if (!mergeLatest(sessionId, generation, page, release = done)) break
+                if (!mergeLatest(sessionId, generation, page, release = done, origin = origin)) break
                 if (done) return@launch
             }
             releaseClosing(sessionId)
@@ -340,18 +416,31 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
     }
 
     /** Merges a freshly read newest page into the conversation on screen; false when another conversation is on screen now. */
-    private fun mergeLatest(sessionId: String, generation: Long, page: HistoryPage, release: Boolean): Boolean {
+    private suspend fun mergeLatest(sessionId: String, generation: Long, page: HistoryPage, release: Boolean, origin: ActionOrigin): Boolean {
+        if (!actionCurrent(origin)) return false
         if (selection.get() != generation || _state.value.selected?.storedSessionId != sessionId) return false
+        app.finalRecovery.observedNewest(page, app.bodyScope())
+        if (!actionCurrent(origin) || selection.get() != generation) return false
+        val scope = app.sessionListScope()
+        app.recentBodies.remember(page, page.returned >= HISTORY_PAGE) {
+            app.sessionListScope() == scope && selection.get() == generation && actionCurrent(origin)
+        }
         val released = if (release) ActivityReducer.release(activityState, sessionId) else activityState
         _state.update { current ->
             if (selection.get() != generation || current.selected?.storedSessionId != sessionId) return@update current
-            val merged = HistoryPages.refreshLatest(current.history, page.messages)
-            val keptOlder = merged.size > page.messages.size
-            current.copy(history = merged,
+            val prior = current.history.takeIf { current.historyNamespace == origin.namespace }.orEmpty()
+            val merged = HistoryPages.refreshLatest(prior, page.messages)
+            // The cursor carries on only when the newest page shares a row with what is shown (nothing lies between them); otherwise
+            // rows may have arrived in between, so the walk toward older rows starts again from the newest page.
+            val shown = prior.mapTo(HashSet()) { it.rowId }
+            val joined = merged.size > page.messages.size && page.messages.any { it.rowId in shown }
+            current.copy(history = merged, historyNamespace = origin.namespace,
                 pendingSends = PendingSends.reconcile(current.pendingSends, sessionId, merged),
                 activity = if (release) released.bubbles else current.activity,
-                hasOlder = if (keptOlder) current.hasOlder else page.returned >= HISTORY_PAGE,
-                rawLoaded = if (keptOlder) maxOf(current.rawLoaded, page.returned) else page.returned)
+                hasOlder = if (joined) current.hasOlder else page.returned >= HISTORY_PAGE,
+                rawLoaded = if (joined) maxOf(current.rawLoaded, page.returned) else page.returned,
+                olderEpoch = if (joined) current.olderEpoch else current.olderEpoch + 1,
+                olderBound = if (joined) minOf(current.olderBound, page.rawFloor() ?: Long.MAX_VALUE) else page.rawFloor() ?: Long.MAX_VALUE)
         }
         if (release) activityState = released
         return true
@@ -365,7 +454,11 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
         MediaControlStatus.REGISTERED -> HeadsetMediaText.REGISTERED
     }
 
-    private fun initialState() = PhoneUiState(
+    private fun initialState(): PhoneUiState {
+        val cached = app.cachedSessionTitles(archived = false)
+        return PhoneUiState(
+        conversations = app.finalRecovery.decorate(cached),
+        status = if (cached.isEmpty()) "" else "Saved conversations · refreshing…",
         dashboardUrl = app.settings.dashboardUrl,
         profile = app.settings.profile,
         signedIn = app.tokens.load() != null,
@@ -373,12 +466,14 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
         playMiddle = app.settings.playMiddleResponses,
         watch = app.settings.watchSettings(),
         themeMode = app.settings.themeMode,
+        fontScalePercent = app.display.fontScalePercent,
         routingEnabled = app.settings.routingEnabled,
         autoNavigate = app.settings.autoNavigateToRouted,
         speakLater = app.laterConsent.enabled,
         useHeadset = app.settings.useHeadset,
         laterReplyWindowMinutes = app.settings.laterReplyWindowMinutes,
-    )
+        )
+    }
 
     private fun wiringOrStatus(): PhoneApp.Wiring? = try {
         app.wiring().also { attachActivity(it.core) }
@@ -387,87 +482,326 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
         null
     }
 
-    private fun launchGuarded(block: suspend (PhoneApp.Wiring) -> Unit) {
+    private data class ActionOrigin(val wiring: PhoneApp.Wiring, val scope: String?, val url: String,
+        val profile: String, val connection: Long, val namespace: String?)
+
+    private fun actionOrigin(wiring: PhoneApp.Wiring) = ActionOrigin(wiring, app.sessionListScope(),
+        app.settings.dashboardUrl, app.settings.profile, connectionEpoch.get(), wiring.namespace)
+
+    private fun actionCurrent(origin: ActionOrigin, authLost: Boolean = false): Boolean {
+        if (app.existingWiring() !== origin.wiring || app.settings.dashboardUrl != origin.url ||
+            app.settings.profile != origin.profile || connectionEpoch.get() != origin.connection) return false
+        val scope = app.sessionListScope()
+        // A current rejected refresh clears its tokens before throwing. The displayed scope is
+        // used only for that null transition, never as the provenance of an independent action.
+        return (scope == origin.scope && app.bodyScope() == origin.namespace) || (authLost && scope == null && displayedListScope == origin.scope)
+    }
+
+    private fun launchGuarded(block: suspend (PhoneApp.Wiring, ActionOrigin) -> Unit) {
         val wiring = wiringOrStatus() ?: return
+        val origin = actionOrigin(wiring)
         viewModelScope.launch {
             try {
-                block(wiring)
-            } catch (error: HermesAuthRequiredException) {
-                _state.update { it.copy(signedIn = false, status = "Sign in to Hermes (${error.message})") }
+                block(wiring, origin)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (error: Exception) {
-                val classified = DiagClassify.of(error)
-                Log.w(TAG, "action failed cause=${classified.cause.wire}")
-                _state.update { it.copy(status = "Couldn't do that: ${DiagLabels.cause(classified.cause)}") }
+                reportActionFailure(error, origin)
             }
         }
     }
 
+    private fun reportActionFailure(error: Exception, origin: ActionOrigin) {
+        if (!actionCurrent(origin, authLost = error is HermesAuthRequiredException)) return
+        if (error is HermesAuthRequiredException) {
+            app.invalidateSessionTitles()
+            listing.incrementAndGet()
+            listJob?.cancel()
+            displayedListScope = null
+            selection.incrementAndGet()
+            cancelOlder()
+            app.selectedConversationId = null
+            _state.update { it.copy(signedIn = false, conversations = emptyList(), selected = null, history = emptyList(),
+                hasOlder = false, rawLoaded = 0, status = "Sign in to Hermes (${error.message})") }
+            return
+        }
+        val classified = DiagClassify.of(error)
+        Log.w(TAG, "action failed cause=${classified.cause.wire}")
+        _state.update { it.copy(status = "Couldn't do that: ${DiagLabels.cause(classified.cause)}") }
+    }
+
     // ── connection & auth ────────────────────────────────────────────────────────────────────
+
+    private val loginAttempt = AtomicLong(0)
 
     fun saveConnection(url: String, profile: String) {
         val changed = url.trim() != app.settings.dashboardUrl || profile.trim() != app.settings.profile
+        if(changed) loginAttempt.incrementAndGet()
         // The cached answers belong to the identity that heard them: forgotten before the new one is wired.
         val cacheCleared = if (changed) app.revokeUnplayedReplies() else true
         app.settings.dashboardUrl = url
         app.settings.profile = profile
         // A bearer pair belongs to the dashboard that minted it; never replay it elsewhere.
-        if (changed) { app.manualCapture.cancel("Connection changed"); app.connectionCue.cancel(); app.tokens.clear() }
+        if (changed) { closeViewer(); app.invalidateSessionTitles(); app.manualCapture.cancel("Connection changed"); app.connectionCue.cancel(); app.tokens.clear() }
+        displayedListScope = app.sessionListScope()
         selection.incrementAndGet()
+        listing.incrementAndGet()
+        listJob?.cancel()
+        endArchiving()
         app.selectedConversationId = null
         _state.update { it.copy(dashboardUrl = app.settings.dashboardUrl, profile = app.settings.profile,
-            signedIn = app.tokens.load() != null, selected = null, history = emptyList(), conversations = emptyList(),
+            signedIn = app.tokens.load() != null, selected = null, history = emptyList(), conversations = emptyList(), archiving = emptySet(),
+            pendingSends = if (changed) emptyList() else it.pendingSends, failedSends = if (changed) emptyList() else it.failedSends,
+            sendsInFlight = if (changed) 0 else it.sendsInFlight,
             status = if (cacheCleared) "Saved" else "Saved. $UNPLAYED_NOT_CLEARED") }
     }
 
     fun signIn() {
         if (wiringOrStatus() == null) return
+        val attempt = loginAttempt.incrementAndGet()
+        val previousNamespace = app.bodyScope()
         viewModelScope.launch {
             _state.update { it.copy(status = "Complete sign-in in the browser…") }
-            val message = runCatching { runNativeSignIn(getApplication()) }.getOrElse { "Sign-in failed: ${it.message}" }
+            val message = try { runNativeSignIn(getApplication()) }
+                catch(cancelled: CancellationException) { throw cancelled }
+                catch(error: Exception) { "Sign-in failed: ${error.message}" }
+            if(loginAttempt.get()!=attempt) return@launch
+            if(app.tokens.load()!=null && app.bodyScope()!=previousNamespace) {
+                selection.incrementAndGet();cancelOlder();closeViewer();drafts.clear()
+                _state.update { it.copy(selected=null,history=emptyList(),historyNamespace=null,conversations=emptyList(),
+                    draft="",attachments=emptyList(),pendingSends=emptyList(),failedSends=emptyList()) }
+            }
             _state.update { it.copy(status = message, signedIn = app.tokens.load() != null) }
             if (app.tokens.load() != null) refresh()
         }
     }
 
     fun signOut() {
+        loginAttempt.incrementAndGet()
+        closeViewer()
+        selection.incrementAndGet()
+        cancelOlder()
         val cacheCleared = app.revokeUnplayedReplies()
+        app.invalidateSessionTitles()
         app.tokens.clear()
+        displayedListScope = null
         app.manualCapture.cancel("Signed out")
         app.connectionCue.cancel()
         app.phoneWake.onSignedOut()
-        _state.update { it.copy(signedIn = false, status = if (cacheCleared) "Signed out on this phone" else "Signed out on this phone. $UNPLAYED_NOT_CLEARED") }
+        listing.incrementAndGet()
+        listJob?.cancel()
+        endArchiving()
+        _state.update { it.copy(signedIn = false, conversations = emptyList(), archiving = emptySet(), selected = null, history = emptyList(),
+            pendingSends = emptyList(), failedSends = emptyList(), sendsInFlight = 0,
+            status = if (cacheCleared) "Signed out on this phone" else "Signed out on this phone. $UNPLAYED_NOT_CLEARED") }
     }
 
     // ── sessions ─────────────────────────────────────────────────────────────────────────────
 
-    fun refresh() = launchGuarded { wiring ->
-        val list = wiring.core.sessions.listConversations(archived = _state.value.showArchived)
-        _state.update { it.copy(conversations = list, status = "") }
+    /**
+     * Reads the dashboard's sessions page by page. Each finished page is shown at once; a newer refresh, a switch between the
+     * active and archived list, a changed connection or a sign-out ends the scan before it, so its late pages are never shown.
+     */
+    fun refresh() {
+        val wiring = wiringOrStatus() ?: return
+        val origin = actionOrigin(wiring)
+        val scope = app.sessionListScope()
+        if (scope != displayedListScope) {
+            app.invalidateSessionTitles()
+            displayedListScope = scope
+            _state.update { it.copy(conversations = emptyList()) }
+        }
+        val cacheVersion = app.sessionTitlesVersion
+        val generation = listing.incrementAndGet()
+        val archived = _state.value.showArchived
+        val cacheRequest = app.beginSessionTitlesRefresh(archived)
+        listJob?.cancel()
+        val url = app.settings.dashboardUrl
+        val profile = app.settings.profile
+        fun requestCurrent() = listing.get() == generation && _state.value.showArchived == archived &&
+            app.sessionTitlesVersion == cacheVersion && app.isSessionTitlesRefreshCurrent(archived, cacheRequest) &&
+            app.settings.dashboardUrl == url && app.settings.profile == profile && app.existingWiring() === wiring &&
+            viewModelScope.coroutineContext[Job]?.isActive != false
+        fun current() = requestCurrent() && app.sessionListScope() == scope
+        _state.update { it.copy(status = "Reading the dashboard's sessions…") }
+        listJob = viewModelScope.launch {
+            try {
+                val list = withReadRetries(lines = readLog, stillCurrent = ::current) { wiring.core.sessions.listConversations(archived = archived) { progress ->
+                    if (current()) {
+                        revokeDisplayed(progress.removedIds)
+                        val rows = mergeConversations(progress.conversations, _state.value.conversations.filterNot { row -> row.owned.storedSessionId in progress.removedIds })
+                        if (app.rememberSessionTitles(scope, cacheVersion, archived, rows, ::current) != null && current()) {
+                            _state.update { it.copy(conversations = rows,
+                                status = "Reading the dashboard's sessions… ${progress.scanned} of ${progress.total}") }
+                        }
+                    }
+                } }
+                if (!current()) return@launch
+                revokeDisplayed(list.removedIds)
+                // Reconciliation is app-owned recovery, not the list/creation status transaction.
+                val recoveryScope = app.bodyScope()
+                app.appScope.launch { app.finalRecovery.reconcile(list, recoveryScope) }
+                if (!current()) return@launch
+                val note = listOfNotNull(
+                    "Only ${list.scanned} of ${list.total} sessions on the dashboard could be read${list.error?.let { " ($it)" } ?: ""}, so this list may be missing some."
+                        .takeIf { !list.complete },
+                    "${list.notAdopted} marked session(s) were not added (no free place or alias, or an unusable id).".takeIf { list.notAdopted > 0 },
+                ).joinToString(" ")
+                _state.update {
+                    it.copy(conversations = if (list.complete) mergeConversations(list.conversations, emptyList())
+                        else mergeConversations(list.conversations, it.conversations.filterNot { row -> row.owned.storedSessionId in list.removedIds }), status = note)
+                }
+                val saved = app.saveSessionTitles(scope, cacheVersion, archived, _state.value.conversations, ::current)
+                if (saved == false && current()) _state.update { it.copy(status = listOf(note, "List not saved for next start").filter(String::isNotBlank).joinToString(" ")) }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: HermesAuthRequiredException) {
+                // Rejected refresh clears credentials before throwing. Null is observed auth loss,
+                // not permission to discard this current request's sign-in-required result.
+                if (requestCurrent() && (app.sessionListScope() == scope || app.sessionListScope() == null)) {
+                    reportActionFailure(error, origin)
+                }
+            } catch (error: Exception) {
+                if (current()) {
+                    val classified = DiagClassify.of(error)
+                    Log.w(TAG, "action failed cause=${classified.cause.wire}")
+                    _state.update { it.copy(status = "Couldn't do that: ${DiagLabels.cause(classified.cause)}") }
+                }
+            }
+        }
+    }
+
+    private fun mergeConversations(found: List<AppConversation>, previous: List<AppConversation>): List<AppConversation> {
+        val ids = HashSet<String>()
+        return app.finalRecovery.decorate((found + previous).filter { ids.add(it.owned.storedSessionId) })
+    }
+
+    private fun revokeDisplayed(ids: Set<String>) {
+        app.finalRecovery.remove(ids)
+        if (_state.value.selected?.storedSessionId in ids) {
+            selection.incrementAndGet(); cancelOlder(); app.selectedConversationId = null
+            _state.update { it.copy(selected = null, history = emptyList()) }
+        }
+    }
+
+    fun contentDisplayed(sessionId: String, rows: List<HistoryMessage>, namespace: String? = _state.value.historyNamespace) {
+        val shown=_state.value
+        if(namespace==null || namespace!=app.bodyScope() || namespace!=shown.historyNamespace || shown.selected?.storedSessionId!=sessionId) return
+        app.finalRecovery.displayed(sessionId,rows.filter { row -> shown.history.any { it.rowId==row.rowId && it.messageUid==row.messageUid && it.text==row.text } })
     }
 
     fun setShowArchived(show: Boolean) {
-        _state.update { it.copy(showArchived = show) }
+        _state.update { it.copy(showArchived = show, conversations = app.cachedSessionTitles(archived = show)) }
         refresh()
     }
 
-    fun createConversation(title: String, alias: String, description: String) = launchGuarded { wiring ->
-        val owned = wiring.core.sessions.createConversation(title, alias, description)
-        _state.update { it.copy(status = "Created '${owned.title}' (voice alias: ${owned.alias})") }
-        refresh()
-        open(owned)
-    }
-
-    fun setArchived(session: OwnedSession, archived: Boolean) = launchGuarded { wiring ->
-        wiring.core.sessions.setArchived(session.storedSessionId, archived)
-        if (archived && _state.value.selected?.storedSessionId == session.storedSessionId) {
-            selection.incrementAndGet()
-            app.selectedConversationId = null
-            _state.update { it.copy(selected = null, history = emptyList()) }
+    /** Creates one conversation and opens it; [onDone] says whether it was created (on false the status line holds the reason). */
+    fun createConversation(title: String, alias: String, description: String, onDone: (Boolean) -> Unit = {}) {
+        if (creating) {
+            _state.update { it.copy(status = "A conversation is already being created") }
+            onDone(false)
+            return
         }
-        refresh()
+        val wiring = wiringOrStatus()
+        if (wiring == null) {
+            onDone(false)
+            return
+        }
+        val origin = actionOrigin(wiring)
+        creating = true
+        viewModelScope.launch {
+            var created = false
+            var currentFailure = false
+            try {
+                val owned = wiring.core.sessions.createConversation(title, alias, description)
+                created = true
+                _state.update { it.copy(status = "Created '${owned.title}' (voice alias: ${owned.alias})") }
+                refresh()
+                val generation = selection.incrementAndGet()
+                cancelOlder()
+                val shown = try {
+                    showNewest(wiring, origin, owned, generation) {
+                        onUserNavigated()
+                        _state.update { it.copy(chatOpenRequest = it.chatOpenRequest + 1) }
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    if (!actionCurrent(origin, authLost = error is HermesAuthRequiredException)) return@launch
+                    currentFailure = true
+                    reportCreatedNotOpened(owned, error, origin)
+                    false
+                }
+                if (!shown && (currentFailure || actionCurrent(origin))) _state.update { it.copy(createClosedRequest = it.createClosedRequest + 1) }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                currentFailure = actionCurrent(origin, authLost = error is HermesAuthRequiredException)
+                reportActionFailure(error, origin)
+            } finally {
+                creating = false
+            }
+            if (currentFailure || actionCurrent(origin)) onDone(created)
+        }
     }
 
-    fun updateAlias(session: OwnedSession, alias: String, description: String) = launchGuarded { wiring ->
+    /** The conversation exists but its history could not be read: say so, and leave it in the list to be opened. */
+    private fun reportCreatedNotOpened(owned: OwnedSession, error: Exception, origin: ActionOrigin) {
+        if (error is HermesAuthRequiredException) {
+            reportActionFailure(error, origin)
+            return
+        }
+        if (!actionCurrent(origin)) return
+        Log.w(TAG, "open after create failed cause=${DiagClassify.of(error).cause.wire}")
+        _state.update { it.copy(status = "Created '${owned.title}' (voice alias: ${owned.alias}), but couldn't open it. Tap it in the list to try again.") }
+    }
+
+    private fun endArchiving() {
+        connectionEpoch.incrementAndGet()
+        synchronized(archivingIds) { archivingIds.clear() }
+    }
+
+    private fun publishArchiving() {
+        val ids = synchronized(archivingIds) { archivingIds.toSet() }
+        _state.update { it.copy(archiving = ids) }
+    }
+
+    /** Archives or restores [session] through the dashboard; a second request for a row whose request is still running is ignored. */
+    fun setArchived(session: OwnedSession, archived: Boolean) {
+        val wiring = wiringOrStatus() ?: return
+        val origin = actionOrigin(wiring)
+        val id = session.storedSessionId
+        val epoch = connectionEpoch.get()
+        if (!synchronized(archivingIds) { archivingIds.add(id) }) return
+        publishArchiving()
+        viewModelScope.launch {
+            try {
+                wiring.core.sessions.setArchived(id, archived)
+                if (connectionEpoch.get() != epoch) return@launch
+                if (archived && _state.value.selected?.storedSessionId == id) {
+                    selection.incrementAndGet()
+                    app.selectedConversationId = null
+                    _state.update { it.copy(selected = null, history = emptyList()) }
+                }
+                _state.update { state ->
+                    if (state.showArchived == archived) state
+                    else state.copy(conversations = state.conversations.filterNot { it.owned.storedSessionId == id })
+                }
+                refresh()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (connectionEpoch.get() == epoch) reportActionFailure(error, origin)
+            } finally {
+                if (connectionEpoch.get() == epoch) {
+                    synchronized(archivingIds) { archivingIds.remove(id) }
+                    publishArchiving()
+                }
+            }
+        }
+    }
+
+    fun updateAlias(session: OwnedSession, alias: String, description: String) = launchGuarded { wiring, _ ->
         wiring.core.sessions.updateDestination(session.storedSessionId, alias, description)
         refresh()
     }
@@ -477,26 +811,61 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
      * selected is dropped. The unsent draft is kept per conversation (the one switched away from
      * is stashed, the one opened gets its own back).
      */
-    fun open(session: OwnedSession) {
+    fun open(session: OwnedSession, afterShown: () -> Unit = {}) {
         val generation = selection.incrementAndGet()
-        launchGuarded { wiring ->
-            val page = wiring.core.sessions.history(session.storedSessionId, limit = HISTORY_PAGE)
-            if (selection.get() != generation) return@launchGuarded
-            // On the main thread, like every draft edit: the stash is never touched inside a retried update.
+        cancelOlder()
+        // Never replace a richer live reader/pagination cursor with its bounded saved newest page.
+        if (_state.value.selected?.storedSessionId != session.storedSessionId || _state.value.history.isEmpty()) app.recentBodies.load(session.storedSessionId)?.let { saved ->
             val current = _state.value
-            val (draft, attachments) = if (current.selected?.storedSessionId == session.storedSessionId) current.draft to current.attachments
-            else {
+            val (draft, attachments) = if (current.selected?.storedSessionId == session.storedSessionId) current.draft to current.attachments else {
                 current.selected?.let { drafts[it.storedSessionId] = current.draft to current.attachments }
                 drafts.remove(session.storedSessionId) ?: ("" to emptyList())
             }
-            _state.update {
-                it.copy(selected = session, history = page.messages, hasOlder = page.returned >= HISTORY_PAGE,
-                    pendingSends = PendingSends.reconcile(it.pendingSends, session.storedSessionId, page.messages),
-                    rawLoaded = page.returned, draft = draft, attachments = attachments)
-            }
-            // With routing off, a voice request made with the app closed goes to the conversation open here.
-            app.selectedConversationId = session.storedSessionId
+            _state.update { it.copy(selected = session, history = saved.page.messages, historyNamespace = app.bodyScope(), hasOlder = saved.hasOlder,
+                rawLoaded = saved.page.returned, olderBound = saved.page.rawFloor() ?: Long.MAX_VALUE,
+                olderEpoch = it.olderEpoch + 1, draft = draft, attachments = attachments,
+                olderLoading = false, olderError = false) }
         }
+        launchGuarded { wiring, origin -> showNewest(wiring, origin, session, generation, afterShown) }
+    }
+
+    /** Reads and shows [session]'s newest page; false when another conversation was selected meanwhile (nothing is shown then). */
+    private suspend fun showNewest(wiring: PhoneApp.Wiring, origin: ActionOrigin, session: OwnedSession, generation: Long, afterShown: () -> Unit): Boolean {
+        val page = try {
+            withReadRetries(lines = readLog, stillCurrent = { actionCurrent(origin) && selection.get() == generation }) {
+                wiring.core.sessions.history(session.storedSessionId, limit = HISTORY_PAGE)
+            }
+        } catch (error: com.rumi.hermesvoice.core.SessionNotOwnedException) {
+            if (actionCurrent(origin) && selection.get() == generation) {
+                app.recentBodies.invalidate()
+                _state.update { if (it.selected?.storedSessionId == session.storedSessionId) it.copy(selected = null, history = emptyList()) else it }
+            }
+            throw error
+        }
+        if (!actionCurrent(origin)) return false
+        if (selection.get() != generation) return false
+        app.finalRecovery.observedNewest(page, app.bodyScope())
+        if (!actionCurrent(origin) || selection.get() != generation) return false
+        app.recentBodies.eligible(session.storedSessionId)
+        app.recentBodies.remember(page, page.returned >= HISTORY_PAGE) { actionCurrent(origin) && selection.get() == generation }
+        // On the main thread, like every draft edit: the stash is never touched inside a retried update.
+        val current = _state.value
+        val (draft, attachments) = if (current.selected?.storedSessionId == session.storedSessionId) current.draft to current.attachments
+        else {
+            current.selected?.let { drafts[it.storedSessionId] = current.draft to current.attachments }
+            drafts.remove(session.storedSessionId) ?: ("" to emptyList())
+        }
+        _state.update {
+            it.copy(selected = session, historyNamespace = origin.namespace, history = if (it.selected?.storedSessionId == session.storedSessionId && it.historyNamespace == origin.namespace) HistoryPages.refreshLatest(it.history, page.messages) else page.messages, hasOlder = page.returned >= HISTORY_PAGE,
+                pendingSends = PendingSends.reconcile(it.pendingSends, session.storedSessionId, page.messages),
+                rawLoaded = page.returned, olderEpoch = it.olderEpoch + 1,
+                olderBound = page.rawFloor() ?: Long.MAX_VALUE,
+                draft = draft, attachments = attachments, olderLoading = false, olderError = false)
+        }
+        // With routing off, a voice request made with the app closed goes to the conversation open here.
+        app.selectedConversationId = session.storedSessionId
+        afterShown()
+        return true
     }
 
     /**
@@ -507,26 +876,116 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
     private fun reloadSelected() {
         val session = _state.value.selected ?: return
         val generation = selection.get()
-        launchGuarded { wiring ->
-            val page = wiring.core.sessions.history(session.storedSessionId, limit = HISTORY_PAGE)
-            mergeLatest(session.storedSessionId, generation, page, release = false)
+        launchGuarded { wiring, origin ->
+            val page = withReadRetries(lines = readLog, stillCurrent = { actionCurrent(origin) && selection.get() == generation }) {
+                wiring.core.sessions.history(session.storedSessionId, limit = HISTORY_PAGE)
+            }
+            mergeLatest(session.storedSessionId, generation, page, release = false, origin = origin)
         }
     }
 
+    /** Shows [session]; when it is already the open conversation its loaded history and place stay and only the newest page is refreshed. */
+    fun openOrResume(session: OwnedSession) {
+        if (_state.value.selected?.storedSessionId == session.storedSessionId) reloadSelected() else open(session)
+    }
+
+    private fun cancelOlder() {
+        olderJob?.cancel()
+        olderJob = null
+        olderSeq.incrementAndGet()
+        _state.update { if (it.olderLoading || it.olderError) it.copy(olderLoading = false, olderError = false) else it }
+    }
+
+    private enum class OlderStep { ADDED, SKIPPED, END, STALLED, RACED, STALE, SUSPECT }
+
+    /** A full page of rows all shown already that did not reach below [PhoneUiState.olderBound]: held, uncommitted, until the next page shows the server moved on. */
+    private class HeldOlder(val page: HistoryPage, val base: Int, val epoch: Int)
+
+    private fun HistoryPage.rawRows(): List<Long> = rawIds.takeIf { it.size == returned } ?: messages.map { it.rowId }
+
+    private fun HistoryPage.rawFloor(): Long? = rawRows().minOrNull()
+
+    /**
+     * Reads the next older page of the open conversation by the RAW row offset ([PhoneUiState.rawLoaded]: hidden, tool and seed rows
+     * count, the number of rows shown does not). One read at a time; a page without a shown message moves on to the next raw page (a
+     * few at most), so earlier messages are never stranded behind rows that are not displayed. Rows that arrive between reads push
+     * the same raw offset toward newer rows, so a page of rows all shown already is not proof that the server stood still: it is
+     * held until the next page differs from it (the server is moving through the rows) and only then passed; a next page that is
+     * the same again is an error with a Retry, never a loop. A read for a conversation that is no longer open is dropped.
+     */
     fun loadOlder() {
+        val start = _state.value
+        val sessionId = start.selected?.storedSessionId ?: return
+        if (!start.hasOlder || olderJob?.isActive == true) return
+        val wiring = wiringOrStatus() ?: return
+        val origin = actionOrigin(wiring)
         val generation = selection.get()
-        launchGuarded { wiring ->
-            val selected = _state.value.selected ?: return@launchGuarded
-            val page = wiring.core.sessions.history(selected.storedSessionId, limit = HISTORY_PAGE, offset = _state.value.rawLoaded)
-            _state.update { current ->
-                if (selection.get() != generation || current.selected?.storedSessionId != selected.storedSessionId) return@update current
-                // New rows may have landed since the first page; de-duplicate by row id.
-                val known = current.history.map { it.rowId }.toSet()
-                val combined = page.messages.filter { it.rowId !in known } + current.history
-                current.copy(history = combined, pendingSends = PendingSends.reconcile(current.pendingSends, selected.storedSessionId, combined),
-                    hasOlder = page.returned >= HISTORY_PAGE, rawLoaded = current.rawLoaded + page.returned)
+        val seq = olderSeq.incrementAndGet()
+        _state.update { it.copy(olderLoading = true, olderError = false) }
+        olderJob = viewModelScope.launch {
+            try {
+                var steps = 0
+                var held: HeldOlder? = null
+                while (steps < MAX_OLDER_STEPS) {
+                    steps += 1
+                    val cursor = _state.value
+                    val base = cursor.rawLoaded
+                    val pending = held?.takeIf { it.base == base && it.epoch == cursor.olderEpoch }?.page
+                    val offset = base + (pending?.returned ?: 0)
+                    val page = wiring.core.sessions.history(sessionId, limit = HISTORY_PAGE, offset = offset)
+                    when (applyOlderPage(sessionId, generation, base, cursor.olderEpoch, page, pending)) {
+                        OlderStep.SUSPECT -> held = HeldOlder(page, offset, cursor.olderEpoch)
+                        OlderStep.SKIPPED, OlderStep.RACED -> held = null
+                        else -> return@launch
+                    }
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (selection.get() == generation && olderSeq.get() == seq) {
+                    if (error is HermesAuthRequiredException) reportActionFailure(error, origin)
+                    else _state.update { it.copy(olderError = true) }
+                }
+            } finally {
+                if (olderSeq.get() == seq) _state.update { it.copy(olderLoading = false) }
             }
         }
+    }
+
+    /** [base] is the cursor the walk started from; [pending] is the page held at [base] (read there, not yet passed), if any. */
+    private fun applyOlderPage(sessionId: String, generation: Long, base: Int, epoch: Int, page: HistoryPage, pending: HistoryPage?): OlderStep {
+        var step = OlderStep.STALE
+        _state.update { current ->
+            step = OlderStep.STALE
+            if (selection.get() != generation || current.selected?.storedSessionId != sessionId) return@update current
+            if (current.rawLoaded != base || current.olderEpoch != epoch) {
+                step = OlderStep.RACED
+                return@update current
+            }
+            // New rows may have landed since the first page; rows already shown win, the others join in row-id order.
+            val known = current.history.mapTo(HashSet()) { it.rowId }
+            val fresh = page.messages.filter { it.rowId !in known }
+            val floor = page.rawFloor()
+            if (fresh.isEmpty() && floor != null && floor >= current.olderBound && page.returned >= HISTORY_PAGE) {
+                // Nothing new and nothing older than what was passed: the rows that arrived since can shift this offset onto rows
+                // already read (an honest page), or the server is repeating itself. The next page of this same read tells which; this
+                // one waits for it, and nothing from an earlier read decides it.
+                // (A short page of such rows is the end of the transcript: nothing older than the oldest row passed is left.)
+                if (pending != null && page.rawRows().toSet() == pending.rawRows().toSet()) {
+                    step = OlderStep.STALLED
+                    return@update current.copy(olderError = true)
+                }
+                step = OlderStep.SUSPECT
+                return@update if (pending == null) current else current.copy(rawLoaded = base + pending.returned)
+            }
+            val more = page.returned >= HISTORY_PAGE
+            step = if (fresh.isNotEmpty()) OlderStep.ADDED else if (more) OlderStep.SKIPPED else OlderStep.END
+            val combined = if (fresh.isEmpty()) current.history else (current.history + fresh).sortedBy { it.rowId }
+            current.copy(history = combined, pendingSends = PendingSends.reconcile(current.pendingSends, sessionId, combined),
+                hasOlder = more, rawLoaded = base + (pending?.returned ?: 0) + page.returned,
+                olderBound = minOf(current.olderBound, floor ?: Long.MAX_VALUE))
+        }
+        return step
     }
 
     /** The user opened a conversation or changed screens: a routed turn accepted earlier no longer moves the screen. */
@@ -542,13 +1001,27 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
         _state.update { it.copy(chatOpenRequest = it.chatOpenRequest + 1) }
     }
 
-    /** A tapped arrival alert's conversation: opened if it is one of this app's own (anything else is dropped), then forgotten. */
+    /**
+     * A tapped arrival alert's conversation: opened if it is one of this app's own (anything else is dropped). The request is
+     * forgotten only once the conversation is really shown (its history read), so a failed read leaves it for the next tap.
+     */
     private fun openFromReplyAlert(storedSessionId: String) {
         val wiring = wiringOrStatus() ?: return
-        app.consumePendingOpen(storedSessionId)
-        val owned = wiring.core.sessions.activeConversation(storedSessionId) ?: return
+        val owned = wiring.core.sessions.activeConversation(storedSessionId)
+        if (owned == null) {
+            app.consumePendingOpen(storedSessionId)
+            return
+        }
         Log.i(TAG, "reply alert conversation opened alias=${owned.alias}")
-        if (_state.value.selected?.storedSessionId != storedSessionId) open(owned) else reloadSelected()
+        if (_state.value.selected?.storedSessionId != storedSessionId) open(owned) { app.consumePendingOpen(storedSessionId) }
+        else {
+            viewModelScope.launch {
+                if (refreshVisible(storedSessionId) != null) {
+                    app.consumePendingOpen(storedSessionId)
+                    app.replyAlerts.onConversationOpened(storedSessionId)
+                }
+            }
+        }
         _state.update { it.copy(chatOpenRequest = it.chatOpenRequest + 1) }
     }
 
@@ -597,7 +1070,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
                 _state.update { it.copy(status = "Sign in to Hermes first") }
                 return
             }
-            val admission = ComposerDispatch.admit(current.selected?.storedSessionId, ComposerDraft(current.draft, current.attachments), sendIds.incrementAndGet(), app.diagnostics.log)
+            val admission = ComposerDispatch.admit(current.selected?.storedSessionId, ComposerDraft(current.draft, current.attachments), app.textSends.ids.incrementAndGet(), app.diagnostics.log)
             when (admission) {
                 is SendAdmission.Refused -> {
                     admission.reason?.let { reason -> _state.update { it.copy(status = reason) } }
@@ -609,7 +1082,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
                         pendingSends = PendingSends.add(current.pendingSends, shown),
                         sendsInFlight = current.sendsInFlight + 1, status = "Sending…")
                     if (_state.compareAndSet(current, cleared)) {
-                        dispatch(wiring, admission.send)
+                        app.textSends.start(wiring.core.chat, shown, app.asyncActionOrigin(wiring))
                         return
                     }
                 }
@@ -633,42 +1106,77 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
             val admitted = current.copy(failedSends = current.failedSends.filterNot { f -> f.send.id == id },
                 pendingSends = PendingSends.add(current.pendingSends, shown), sendsInFlight = current.sendsInFlight + 1, status = "Sending…")
             if (_state.compareAndSet(current, admitted)) {
-                dispatch(wiring, failed.send)
+                if (!app.textSends.retry(wiring.core.chat, shown, app.asyncActionOrigin(wiring))) {
+                    // A different screen may already have retried/accepted this exact request.
+                    // Remove only this stale projection; never create another transport attempt.
+                    _state.update { it.copy(pendingSends = PendingSends.remove(it.pendingSends, id),
+                        sendsInFlight = maxOf(0, it.sendsInFlight - 1),
+                        status = "This request is no longer available for retry. Check the conversation") }
+                }
                 return
             }
         }
     }
 
-    fun dismissFailedSend(id: Long) = _state.update { it.copy(failedSends = it.failedSends.filterNot { f -> f.send.id == id }) }
+    fun dismissFailedSend(id: Long) {
+        app.textSends.dismissFailed(id)
+        _state.update { it.copy(failedSends = it.failedSends.filterNot { f -> f.send.id == id }) }
+    }
 
-    private fun dispatch(wiring: PhoneApp.Wiring, send: DispatchedSend) {
-        viewModelScope.launch {
-            val result = try {
-                wiring.core.chat.send(send.sessionId, send.text, send.attachments, onAccepted = {
-                    _state.update { it.copy(pendingSends = PendingSends.markDelivered(it.pendingSends, send.id)) }
-                    if (_state.value.selected?.storedSessionId == send.sessionId) reloadSelected()
-                })
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Exception) {
-                val classified = DiagClassify.of(error)
-                Log.w(TAG, "send failed cause=${classified.cause.wire}")
-                ChatSendResult.Failed("Couldn't send", cause = classified.cause)
+    private fun onSendAccepted(send: DispatchedSend) {
+        _state.update { it.copy(pendingSends = PendingSends.markDelivered(it.pendingSends, send.id)) }
+        if (_state.value.selected?.storedSessionId == send.sessionId) reloadSelected()
+    }
+
+    private fun onSendFinished(send: DispatchedSend, result: ChatSendResult, origin: PhoneApp.AsyncActionOrigin) {
+        if (!app.asyncActionCurrent(origin, authLost = result is ChatSendResult.Failed && result.authRequired)) {
+            // The app still owns the original outcome/custody. Retire only this screen's old
+            // pending projection; do not publish its status, auth loss or history into a new account.
+            _state.update { current ->
+                if (current.pendingSends.none { it.send.id == send.id }) current else current.copy(
+                    pendingSends = PendingSends.remove(current.pendingSends, send.id),
+                    sendsInFlight = maxOf(0, current.sendsInFlight - 1))
             }
-            val failed = ComposerDispatch.failure(send, result)
-            val status = ComposerDispatch.statusSafe(result)
-            _state.update {
-                val inFlight = maxOf(0, it.sendsInFlight - 1)
-                it.copy(
-                    sendsInFlight = inFlight,
-                    status = if (status.isEmpty() && inFlight > 0) it.status else status,
-                    signedIn = if (result is ChatSendResult.Failed && result.authRequired) false else it.signedIn,
-                    failedSends = if (failed != null) ComposerDispatch.withFailed(it.failedSends, failed) else it.failedSends,
-                    pendingSends = if (failed != null) PendingSends.remove(it.pendingSends, send.id) else PendingSends.markDelivered(it.pendingSends, send.id),
-                )
-            }
-            if (failed == null && _state.value.selected?.storedSessionId == send.sessionId) reloadSelected()
+            return
         }
+        val failed = ComposerDispatch.failure(send, result)
+        val status = ComposerDispatch.statusSafe(result)
+        _state.update {
+            val inFlight = maxOf(0, it.sendsInFlight - 1)
+            it.copy(
+                sendsInFlight = inFlight,
+                status = if (status.isEmpty() && inFlight > 0) it.status else status,
+                signedIn = if (result is ChatSendResult.Failed && result.authRequired) false else it.signedIn,
+                failedSends = if (failed != null) ComposerDispatch.withFailed(it.failedSends.filterNot { f -> f.send.id == send.id }, failed) else it.failedSends,
+                pendingSends = if (failed != null || (result is ChatSendResult.Failed && result.delivery == com.rumi.hermesvoice.core.SendDelivery.POSSIBLY_SENT))
+                    PendingSends.remove(it.pendingSends, send.id) else PendingSends.markDelivered(it.pendingSends, send.id),
+            )
+        }
+        if (failed == null && _state.value.selected?.storedSessionId == send.sessionId) reloadSelected()
+    }
+
+    /**
+     * Re-reads the newest page of [sessionId] and merges it into the screen, for the reply alerts: the page when the conversation is
+     * the one selected, the read succeeded and it is still in front of the user; null otherwise (nothing is then claimed as shown).
+     */
+    private suspend fun refreshVisible(sessionId: String): HistoryPage? {
+        val generation = selection.get()
+        if (_state.value.selected?.storedSessionId != sessionId) return null
+        val wiring = try {
+            app.wiring()
+        } catch (_: IllegalArgumentException) {
+            return null
+        }
+        val origin = actionOrigin(wiring)
+        val page = try {
+            wiring.core.sessions.history(sessionId, limit = HISTORY_PAGE)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return null
+        }
+        if (!mergeLatest(sessionId, generation, page, release = false, origin = origin)) return null
+        return page.takeIf { app.presence.isVisible(sessionId) }
     }
 
     // ── viewing attachments ──────────────────────────────────────────────────────────────────
@@ -682,33 +1190,66 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
         showViewer(item.name) { materialize(item.name, item.mimeType, item.bytes) }
     }
 
-    /** Fetches the stored file a message names (through the signed-in dashboard client only) and shows it; stale results are dropped. */
+    /** Render-bound source, retained by ChatTab until that exact session/body changes. */
+    internal fun attachmentOpener(sessionId: String): (HistoryMessage, AttachmentRef) -> Unit {
+        val wiring = app.existingWiring()
+        val origin = wiring?.let(app::asyncActionOrigin)
+        return { message, ref -> openAttachment(sessionId, message, ref, origin) }
+    }
+
+    /** Non-UI callers must also name a real displayed source row, never just a global file path. */
     fun openAttachment(ref: AttachmentRef) {
-        val wiring = wiringOrStatus() ?: return
-        showViewer(ref.name) {
+        val state = _state.value
+        val session = state.selected ?: return
+        if(state.historyNamespace == null || state.historyNamespace != app.bodyScope()) return
+        val message = state.history.firstOrNull { ref in com.rumi.hermesvoice.core.attachments.AttachmentRefs.extract(it.text) } ?: return
+        attachmentOpener(session.storedSessionId)(message, ref)
+    }
+
+    private fun openAttachment(sessionId: String, message: HistoryMessage, ref: AttachmentRef, origin: PhoneApp.AsyncActionOrigin?) {
+        if (origin == null || !app.asyncActionCurrent(origin) || origin.namespace == null ||
+            message.rowId < 0 || ref !in com.rumi.hermesvoice.core.attachments.AttachmentRefs.extract(message.text)) return
+        val wiring = origin.wiring
+        // All source identity is frozen before suspension. A later selection is irrelevant.
+        showViewer(ref.name, origin) {
+            // Read authority (including eligible archived history), not send/delivery authority.
+            wiring.core.sessions.history(sessionId, limit = 1)
+            if (!app.asyncActionCurrent(origin)) throw CancellationException("Attachment origin changed")
             val stored = wiring.dashboard.fetchStoredFile(ref)
+            if (!app.asyncActionCurrent(origin)) throw CancellationException("Attachment origin changed")
             materialize(ref.name.ifBlank { stored.name }, stored.mimeType, stored.bytes)
         }
     }
 
-    private fun showViewer(title: String, load: suspend () -> ViewedAttachment) {
+    private fun showViewer(title: String, origin: PhoneApp.AsyncActionOrigin? = null, load: suspend () -> ViewedAttachment) {
         val serial = viewerSerial.incrementAndGet()
         viewerJob?.cancel()
         ViewedFiles.clear(app)
         _state.update { it.copy(viewer = AttachmentViewerState(title, ViewerPhase.LOADING)) }
         viewerJob = viewModelScope.launch {
+            fun current(authLost: Boolean = false) = viewerSerial.get() == serial &&
+                (origin == null || app.asyncActionCurrent(origin, authLost))
+            var authLost = false
             val next = try {
                 AttachmentViewerState(title, ViewerPhase.READY, load())
             } catch (error: CancellationException) {
                 throw error
             } catch (error: HermesAuthRequiredException) {
+                if (!current(authLost = true)) return@launch
+                authLost = true
                 _state.update { it.copy(signedIn = false) }
                 AttachmentViewerState(title, ViewerPhase.FAILED, error = "Sign in to Hermes again to view this file")
             } catch (error: Exception) {
                 Log.w(TAG, "attachment not shown: ${error.javaClass.simpleName}")
                 AttachmentViewerState(title, ViewerPhase.FAILED, error = viewerFailure(error))
             }
-            if (viewerSerial.get() == serial) _state.update { it.copy(viewer = next) } else ViewedFiles.clear(app)
+            if (viewerSerial.get() == serial) {
+                if (current(authLost)) {
+                    _state.update { it.copy(viewer = next) }
+                    return@launch
+                }
+            }
+            next.file?.file?.delete() // Only this load's unique materialization, never a newer viewer's files.
         }
     }
 
@@ -719,11 +1260,21 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
         else -> "Could not load this file. Check the connection and try again"
     }
 
-    private suspend fun materialize(name: String, declaredMime: String, bytes: ByteArray): ViewedAttachment = withContext(Dispatchers.IO) {
-        val decision = FilePreview.classify(name, declaredMime, bytes)
-        val text = if (decision.kind == PreviewKind.TEXT) FilePreview.textPreview(bytes) else null
-        val kind = if (decision.kind == PreviewKind.TEXT && text == null) PreviewKind.OTHER else decision.kind
-        ViewedAttachment(name, decision.mimeType, kind, bytes.size, text, ViewedFiles.write(app, name, bytes), bytes)
+    private suspend fun materialize(name: String, declaredMime: String, bytes: ByteArray): ViewedAttachment {
+        // Keep ownership outside the IO return: prompt cancellation can discard its result.
+        var owned: java.io.File? = null
+        try {
+            return withContext(Dispatchers.IO) {
+                val decision = FilePreview.classify(name, declaredMime, bytes)
+                val text = if (decision.kind == PreviewKind.TEXT) FilePreview.textPreview(bytes) else null
+                val kind = if (decision.kind == PreviewKind.TEXT && text == null) PreviewKind.OTHER else decision.kind
+                val file = ViewedFiles.write(app, name, bytes).also { owned = it }
+                ViewedAttachment(name, decision.mimeType, kind, bytes.size, text, file, bytes)
+            }
+        } catch (error: Throwable) {
+            runCatching { owned?.delete() } // Only this load's file, even if a newer viewer has already opened.
+            throw error
+        }
     }
 
     fun closeViewer() {
@@ -1118,6 +1669,15 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
         _state.update { it.copy(themeMode = mode) }
     }
 
+    /** Sets this phone's text size (percent of the system font scale; bounded and put on a step before it is saved). */
+    fun setFontScalePercent(percent: Int) {
+        val saved = PhoneDisplaySettings.sanitize(percent.toString())
+        app.display.fontScalePercent = saved
+        _state.update { it.copy(fontScalePercent = saved) }
+    }
+
+    fun resetFontScale() = setFontScalePercent(PhoneDisplaySettings.DEFAULT)
+
     fun refreshWatchStatus() {
         viewModelScope.launch {
             val reachable = runCatching { WatchPresence.reachable(getApplication()) }.getOrDefault(false)
@@ -1162,6 +1722,8 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
     }
 
     override fun onCleared() {
+        app.textSends.detach(sendScreen)
+        if (app.conversationDisplay === display) app.conversationDisplay = null
         viewerJob?.cancel()
         ViewedFiles.clear(app)
         // Manual capture and its headset target belong to the Application/service, never this screen.
@@ -1173,6 +1735,9 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
 
     companion object {
         const val HISTORY_PAGE = 50
+
+        /** Raw pages read in one older-history request while they hold no shown message. */
+        private const val MAX_OLDER_STEPS = 4
 
         /** Waits before each re-read of the history for a just-arrived final reply (the last one releases its bubble regardless). */
         private val FINAL_LOOKUP_WAITS_MS = longArrayOf(0, 400, 1_000, 2_500).toList()

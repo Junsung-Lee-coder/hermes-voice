@@ -14,12 +14,13 @@
 
 </div>
 
-Hermes Voice is an experimental Android app with a Wear OS companion. The Phone signs in to a compatible [Hermes](#how-it-works) dashboard and manages the conversations the app creates. The Watch records on the watch itself, reads those conversations and plays replies, and it relies on the paired Phone to relay its requests to Hermes. It never connects to Hermes directly.
+Hermes Voice is an experimental Android app with a Wear OS companion. The Phone signs in to a compatible [Hermes](#how-it-works) dashboard and manages the conversations the app creates, plus existing Hermes sessions whose `created_source` was set to the app's marker. The Watch records on the watch itself, reads those conversations and plays replies, and it relies on the paired Phone to relay its requests to Hermes. It never connects to Hermes directly.
 
 ## Features
 
 - **Text chat** with attachments (up to 6 per message, 10 MiB each) and paged conversation history.
 - **Manual voice**: tap to toggle recording on the Phone, or use a one-second long press on the Watch. Speech is transcribed and spoken back using the speech providers configured on your dashboard.
+- **Sessions made elsewhere**: a session started in the terminal, Desktop or Discord shows up here after its `created_source` is set to `recorder-phone` on the server. See [Sessions made elsewhere](#sessions-made-elsewhere).
 - **Voice routing** (on by default, can be turned off): a spoken request is routed to one of your conversations by its voice alias, and the router may propose a new conversation. With routing off, requests go to the conversation selected on the sending device.
 - **Optional hands-free use**: a wake phrase, listening in the background, and later replies. All are off by default.
 - **Settings on both devices**: appearance, which replies are spoken, and the wake phrase and Watch options, which are set on the Phone and synced to the Watch.
@@ -33,7 +34,7 @@ Watch  ──Wear Data Layer──▶  Phone  ──HTTPS / WebSocket──▶  
                               voice routing)
 ```
 
-- The Phone authenticates with the dashboard and calls its APIs directly. Each conversation is a dashboard session that the app created and lists only if it is in the Phone's local registry.
+- The Phone authenticates with the dashboard and calls its APIs directly. Each conversation is a dashboard session whose `created_source` is the app's marker, and the app uses a session only while the server shows that marker; the Phone's local registry only keeps its voice name and archived state.
 - The Watch exchanges messages only with its paired Phone, which relays its requests to Hermes. It stores no dashboard credentials and never connects to Hermes directly.
 - Speech uses the dashboard's configured speech-to-text and text-to-speech. If a provider is unavailable or misconfigured, voice turns can fail.
 
@@ -55,6 +56,17 @@ The sign-in token is stored with an Android Keystore key, excluded from backup a
 - **Watch reader.** The Watch shows your app-owned conversations. Swipe left to switch between the list and the open conversation, and swipe right or press Back to send the app to the background. It keeps at most 200 messages per conversation, and older ones are on the Phone.
 - **Wake phrase** (off by default, set on the Phone). **Listen on** chooses Off, Watch, Phone or Both. Phrases are shared by both devices. By default it listens only while that device's app is open.
 - **Background use** (all off by default). The Phone can keep listening with the app closed or the screen off, and the Watch can keep a background session. This needs an on-device speech recognizer, shows a notification with **Stop**, and starts only from the open app.
+
+## Sessions made elsewhere
+
+Hermes keeps two labels on every session. `source` says which client the session is routed through now (`discord`, `tui`, `recorder-phone`, ...) and other clients can change it. `created_source` is written once when the row is created and is kept. The app decides by `created_source` alone: a session is listed and usable when its `created_source` is `recorder-phone` (the marker), whatever its `source` says. `source`, a local registration and an earlier conversation of this app never stand in for it. Conversations made in this version carry the marker already; ones made by earlier builds whose `created_source` is empty or different need it set by hand.
+
+- **Using a session made elsewhere.** Someone with write access to the Hermes database sets that session's `created_source` to `recorder-phone` (see [docs/created-source-marker.md](docs/created-source-marker.md) for the backup, transaction, checks and rollback). On the next Refresh or launch the Phone adds it with its existing history, gives it a voice alias made from its title (a short suffix is added when that alias is taken) and saves it in the local registry in one write. The app creates, copies, renames and sends nothing, and changes neither `source` nor Discord routing. The Watch shows a session only after the Phone has added it.
+- **What the marker means.** It makes a session eligible; it does not mean this app created it, and the app does not say so. Setting `created_source` by hand replaces the record of where the session began, so do it only for sessions you mean to use here, and keep a backup. Do not mark scheduled-job, Kanban, sub-agent, routing or other internal sessions. The hidden routing session is told apart by its own `created_source` (`recorder-phone-router`), never by its current `source`.
+- **After it is added.** The local registry keeps the alias and the exact id. `source` no longer matters: a listed session stays usable when Discord or another client changes it. If the marker is taken off, the next send or voice request to it is refused and it leaves the list and the voice destinations; the registry entry (its place among the 100 and its alias) is kept and the session returns when the marker does. A turn that was already accepted is not cancelled by this.
+- **Compression.** When Hermes compresses a conversation, the list shows its newest part. The app follows it only through the server's own compression link (parent ended with reason `compression`, child started at or after that), and the marker is read from the root of that chain, so put it on the original (root) session. An id selected before a compression is not moved automatically.
+- **Older servers and gaps.** Without a `created_source` value (an older server, or an empty value) a session is not added or used, including conversations made in this app and ones whose `source` is `recorder-phone`. The app sends no `source` filter; the dashboard's list leaves out hidden rows, sub-agent runs and compression continuations. The app reads the dashboard's sessions page by page to the end of its list, shows each conversation as soon as its page has been read, and says when reading stopped early. At most 100 conversations are active; further marked sessions are counted and left out until one is archived. Archived sessions are not added.
+- **A session in use elsewhere.** Only one Hermes process can write to a session at a time. When the terminal or another Hermes runtime is using it, a send is refused with "currently in use in the TUI or another Hermes runtime. Release or close it there and retry." The text stays in the failed-send list for retry and nothing was sent. The app does not take the session over, send it elsewhere or resend it by itself. A send from this app does not guarantee a Discord broadcast or physical delivery. A timeout while opening a session is reported as a timeout, not as in use.
 
 ## Headset mode
 

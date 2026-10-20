@@ -21,6 +21,9 @@ import com.google.android.gms.wearable.MessageEvent
 import com.google.android.gms.wearable.Node
 import com.google.android.gms.wearable.Wearable
 import com.rumi.hermesvoice.core.notify.ReplyAlert
+import com.rumi.hermesvoice.core.watchlink.ReaderMessageRow
+import com.rumi.hermesvoice.core.watchlink.ReaderRequest
+import com.rumi.hermesvoice.core.watchlink.ReaderResponse
 import com.rumi.hermesvoice.core.watchlink.ReaderSurface
 import com.rumi.hermesvoice.core.watchlink.WatchLinkPaths
 import io.mockk.every
@@ -29,6 +32,7 @@ import io.mockk.mockkStatic
 import io.mockk.unmockkAll
 import java.time.Duration
 import java.util.Collections
+import java.util.concurrent.ConcurrentLinkedQueue
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -63,6 +67,7 @@ class WatchLegacyAlertDismissRoboTest {
     private val sent: MutableList<Triple<String, String, ByteArray>> = Collections.synchronizedList(mutableListOf())
     private var controller: ActivityController<WatchActivity>? = null
     private var n = 0
+    private val requests = ConcurrentLinkedQueue<ReaderRequest>()
 
     private val phone = "phone-node"
     private val work = "20260101_120000_workwork"
@@ -81,6 +86,7 @@ class WatchLegacyAlertDismissRoboTest {
         every { capability.getCapability(any(), any()) } returns Tasks.forResult(info)
         val messages = mockk<MessageClient>()
         every { messages.sendMessage(any(), any(), any()) } answers {
+            if (secondArg<String>() == WatchLinkPaths.READER_REQUEST) ReaderRequest.decode(thirdArg<ByteArray>())?.let(requests::add)
             sent += Triple(firstArg<String>(), secondArg<String>(), thirdArg<ByteArray>())
             Tasks.forResult(1)
         }
@@ -93,7 +99,20 @@ class WatchLegacyAlertDismissRoboTest {
         every { Wearable.getDataClient(any<Context>()) } returns data
     }
 
-    private fun idle(ms: Long = 50) = shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(ms))
+    /** The Phone answers every reader request with a conversation that ends with the assistant's message (review F08: dismissal needs a successful re-read). */
+    private fun pump() {
+        while (true) {
+            val request = requests.poll() ?: break
+            val rows = listOf(ReaderMessageRow(1, "user", "question", false), ReaderMessageRow(2, "assistant", "answer", false))
+            app.onReaderResponse(phone, ReaderResponse(request.reqId, request.kind, true, sessionId = request.sessionId, messages = rows, nextOffset = 2).encode())
+        }
+    }
+
+    private fun idle(ms: Long = 50) {
+        pump()
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(ms))
+        pump()
+    }
     private fun settle() = repeat(8) { idle(50); Thread.sleep(25) }
     private fun await(timeoutMs: Long = 5000, condition: () -> Boolean): Boolean {
         val end = System.currentTimeMillis() + timeoutMs

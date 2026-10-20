@@ -68,6 +68,7 @@ import com.rumi.hermesvoice.core.watchlink.WatchPhase
 import com.rumi.hermesvoice.core.watchlink.WatchTalkState
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.collect
 
 /**
  * Root horizontal-swipe detector. It watches the Final pass, after the lists and buttons had
@@ -263,6 +264,16 @@ fun ChatSurface(
     }
 }
 
+/** Production reader with a placement/foreground acknowledgement, separate from a fetch. */
+@Composable
+fun ReceivedChatSurface(title: String, history: ReaderHistory, focusRequester: FocusRequester,
+    onOlder: () -> Unit, onRetry: () -> Unit, onScrollStep: () -> Unit,
+    onDisplayed: (List<ReaderMessageRow>) -> Unit, talkStatus: @Composable () -> Unit) {
+    key(history.sessionId) {
+        ChatSurfaceContent(title, history, focusRequester, onOlder, onRetry, onScrollStep, talkStatus, onDisplayed)
+    }
+}
+
 @Composable
 private fun ChatSurfaceContent(
     title: String,
@@ -272,8 +283,23 @@ private fun ChatSurfaceContent(
     onRetry: () -> Unit,
     onScrollStep: () -> Unit,
     talkStatus: @Composable () -> Unit,
+    onDisplayed: (List<ReaderMessageRow>) -> Unit = {},
 ) {
     val listState = rememberLazyListState()
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var resumed by remember { mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, _ -> resumed = lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    LaunchedEffect(history.sessionId, history.messages, resumed) {
+        if (resumed) {
+            androidx.compose.runtime.withFrameNanos { }
+            snapshotFlow { listState.layoutInfo.visibleItemsInfo.filter { it.size > 0 && it.offset < listState.layoutInfo.viewportEndOffset && it.offset + it.size > listState.layoutInfo.viewportStartOffset }.map { it.key }.toSet() }
+                .collect { keys -> onDisplayed(history.messages.filter { it.rowId in keys }) }
+        }
+    }
     val ids = history.messages.map { it.rowId }
     var previousIds by remember(history.sessionId) { mutableStateOf(emptyList<Long>()) }
     LaunchedEffect(history.sessionId, ids) {
@@ -352,15 +378,19 @@ fun SessionsSurface(
                     StatusText(readerErrorText(sessions.error), error = true)
                     CompactChip(onClick = onRefresh, label = { Text("Retry") }, colors = ChipDefaults.secondaryChipColors())
                 }
-                LoadStatus.READY -> if (sessions.rows.isEmpty()) StatusText("No conversations. Create one on the phone.")
+                LoadStatus.READY -> when {
+                    sessions.notice != null -> StatusText(sessions.notice.orEmpty())
+                    sessions.rows.isEmpty() -> StatusText("No conversations. Create one on the phone.")
+                }
                 LoadStatus.IDLE -> Unit
             }
         }
+        sessions.alertNotice?.let { note -> item(key = "alert_pending") { StatusText(note, error = true) } }
         items(sessions.rows, key = { it.id }) { row ->
             Chip(
                 onClick = { onSelect(row.id) },
-                label = { Text(row.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                secondaryLabel = { Text(row.preview.ifBlank { row.alias }, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                label = { Text(row.title, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    fontWeight = if (row.unread) androidx.compose.ui.text.font.FontWeight.Bold else androidx.compose.ui.text.font.FontWeight.Normal) },
                 colors = if (row.id == selectedId) ChipDefaults.primaryChipColors() else ChipDefaults.secondaryChipColors(),
                 modifier = Modifier.fillMaxWidth().testTag("session_${row.alias}"),
             )
@@ -392,8 +422,10 @@ private fun ClearWatchLogChip(clear: suspend () -> Boolean) {
 }
 
 /** What a press does now, or what the voice request is doing: recording, sending, waiting, the wake phrase. */
-fun talkHint(talk: WatchTalkState, wakeListening: Boolean): String = when {
+fun talkHint(talk: WatchTalkState, wakeListening: Boolean, failure: String? = null): String = when {
     talk.phase == WatchPhase.RECORDING -> "● Recording · hold 1 s to send"
+    failure != null -> failure
+    talk.notice.isNotBlank() -> if (talk.line.isNotBlank() && talk.line != talk.notice) "${talk.notice} · ${talk.line}" else talk.notice
     talk.line.isNotBlank() -> if (talk.waitingCount > 1) "${talk.line} · ${talk.waitingCount} waiting" else talk.line
     wakeListening -> "Listening for the wake phrase…"
     talk.waitingCount > 0 -> "${talk.waitingCount} waiting for a reply · hold 1 s to talk"
@@ -402,7 +434,8 @@ fun talkHint(talk: WatchTalkState, wakeListening: Boolean): String = when {
 
 /** The home screen when no conversation is open: status lines only; the talk gesture covers the whole screen. */
 @Composable
-fun TalkHome(phone: Boolean?, talk: WatchTalkState, wakeEnabled: Boolean, wakeListening: Boolean, wakeUnavailable: Boolean, onReplay: () -> Unit = {}) {
+fun TalkHome(phone: Boolean?, talk: WatchTalkState, wakeEnabled: Boolean, wakeListening: Boolean, wakeUnavailable: Boolean, onReplay: () -> Unit = {},
+             failure: String? = null) {
     Column(Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 14.dp),
         horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterVertically)) {
         Text(
@@ -417,7 +450,7 @@ fun TalkHome(phone: Boolean?, talk: WatchTalkState, wakeEnabled: Boolean, wakeLi
         val recording = talk.phase == WatchPhase.RECORDING
         Text(
             when {
-                recording || talk.line.isNotBlank() || wakeListening -> talkHint(talk, wakeListening)
+                recording || failure != null || talk.line.isNotBlank() || talk.notice.isNotBlank() || wakeListening -> talkHint(talk, wakeListening, failure)
                 wakeEnabled && wakeUnavailable -> "Wake phrase unavailable on this watch. Hold 1 s to talk"
                 wakeEnabled -> "Say the wake phrase, or hold 1 s to talk"
                 else -> "Hold anywhere 1 s to talk"
@@ -434,11 +467,11 @@ fun TalkHome(phone: Boolean?, talk: WatchTalkState, wakeEnabled: Boolean, wakeLi
 
 /** One compact line over the bottom of the chat: recording, the request's progress, or the hold hint. */
 @Composable
-fun TalkStatusLine(talk: WatchTalkState, wakeListening: Boolean, onReplay: () -> Unit = {}) {
+fun TalkStatusLine(talk: WatchTalkState, wakeListening: Boolean, onReplay: () -> Unit = {}, failure: String? = null) {
     val recording = talk.phase == WatchPhase.RECORDING
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
     if (talk.replayTurnId != null) PlayAgainChip(onReplay)
-    Text(talkHint(talk, wakeListening),
+    Text(talkHint(talk, wakeListening, failure),
         Modifier.background(Color(0xCC000000), RoundedCornerShape(8.dp)).padding(horizontal = 6.dp, vertical = 2.dp).testTag("talk_status"),
         color = if (recording) MaterialTheme.colors.error else MaterialTheme.colors.onSurfaceVariant,
         style = MaterialTheme.typography.caption3, maxLines = 2, textAlign = TextAlign.Center)

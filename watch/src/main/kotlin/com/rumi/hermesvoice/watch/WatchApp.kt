@@ -71,6 +71,7 @@ import com.rumi.hermesvoice.core.diag.PhoneUnreachableException
 import com.rumi.hermesvoice.core.watchlink.TurnStateMessage
 import com.rumi.hermesvoice.core.watchlink.TurnTrigger
 import com.rumi.hermesvoice.core.watchlink.WatchHapticPolicy
+import com.rumi.hermesvoice.core.sessions.ReadRetryBudget
 import com.rumi.hermesvoice.core.watchlink.WatchLinkPaths
 import com.rumi.hermesvoice.core.watchlink.WatchNavigation
 import com.rumi.hermesvoice.core.watchlink.WatchNavigationGuard
@@ -88,14 +89,25 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import org.json.JSONArray
+import org.json.JSONObject
+import com.rumi.hermesvoice.core.watchlink.ReaderSessionsState
+import com.rumi.hermesvoice.core.watchlink.LoadStatus
+import com.rumi.hermesvoice.core.watchlink.ReaderError
 
 /**
  * Watch process state. The Watch never talks to Hermes: it uploads captured WAVs to the Phone,
@@ -138,6 +150,114 @@ class WatchApp : Application() {
 
     /** The Phone node each pending reader request went to; a response from any other node is ignored. */
     private val readerTargets = ConcurrentHashMap<String, String>()
+
+    private val readerTitleWrites = Mutex()
+    private val readerTitleEpoch = java.util.concurrent.atomic.AtomicLong()
+    @Volatile private var readerTitlePhone: String? = null
+    @Volatile private var readerTitleScope: String? = null
+    @Volatile private var readerBodyScope: String? = null
+    private val bodyGeneration = java.util.concurrent.atomic.AtomicLong()
+    private val receivedFinals by lazy {
+        WatchFinalIntake(this, {
+            val phone = readerTitlePhone; val account = readerBodyScope
+            if (phone == null || account == null) null else phone to account
+        }, { presence.isVisible(it) }, { note -> _reader.update { it.copy(sessions = it.sessions.copy(alertNotice = note)) } }, { ids ->
+            _reader.update { state -> state.copy(sessions = state.sessions.copy(rows = state.sessions.rows.map { if(it.id in ids) it.copy(unread = true) else it })) }
+            saveReaderTitles()
+            loadSessions() // Retire older list requests before reading the Phone's receive/read knowledge.
+        })
+    }
+    private val READER_TITLES_KEY = "reader_session_titles_v1"
+    private val recentBodies by lazy {
+        com.rumi.hermesvoice.core.sessions.RecentBodies(localStore, "reader_bodies_v1", {
+            val phone = readerTitlePhone
+            val account = readerBodyScope
+            if (phone == null || account == null) null else "$phone|$account"
+        }, scope) {
+            _reader.update { it.copy(sessions = it.sessions.copy(notice = "Recent messages not saved for next start")) }
+        }
+    }
+
+    /** Only last-known display metadata; no prompts, aliases, previews, history or auth material. */
+    private fun hydrateReaderTitles() {
+        runCatching {
+            val saved = JSONObject(localStore.getString(READER_TITLES_KEY) ?: return)
+            if (saved.optInt("v") != 1) return
+            val phone = saved.getString("phone").takeIf { it.isNotBlank() && it.length <= 256 } ?: return
+            val scope = saved.getString("scope").takeIf { it.matches(Regex("[a-f0-9]{64}")) } ?: return
+            val data = saved.getJSONArray("rows")
+            if (data.length() > WatchReaderLimits.MAX_SESSIONS) return
+            val rows = (0 until data.length()).map { i ->
+                val row = data.getJSONObject(i)
+                val id = row.getString("id")
+                require(com.rumi.hermesvoice.core.voice.DestinationAllowlist.isValidSessionId(id))
+                ReaderSessionRow(id, row.getString("title").take(WatchReaderLimits.MAX_TITLE_CHARS), "", "",
+                    row.optDouble("last_active", 0.0).takeIf { it.isFinite() } ?: 0.0, row.optBoolean("unread"))
+            }.distinctBy { it.id }
+            readerTitlePhone = phone
+            readerTitleScope = scope
+            readerBodyScope = saved.optString("body_scope").takeIf { it.matches(Regex("[a-f0-9]{64}")) }?:scope
+            _reader.value = _reader.value.copy(sessions = ReaderSessionsState(rows, LoadStatus.READY,
+                notice = if (rows.isEmpty()) null else "Saved conversations"))
+        }
+    }
+
+    /** Immediate state/request fence; the small disk clear is serialized off the main thread. */
+    private fun invalidateReaderTitles(phone: String? = readerTitlePhone, scope: String? = null, clearState: Boolean = true) {
+        bodyGeneration.incrementAndGet()
+        receivedFinals.invalidate()
+        recentBodies.invalidate()
+        readerTitlePhone = phone
+        readerTitleScope = scope
+        readerBodyScope = scope
+        val epoch = readerTitleEpoch.incrementAndGet()
+        if (clearState) {
+            readerTargets.clear()
+            updateReader { WatchReaderState(surface = ReaderSurface.SESSIONS) }
+        }
+        this.scope.launch(Dispatchers.IO) {
+            readerTitleWrites.withLock {
+                if (readerTitleEpoch.get() != epoch) return@withLock
+                val ok = try { localStore.commitString(READER_TITLES_KEY, "{}") }
+                    catch (cancelled: CancellationException) { throw cancelled }
+                    catch (_: Exception) { false }
+                if (!ok) Log.w(TAG, "Reader title invalidation was not saved")
+            }
+        }
+    }
+
+    /** A capability/query result is an observed Phone node, not proof of its Hermes account. */
+    private fun observeReaderPhone(node: String) {
+        if (readerTitlePhone != null && readerTitlePhone != node) invalidateReaderTitles(phone = node)
+        else readerTitlePhone = node
+    }
+
+    private fun saveReaderTitles() {
+        val phone = readerTitlePhone ?: return
+        val namespace = readerTitleScope ?: return // old peer: no invented endpoint/account binding
+        val bodyNamespace = readerBodyScope
+        val epoch = readerTitleEpoch.incrementAndGet()
+        val rows = _reader.value.sessions.rows.take(WatchReaderLimits.MAX_SESSIONS)
+        scope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                readerTitleWrites.withLock {
+                    if (readerTitleEpoch.get() != epoch) return@withLock null
+                    val saved = JSONObject().put("v", 1).put("phone", phone).put("scope", namespace)
+                        .put("body_scope",bodyNamespace?:JSONObject.NULL)
+                        .put("rows", JSONArray().apply { rows.forEach {
+                            put(JSONObject().put("id", it.id).put("title", it.title.take(WatchReaderLimits.MAX_TITLE_CHARS))
+                                .put("last_active", it.lastActive).put("unread", it.unread))
+                        } })
+                    try { localStore.commitString(READER_TITLES_KEY, saved.toString()) }
+                    catch (cancelled: CancellationException) { throw cancelled }
+                    catch (_: Exception) { false }
+                }
+            }
+            if (ok == false && readerTitleEpoch.get() == epoch) updateReader {
+                it.copy(sessions = it.sessions.copy(error = "cache_not_saved", notice = "List not saved for next start"))
+            }
+        }
+    }
 
     /**
      * Phone-told conversation moves ([onNavigation]) are applied only for a request this Watch started and only while the user has
@@ -184,13 +304,23 @@ class WatchApp : Application() {
         // Durable migration: a copy from before the wake-location selector (or an unreadable one) is rewritten once.
         if (stored != null && stored != replica.current.toJson()) prefs.edit().putString(KEY_SETTINGS, replica.current.toJson()).apply()
         _settings.value = replica.current
+        hydrateReaderTitles()
+        // A final intake can commit before an unrelated title writer. Recover its own binding,
+        // but never cross an explicit title-clear tombstone or replace a known newer scope.
+        if (readerTitlePhone == null && localStore.getString(READER_TITLES_KEY) == null) runCatching {
+            val saved = JSONObject(localStore.getString(WatchFinalIntake.KEY) ?: "{}")
+            val phone = saved.optString("phone").takeIf { it.isNotBlank() && it.length <= 256 }
+            val account = saved.optString("scope").takeIf { it.matches(Regex("[a-f0-9]{64}")) }
+            if (phone != null && account != null) { readerTitlePhone = phone; readerBodyScope = account }
+        }
         WatchVoiceService.createChannel(this)
         WatchReplyAlertNotifier.createChannel(this)
+        hydrateOwedFailure()
         voice = WatchVoiceRuntime(this)
         // The Phone's reachability is kept current by the platform's own capability events (no polling before a window).
         runCatching {
             Wearable.getCapabilityClient(this).addListener(
-                CapabilityClient.OnCapabilityChangedListener { info -> _phoneReachable.value = info.nodes.any { it.isNearby } },
+                CapabilityClient.OnCapabilityChangedListener { info -> setPhoneReachable(info.nodes.firstOrNull { it.isNearby }?.id) },
                 WatchLinkPaths.CAPABILITY_PHONE,
             )
         }.onFailure { Log.w(TAG, "capability listener unavailable: ${it.javaClass.simpleName}") }
@@ -235,13 +365,77 @@ class WatchApp : Application() {
     val phoneReachable: StateFlow<Boolean?> = _phoneReachable
 
     suspend fun refreshPhoneReachable() {
-        _phoneReachable.value = phoneNode() != null
+        setPhoneReachable(phoneNode())
     }
 
-    private suspend fun phoneNode(): String? = runCatching {
+    /** Whether the Phone is reachable now; each time it becomes reachable, the "not sent" states it owes this Watch are asked for. */
+    private fun setPhoneReachable(node: String?) {
+        if (node != null) observeReaderPhone(node)
+        val before = _phoneReachable.value
+        _phoneReachable.value = node != null
+        if (node != null && before != true) scope.launch {
+            receivedFinals.recover()
+            if (_reader.value.sessions.pendingReqId == null) loadSessions()
+            runCatching {
+                withTimeoutOrNull(PROGRESS_SEND_MS) {
+                    Wearable.getMessageClient(this@WatchApp).sendMessage(node, WatchLinkPaths.STATE_SYNC, ByteArray(0)).await()
+                }
+            }
+        }
+    }
+
+    /** The Phone's "not sent" states this Watch owes the person a look at, and those already shown (durable, checked commits). */
+    private val failureInbox by lazy { com.rumi.hermesvoice.core.watchlink.WatchFailureInbox(localStore) }
+
+    private val _owedFailure = MutableStateFlow<com.rumi.hermesvoice.core.watchlink.WatchFailureInbox.Owed?>(null)
+
+    /** The oldest "not sent" state not yet shown on screen, with its exact request id; null when nothing is owed. */
+    val owedFailure: StateFlow<com.rumi.hermesvoice.core.watchlink.WatchFailureInbox.Owed?> = _owedFailure.asStateFlow()
+
+    /** Reads what the durable inbox still owes the screen (also after the app was recreated). */
+    fun hydrateOwedFailure() {
+        _owedFailure.value = failureInbox.pending().firstOrNull()
+    }
+
+    /**
+     * The screen showed the owed failure [turnId] (resumed activity, status text composed). Only now is it settled, durably, and only
+     * when that is saved is the Phone acknowledged, to the Phone node it came from.
+     */
+    fun onFailureDisplayed(turnId: String) {
+        val entry = failureInbox.pending().firstOrNull { it.turnId == turnId } ?: return hydrateOwedFailure()
+        val saved = failureInbox.displayed(turnId)
+        hydrateOwedFailure()
+        if (saved) acknowledgeFailure(turnId, entry.source)
+    }
+
+    private fun acknowledgeFailure(turnId: String, sourceNodeId: String?) {
+        scope.launch {
+            val node = sourceNodeId ?: phoneNode() ?: return@launch
+            runCatching {
+                withTimeoutOrNull(PROGRESS_SEND_MS) {
+                    Wearable.getMessageClient(this@WatchApp).sendMessage(node, WatchLinkPaths.STATE_ACK, TurnStateMessage(turnId, "ack", "", true).encode()).await()
+                }
+            }
+        }
+    }
+
+    private suspend fun lookUpPhone(): String? =
         Wearable.getCapabilityClient(this).getCapability(WatchLinkPaths.CAPABILITY_PHONE, CapabilityClient.FILTER_REACHABLE)
             .await().nodes.firstOrNull { it.isNearby }?.id
-    }.getOrNull()
+
+    private suspend fun phoneNode(): String? = runCatching { lookUpPhone() }.getOrNull()
+
+    /**
+     * One Data Layer call as a value. A Task that was itself cancelled throws a CancellationException although this coroutine is still
+     * active (a transport failure, not ours to propagate); but when THIS coroutine was cancelled that is thrown at once, even if the Task
+     * had already failed, so a cancelled refresh never goes on to publish a failure or send again.
+     */
+    private suspend fun <T> dataLayerCall(call: suspend () -> T): Result<T> = try {
+        Result.success(call()).also { currentCoroutineContext().ensureActive() }
+    } catch (error: Exception) {
+        currentCoroutineContext().ensureActive()
+        Result.failure(error)
+    }
 
     fun newTurn(trigger: TurnTrigger): String? {
         val turnId = UUID.randomUUID().toString()
@@ -504,7 +698,25 @@ class WatchApp : Application() {
         }
     }
 
-    fun onPhoneState(message: TurnStateMessage) {
+    /**
+     * The Phone's state for a request. A "not sent" end is kept as owed (durably) until the screen reports it was shown, then it is
+     * settled and acknowledged to [sourceNodeId] (the Phone node it came from); a repeat of a shown one is only acknowledged again,
+     * a repeat of one not yet shown is shown again. The Phone keeps owing it until it is acknowledged.
+     */
+    fun onPhoneState(message: TurnStateMessage, sourceNodeId: String? = null) {
+        val failure = message.terminal && WatchTalkState.isRetainedFailure(message.detail)
+        if (!failure) return applyPhoneState(message)
+        when (failureInbox.receive(message.turnId, message.detail, sourceNodeId)) {
+            com.rumi.hermesvoice.core.watchlink.WatchFailureInbox.Receipt.SHOWN_AND_SAVED -> acknowledgeFailure(message.turnId, sourceNodeId)
+            com.rumi.hermesvoice.core.watchlink.WatchFailureInbox.Receipt.SHOWN_NOT_SAVED -> Unit
+            com.rumi.hermesvoice.core.watchlink.WatchFailureInbox.Receipt.OWED -> {
+                applyPhoneState(message)
+                hydrateOwedFailure()
+            }
+        }
+    }
+
+    private fun applyPhoneState(message: TurnStateMessage) {
         Log.i(TAG, "phone state turn=${message.turnId.take(12)} stage=${message.stage} terminal=${message.terminal}")
         val ownTurn = message.turnId == _talk.value.turnId || message.turnId in _talk.value.earlier
         // The Phone answered this turn: its wake claim was used up (or, if the turn ended there, is given back).
@@ -563,6 +775,11 @@ class WatchApp : Application() {
 
     // ── conversation reader ──────────────────────────────────────────────────────────────────
 
+    /** Saved READY (even empty) is not a current Phone read. Keep an existing request's custody. */
+    fun refreshSessionTitlesOnResume() {
+        if (_reader.value.sessions.pendingReqId == null) loadSessions()
+    }
+
     fun loadSessions() {
         val reqId = newRequestId()
         updateReader { it.requestSessions(reqId) }
@@ -578,7 +795,46 @@ class WatchApp : Application() {
     private val replyNotifier by lazy { WatchReplyAlertNotifier(this) }
 
     /** A conversation is "opened" only when it is the one shown on the chat surface AND the Watch app is in the foreground. */
-    val presence: ConversationPresence by lazy { ConversationPresence().also { it.onOpened = { id -> replyNotifier.dismissConversation(id) } } }
+    val presence: ConversationPresence by lazy {
+        ConversationPresence().also {
+            // Its stacked alerts go only once the conversation's history was read successfully again.
+            it.onOpened = { id -> dismissAfterVisibleRead(id, fresh = true) }
+        }
+    }
+
+    /**
+     * The history of [sessionId] (the selected conversation) was read again and the read succeeded; waits until no read of it is pending
+     * (a newer request that replaces the pending one is waited for too), else asks for one. Bounded.
+     */
+    private val openingReads = java.util.concurrent.atomic.AtomicLong()
+
+    private fun dismissAfterVisibleRead(sessionId: String, fresh: Boolean) {
+        val opening = openingReads.incrementAndGet()
+        val generation = presence.generation
+        if (!presence.isVisible(sessionId)) return
+        // A return to CHAT/foreground must not reuse a request of an earlier opening.
+        if (fresh) refreshSelected()
+        scope.launch {
+            if (readVisibleHistory(sessionId) && openingReads.get() == opening) {
+                presence.ifVisible(sessionId, generation) {
+                    if (openingReads.get() == opening) replyNotifier.dismissConversation(sessionId)
+                }
+            }
+        }
+    }
+
+    private suspend fun readVisibleHistory(sessionId: String): Boolean {
+        if (_reader.value.selectedSessionId != sessionId || !presence.isVisible(sessionId)) return false
+        if (_reader.value.historyFor(sessionId)?.pendingReqId == null) refreshSelected()
+        if (_reader.value.historyFor(sessionId)?.pendingReqId != null) {
+            withTimeoutOrNull(WatchReaderLimits.REQUEST_TIMEOUT_MS + READ_WAIT_SLACK_MS) {
+                _reader.first { it.selectedSessionId != sessionId || it.historyFor(sessionId)?.pendingReqId == null }
+            } ?: return false
+        }
+        if (_reader.value.selectedSessionId != sessionId || !presence.isVisible(sessionId)) return false
+        val history = _reader.value.historyFor(sessionId)
+        return history != null && history.status == com.rumi.hermesvoice.core.watchlink.LoadStatus.READY && history.error == null
+    }
 
     private fun updateReader(change: (WatchReaderState) -> WatchReaderState) {
         _reader.update(change)
@@ -593,23 +849,44 @@ class WatchApp : Application() {
     fun onForeground(foreground: Boolean) {
         syncPresence()
         presence.setForeground(foreground)
+        if (foreground) receivedFinals.recover()
+    }
+
+    fun contentDisplayed(id: String, messages: List<ReaderMessageRow>) = receivedFinals.displayed(id, messages)
+    fun onSessionFinalReceipt(node: String, bytes: ByteArray) = receivedFinals.acknowledged(node, bytes)
+
+    fun onSessionFinals(node: String, bytes: ByteArray) {
+        if (bytes.size > 60_000) return
+        val json = runCatching { JSONObject(String(bytes, Charsets.UTF_8)) }.getOrNull() ?: return
+        if (json.optInt("v") != 1) return
+        val rows = json.optJSONArray("finals") ?: return
+        receivedFinals.receive(node, json.optString("scope"), (0 until minOf(rows.length(),100)).map { rows.getJSONObject(it) })
     }
 
     /**
      * The Phone says a final answer for this Watch arrived without audio ([ReplyAlertMessage]): this Watch alone shows the alert
      * (local-only; the Phone showed none). A repeat of the same identity does nothing. Returns what was decided (null: not valid).
      */
-    fun onReplyAlert(bytes: ByteArray): ReplyAlertResult? {
+    suspend fun onReplyAlert(bytes: ByteArray): ReplyAlertResult? {
         val message = ReplyAlertMessage.decode(bytes) ?: return null
         val alert = ReplyAlert(message.identity, message.sessionId)
-        if (!replyLedger.claim(alert.identity)) return ReplyAlertResult.DUPLICATE
-        if (presence.isVisible(alert.storedSessionId)) {
-            refreshSelected()
-            return ReplyAlertResult.SUPPRESSED_VISIBLE
+        if (replyLedger.isHandled(alert.identity)) return ReplyAlertResult.DUPLICATE
+        if (!replyLedger.begin(alert.identity)) return ReplyAlertResult.NOT_SHOWN_HERE
+        var spent = false
+        try {
+            // Refresh the real reader only for the conversation already visible; never navigate on arrival.
+            // This read is independent of alert delivery: failure/timeout must not spend or suppress its identity.
+            if (presence.isVisible(message.sessionId)) refreshSelected()
+            // The content-free wire cannot bind this final identity to a history row. An older assistant row is not
+            // positive display of the new answer: keep one deduplicated alert, even when this conversation is visible.
+            // A later explicit open/read uses presence.onOpened to dismiss it only after a successful history read.
+            val shown = if (replica.current.privateAudio) replyNotifier.show(alert, null, true) else replyNotifier.show(alert)
+            if (!shown) return ReplyAlertResult.NOT_SHOWN_HERE
+            spent = true
+            return ReplyAlertResult.SHOWN_HERE
+        } finally {
+            if (spent) replyLedger.commit(alert.identity) else replyLedger.release(alert.identity)
         }
-        val shown = if (replica.current.privateAudio) replyNotifier.show(alert, null, true) else replyNotifier.show(alert)
-        if (shown && presence.isVisible(alert.storedSessionId)) replyNotifier.dismissConversation(alert.storedSessionId)
-        return if (shown) ReplyAlertResult.SHOWN_HERE else ReplyAlertResult.NOT_SHOWN_HERE
     }
 
     /** A tapped arrival alert: the conversation it names is opened like the user's own choice. */
@@ -617,13 +894,23 @@ class WatchApp : Application() {
 
     fun selectSession(sessionId: String) {
         navigationGuard.onUserNavigation()
+        val alreadyVisible = presence.isVisible(sessionId)
         openConversation(sessionId)
+        if (alreadyVisible) dismissAfterVisibleRead(sessionId, fresh = false)
     }
 
     private fun openConversation(sessionId: String) {
+        if (_reader.value.historyFor(sessionId) == null) recentBodies.load(sessionId)?.let { saved ->
+            updateReader { state -> state.copy(histories = (state.histories +
+                com.rumi.hermesvoice.core.watchlink.ReaderHistory(sessionId,
+                    saved.page.messages.map { ReaderMessageRow(it.rowId, it.role, it.text, it.truncated, it.messageUid, it.timestamp, received = it.received) },
+                    nextOlderOffset = saved.page.returned, hasOlder = saved.hasOlder))
+                .takeLast(WatchReaderLimits.MAX_CACHED_SESSIONS)) }
+        }
         val reqId = newRequestId()
         updateReader { it.select(sessionId, reqId) }
-        dispatch(ReaderRequest(reqId, ReaderKind.HISTORY, sessionId))
+        // onOpened may have synchronously replaced this with a fresh opening read.
+        if (_reader.value.historyFor(sessionId)?.pendingReqId == reqId) dispatch(ReaderRequest(reqId, ReaderKind.HISTORY, sessionId))
     }
 
     /**
@@ -691,33 +978,128 @@ class WatchApp : Application() {
             }
         }
         readerTargets.remove(response.reqId, sourceNodeId)
+        val bodyNamespace=response.bodyScope?:response.scope
+        val changedScope = (response.scope != null && readerTitleScope != null && response.scope != readerTitleScope) ||
+            (bodyNamespace!=null && readerBodyScope!=null && bodyNamespace!=readerBodyScope)
+        val signedOut = response.error in setOf(ReaderError.SIGN_IN_REQUIRED, ReaderError.NOT_CONFIGURED)
+        if (changedScope || signedOut) {
+            invalidateReaderTitles(sourceNodeId, response.scope)
+            readerBodyScope=if(signedOut) null else bodyNamespace
+            if (response.kind == ReaderKind.HISTORY) {
+                if (signedOut) updateReader { it.copy(sessions = ReaderSessionsState(status = LoadStatus.ERROR, error = response.error)) }
+                else loadSessions()
+                return
+            }
+            if (response.kind == ReaderKind.SESSIONS) updateReader { it.requestSessions(response.reqId) }
+        }
+        if (response.scope != null) readerTitleScope = response.scope
+        if (!signedOut && response.scope != null) readerBodyScope = bodyNamespace
+        if (response.kind == ReaderKind.SESSIONS && response.ok && response.scope == null) {
+            // A legacy peer can display its current result, but cannot authenticate a durable account namespace.
+            invalidateReaderTitles(sourceNodeId, clearState = false)
+        }
         updateReader { it.onResponse(response) }
+        if (response.kind == ReaderKind.SESSIONS && response.ok) {
+            response.removedSessionIds.forEach { recentBodies.evict(it) }
+            response.sessions.forEach { recentBodies.eligible(it.id) }
+            receivedFinals.remove(response.removedSessionIds.toSet())
+            receivedFinals.eligible(response.sessions.map { it.id }.toSet())
+        }
+        if (response.ok && response.scope != null) receivedFinals.receive(sourceNodeId, bodyNamespace, response.finals)
+        if (response.kind == ReaderKind.HISTORY && response.ok && response.scope != null &&
+            pending.pendingHistoryRequest(response.reqId)?.loadingOlder == false) {
+            val epoch = bodyGeneration.get()
+            recentBodies.remember(com.rumi.hermesvoice.core.net.HistoryPage(response.sessionId!!,
+                response.messages.map { com.rumi.hermesvoice.core.net.HistoryMessage(it.rowId, it.role, it.text, it.timestamp, it.truncated, it.messageUid, finishReason = if(it.received) null else "nonfinal") },
+                response.nextOffset), response.hasOlder) {
+                bodyGeneration.get() == epoch && readerTitlePhone == sourceNodeId && readerTitleScope == response.scope && readerBodyScope==bodyNamespace
+            }
+        }
+        if (response.kind == ReaderKind.HISTORY && response.error == ReaderError.NOT_OWNED) {
+            recentBodies.invalidate()
+            updateReader { it.copy(sessions = it.sessions.copy(rows = it.sessions.rows.filterNot { row -> row.id == response.sessionId })) }
+            saveReaderTitles()
+        } else if (response.kind == ReaderKind.SESSIONS && response.ok) saveReaderTitles()
         // A conversation turned out to be gone: reload the browser so it cannot be tapped again.
         if (_reader.value.sessions.stale) loadSessions()
         Log.i(TAG, "reader ${response.kind.wire} req=${response.reqId.take(12)} ok=${response.ok} error=${response.error} " +
             "sessions=${response.sessions.size} messages=${response.messages.size} has_older=${response.hasOlder}")
     }
 
+    private fun readerRequestPending(request: ReaderRequest): Boolean {
+        val pending = _reader.value
+        if (request.kind == ReaderKind.SESSIONS) return pending.sessions.pendingReqId == request.reqId
+        val selected = pending.selectedSessionId ?: return false
+        return pending.pendingHistoryRequest(request.reqId)?.sessionId == selected
+    }
+
+    /**
+     * Sends a read request to the Phone. A failed Data Layer call proves nothing about whether the Phone got the message, so a call that
+     * failed for a TRANSIENT typed reason, or a missing Phone node, is sent again with the same id after 1 s and then 2 s, and only while
+     * it is still the pending request and the ONE original 15 s window (counted from the first try, lookups and sends included) has not
+     * closed. A final failure (sign-in, access, security, protocol, size, cancellation, anything unrecognised) is shown at once. The retries
+     * already spent travel with the request so the Phone continues the same allowance and the whole refresh makes at most two. A request
+     * the Phone received is never sent again here: the Phone owns its dashboard retries and coalesces a repeated id.
+     */
     private fun dispatch(request: ReaderRequest) {
         scope.launch {
-            val node = phoneNode()
-            if (node == null) {
-                _phoneReachable.value = false
-                updateReader { it.onSendFailed(request.reqId) }
-                return@launch
+            val startedAt = SystemClock.elapsedRealtime()
+            val elapsedMs = { SystemClock.elapsedRealtime() - startedAt }
+            var retries = 0
+            while (true) {
+                val lookup = dataLayerCall { lookUpPhone() }
+                val node = lookup.getOrNull()
+                var failure = "no_phone"
+                if (node == null) {
+                    _phoneReachable.value = false
+                    if (lookup.isFailure && !ReaderSendAdmission.transient(lookup.exceptionOrNull()!!)) {
+                        updateReader { it.onSendFailed(request.reqId) }
+                        return@launch
+                    }
+                } else {
+                    if (!readerRequestPending(request)) return@launch
+                    if (elapsedMs() >= WatchReaderLimits.REQUEST_TIMEOUT_MS) {
+                        updateReader { it.onSendFailed(request.reqId) }
+                        return@launch
+                    }
+                    val changedPhone = readerTitlePhone != null && readerTitlePhone != node
+                    observeReaderPhone(node)
+                    if (changedPhone) {
+                        if (request.kind == ReaderKind.HISTORY) { loadSessions(); return@launch }
+                        updateReader { it.requestSessions(request.reqId) }
+                    }
+                    readerTargets[request.reqId] = node
+                    val wire = request.copy(retriesUsed = retries).encode()
+                    val sent = dataLayerCall {
+                        Wearable.getMessageClient(this@WatchApp).sendMessage(node, WatchLinkPaths.READER_REQUEST, wire).await()
+                    }
+                    Log.i(TAG, "reader request ${request.kind.wire} req=${request.reqId.take(12)} offset=${request.offset} sent=${sent.isSuccess}")
+                    if (sent.isSuccess) {
+                        delay((WatchReaderLimits.REQUEST_TIMEOUT_MS - elapsedMs()).coerceAtLeast(0L))
+                        if (readerTargets.remove(request.reqId) != null) updateReader { it.onTimeout(request.reqId) }
+                        return@launch
+                    }
+                    readerTargets.remove(request.reqId)
+                    if (!ReaderSendAdmission.transient(sent.exceptionOrNull()!!)) {
+                        updateReader { it.onSendFailed(request.reqId) }
+                        return@launch
+                    }
+                    failure = "send_refused"
+                }
+                val wait = ReadRetryBudget.LOCAL_DELAYS_MS.getOrNull(retries)
+                if (wait == null || elapsedMs() + wait >= WatchReaderLimits.REQUEST_TIMEOUT_MS) {
+                    updateReader { it.onSendFailed(request.reqId) }
+                    return@launch
+                }
+                retries += 1
+                Log.i(TAG, "reader request ${request.kind.wire} retry=$retries/${ReadRetryBudget.MAX_RETRIES} cause=$failure wait_ms=$wait")
+                delay(wait)
+                if (!readerRequestPending(request)) return@launch
+                if (elapsedMs() >= WatchReaderLimits.REQUEST_TIMEOUT_MS) {
+                    updateReader { it.onSendFailed(request.reqId) }
+                    return@launch
+                }
             }
-            readerTargets[request.reqId] = node
-            val sent = runCatching {
-                Wearable.getMessageClient(this@WatchApp).sendMessage(node, WatchLinkPaths.READER_REQUEST, request.encode()).await()
-            }
-            Log.i(TAG, "reader request ${request.kind.wire} req=${request.reqId.take(12)} offset=${request.offset} sent=${sent.isSuccess}")
-            if (sent.isFailure) {
-                readerTargets.remove(request.reqId)
-                updateReader { it.onSendFailed(request.reqId) }
-                return@launch
-            }
-            delay(WatchReaderLimits.REQUEST_TIMEOUT_MS)
-            if (readerTargets.remove(request.reqId) != null) updateReader { it.onTimeout(request.reqId) }
         }
     }
 
@@ -952,6 +1334,7 @@ class WatchApp : Application() {
         private const val ACK_HOLD_MS = 10_000L
         private const val PROGRESS_INTERVAL_MS = 5_000L
         private const val PROGRESS_SEND_MS = 4_000L
+        private const val READ_WAIT_SLACK_MS = 2_000L
         private const val DIAG_SEND_MS = 5_000L
 
         fun from(context: Context): WatchApp = context.applicationContext as WatchApp

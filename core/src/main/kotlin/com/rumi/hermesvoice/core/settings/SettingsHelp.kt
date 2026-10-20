@@ -35,9 +35,10 @@ object SettingsHelp {
     const val DIAGNOSTICS = "diagnostics"
     const val PHONE_CHARGING = "phone_wake_while_charging"
     const val WATCH_CHARGING = "watch_wake_while_charging"
+    const val SESSION_MARKER = "session_marker"
 
     val topicIds: List<String> = listOf(SPOKEN_REPLIES, LATER_REPLIES, USE_HEADSET, ROUTING, PHONE_NAVIGATION, WATCH_NAVIGATION, WATCH, BACKGROUND_RELAY,
-        WAKE_PHRASE, WAKE_PATTERNS, STANDBY, VAD, WAITING, DIAGNOSTICS, PHONE_CHARGING, WATCH_CHARGING)
+        WAKE_PHRASE, WAKE_PATTERNS, STANDBY, VAD, WAITING, DIAGNOSTICS, PHONE_CHARGING, WATCH_CHARGING, SESSION_MARKER)
 
     fun spokenReplies() = HelpTopic(SPOKEN_REPLIES, "Spoken replies", listOf(
         "The routing acknowledgement and the final reply always play. They play on whichever device, this phone or the Watch, " +
@@ -267,6 +268,30 @@ object SettingsHelp {
             "something only inside that file. An event not yet written when the app is killed can be missing.",
     ))
 
+    fun sessionMarker() = HelpTopic(SESSION_MARKER, "Sessions made elsewhere", listOf(
+        "Every Hermes session has two labels. \"source\" says which client it is routed through now (discord, tui and so on), and other " +
+            "clients can change it. \"created_source\" is written once, when the session is created, and is kept. This app lists and " +
+            "uses the sessions whose created_source is \"recorder-phone\" (the marker); conversations made in this app carry it.",
+        "To use a session that was started elsewhere, such as in Discord, someone with access to the Hermes database sets that session's " +
+            "created_source to \"recorder-phone\". After Refresh or the next launch it appears here with its existing history. " +
+            "The app creates, copies, renames and sends nothing for that, and the session's source and Discord routing are not touched.",
+        "The marker makes a session eligible; it does not mean this app created it. Setting it by hand replaces the record of where " +
+            "the session began, so do it only for sessions you mean to use here and keep a backup. Taking the marker off hides the " +
+            "session again: the next send or voice request to it is refused and it leaves the voice destinations. A turn the app already " +
+            "accepted is not cancelled. A change of \"source\" neither hides a marked session nor makes an unmarked one usable.",
+        "Only created_source decides. A session whose created_source is empty or different is not listed or usable, even if its source is " +
+            "\"recorder-phone\" or it was made earlier in this app, and an older server without that field shows no conversation. Such " +
+            "sessions need the marker set by hand once. For a session that Hermes compressed, set it on the original (root) session. " +
+            "At most 100 conversations are active; marked sessions beyond that are counted but not added until you archive one, and a " +
+            "session whose marker was taken off keeps its place and voice name until the marker comes back. The phone reads the " +
+            "dashboard's sessions page by page to the end of its list and shows each conversation as soon as its page has been read; " +
+            "the list says when reading stopped early. The Watch shows a session only after the phone has added it.",
+        "Only one Hermes process can write to a session at a time. If the terminal or another Hermes runtime is using it, a send is " +
+            "refused with \"currently in use\": release or close it there and retry. Your text stays for retry and nothing was sent; " +
+            "the app does not take the session over or resend on its own. A send from this app does not guarantee a Discord " +
+            "broadcast or physical delivery. A timeout while opening a session is reported as a timeout, not as in use.",
+    ))
+
     fun all(laterReplyWindowMinutes: Int): List<HelpTopic> = listOf(spokenReplies(), laterReplies(laterReplyWindowMinutes), useHeadset(), routing(),
-        phoneNavigation(), watchNavigation(), watch(), backgroundRelay(), wakePhrase(), wakePatterns(), standby(), vad(), waiting(), diagnostics(), chargingWake("Phone"), chargingWake("Watch"))
+        phoneNavigation(), watchNavigation(), watch(), backgroundRelay(), wakePhrase(), wakePatterns(), standby(), vad(), waiting(), diagnostics(), chargingWake("Phone"), chargingWake("Watch"), sessionMarker())
 }

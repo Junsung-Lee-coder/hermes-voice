@@ -113,7 +113,7 @@ class WatchReplyAlertNotifier(private val context: Context) : ReplyAlertPort {
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
             .setPublicVersion(publicVersion)
             .setLocalOnly(true)
-            .setAutoCancel(true)
+            .setAutoCancel(false)
             .setContentIntent(open)
             .addExtras(android.os.Bundle().apply { putString(ReplyAlertContent.EXTRA_SESSION_ID, alert.storedSessionId) })
         if (quiet) builder.setSilent(true)

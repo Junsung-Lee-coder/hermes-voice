@@ -23,6 +23,7 @@ import com.rumi.hermesvoice.core.voice.RecipientCreator
 import com.rumi.hermesvoice.core.voice.RoutingContract
 import com.rumi.hermesvoice.core.voice.TextSanitizer
 import java.security.MessageDigest
+import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -35,9 +36,11 @@ import org.json.JSONObject
 
 /** The dashboard session routes the repository needs; [com.rumi.hermesvoice.core.net.HermesDashboardClient] implements them. */
 interface HermesSessionsApi {
-    suspend fun listSessions(source: String, archived: ArchivedFilter, limit: Int = 100, offset: Int = 0): StoredSessionPage
+    suspend fun listSessions(source: String?, archived: ArchivedFilter, limit: Int = 100, offset: Int = 0, excludeSources: List<String> = emptyList()): StoredSessionPage
     suspend fun getSession(sessionId: String): StoredSession?
     suspend fun getMessages(sessionId: String, limit: Int = 50, offset: Int = 0): HistoryPage
+    /** Same authorized read, distinct caller intent for diagnostics; never changes eligibility or pagination. */
+    suspend fun getReconciliationMessages(sessionId:String,limit:Int=50,offset:Int=0):HistoryPage = getMessages(sessionId,limit,offset)
     suspend fun setArchived(sessionId: String, archived: Boolean)
 }
 
@@ -274,13 +277,38 @@ class TurnCreateJournal(store: KeyValueStore) {
 class RecipientCreateException(val reason: String, message: String) : HermesException(message)
 
 /** A conversation row for the Phone UI: our registry entry joined with the dashboard's row. */
-data class AppConversation(val owned: OwnedSession, val stored: StoredSession)
+data class AppConversation(val owned: OwnedSession, val stored: StoredSession, val unread: Boolean = false, val receivedAt: Double = 0.0)
+
+/**
+ * What [AppSessionRepository.listConversations] found: the conversations (this object is that list), and how far the look went.
+ * [inProgress] marks a listing handed over while more pages are still being read; its conversations are already registered and
+ * usable. [complete] is false when the scan stopped early (a page failed, or the server's pages stopped advancing) or a check
+ * failed, and always while [inProgress]; [scanned] distinct server rows of [total] were read. [notAdopted] counts marked sessions
+ * that were seen but not taken in (no free place or alias, an unusable id, or an unverifiable lineage). [error] names a failure by
+ * class only.
+ */
+class ConversationListing(
+    val conversations: List<AppConversation>,
+    val complete: Boolean = true,
+    val scanned: Int = 0,
+    val total: Int = 0,
+    val notAdopted: Int = 0,
+    val error: String? = null,
+    val inProgress: Boolean = false,
+    /** Positive observations only; an unseen row in an unfinished scan is not a revocation. */
+    val removedIds: Set<String> = emptySet(),
+) : List<AppConversation> by conversations {
+    override fun equals(other: Any?): Boolean = conversations == other
+    override fun hashCode(): Int = conversations.hashCode()
+    override fun toString(): String = conversations.toString()
+}
 
 /**
  * App-only session management over the existing dashboard + gateway surface, with no Hermes
- * change. Listing uses the server-side `source` filter AND the local exact-id registry;
- * history/archive/submit verify both (registry membership, then the server row's `source`)
- * before touching a session, and fail closed otherwise. This does not stop the same dashboard
+ * change. A session is this app's when its exact id is in the local registry AND the server row
+ * is marked for the app by `created_source` (see [judge]); `source` is a mutable routing label and
+ * does not decide it. Listing, history, archive and submit check both before touching a session,
+ * and fail closed otherwise. This does not stop the same dashboard
  * identity from reaching its other sessions through other clients; it only keeps this app to its own.
  *
  * Everything that changes the registry or the journal (a conversation the router asked for, one
@@ -300,7 +328,10 @@ class AppSessionRepository(
     /** Metadata-only diagnostics (never text or ids): the router model's state. */
     private val diagnostic: (String) -> Unit = {},
 ) {
+    internal var onConversationCreated: suspend (String) -> Unit = {}
+    internal var onConversationVerified: suspend (String,Double) -> Unit = { _,_ -> }
     private val verifiedSources = HashSet<String>()
+    private val ineligible = HashSet<String>()
     private val journal = TurnCreateJournal(registry.store)
     private val lock = Mutex()
 
@@ -359,7 +390,7 @@ class AppSessionRepository(
         }
         val record = pending.copy(state = TurnCreateState.CREATED, storedSessionId = created.storedSessionId, createdAtMs = clock())
         withContext(io) { journal.put(record) }
-        registerCreated(record)
+        registerCreated(record).also { onConversationCreated(it.storedSessionId) }
     }
 
     /** The [RecipientCreator] the voice orchestrator uses: creation only ever goes through this repository. */
@@ -396,10 +427,11 @@ class AppSessionRepository(
         val owned = registry.find(storedSessionId)
         if (owned == null || owned.role != OwnedRole.CONVERSATION) throw SessionNotOwnedException("session was not created by this app")
         if (owned.archived) throw SessionNotOwnedException("the conversation '${owned.alias}' was archived; nothing was sent")
-        val row = api.getSession(storedSessionId) ?: throw SessionNotOwnedException("session no longer exists on the dashboard")
-        if (row.id != storedSessionId || row.source != AppSources.CONVERSATION) {
-            throw SessionNotOwnedException("session is not tagged with this app's source")
-        }
+        val verdict = judge(storedSessionId)
+        val row = verdict.row ?: throw SessionNotOwnedException("session no longer exists on the dashboard")
+        markEligibility(storedSessionId, verdict.eligible)
+        if (!verdict.eligible) throw SessionNotOwnedException(NOT_MARKED)
+        verdict.row?.let { onConversationVerified(storedSessionId,it.lastActive) }
         if (row.archived) throw SessionNotOwnedException("the conversation '${owned.alias}' was archived; nothing was sent")
     }
 
@@ -419,7 +451,7 @@ class AppSessionRepository(
             throw RecipientCreateException("create_unverified", "create_unverified: the dashboard returned an unusable session id")
         }
         val row = api.getSession(record.storedSessionId)
-        if (row == null || row.id != record.storedSessionId || row.source != AppSources.CONVERSATION || row.archived) {
+        if (row == null || row.id != record.storedSessionId || row.archived || row.createdSource != AppSources.CONVERSATION) {
             throw RecipientCreateException("create_unverified", "create_unverified: the new conversation could not be verified on the dashboard")
         }
         val current = active(all)
@@ -431,7 +463,6 @@ class AppSessionRepository(
         val session = OwnedSession(row.id, OwnedRole.CONVERSATION, record.title, alias, record.description,
             archived = false, createdAtMs = record.createdAtMs)
         withContext(io) { registry.put(session) }
-        synchronized(verifiedSources) { verifiedSources += "${AppSources.CONVERSATION}|${row.id}" }
         return session
     }
 
@@ -464,6 +495,7 @@ class AppSessionRepository(
         val session = OwnedSession(created.storedSessionId, OwnedRole.CONVERSATION, cleanTitle, cleanAlias, cleanDescription,
             archived = false, createdAtMs = clock())
         withContext(io) { registry.put(session) }
+        onConversationCreated(session.storedSessionId)
         session
     }
 
@@ -531,7 +563,7 @@ class AppSessionRepository(
         if (current != null) {
             // A replacement is adopted only if its row reads back as this app's routing session; otherwise the old one stays.
             val row = runCatching { api.getSession(created.storedSessionId) }.getOrNull()
-            if (row == null || row.id != created.storedSessionId || row.source != AppSources.ROUTER) return current
+            if (row == null || row.id != created.storedSessionId || row.createdSource != AppSources.ROUTER) return current
             synchronized(verifiedSources) { verifiedSources += "${AppSources.ROUTER}|${row.id}" }
         }
         // The create reported the pinned model back: recorded. Otherwise it is switched and read back before first use.
@@ -566,30 +598,272 @@ class AppSessionRepository(
     /** A replacement of the routing session was started for this contract version and never recorded as done. */
     private fun routerMigrationPending(): Boolean = registry.store.getString(KEY_ROUTER_MIGRATION) == RoutingContract.VERSION.toString()
 
-    /** Only rows that carry the app source AND whose exact id this install created. The router never appears. */
-    suspend fun listConversations(archived: Boolean): List<AppConversation> {
-        if (registry.all().none { it.role == OwnedRole.CONVERSATION }) return emptyList()
-        val rows = ArrayList<StoredSession>()
+    /**
+     * The conversations this app shows: its registered ones that are still marked, plus (when [adoptMarked]) newly marked ones.
+     * Eligibility is the server's `sessions.created_source`; the mutable `source` is not consulted for it (see [judge]).
+     * - The scan is `GET /api/sessions` (no created_source filter exists), pages of [PAGE_SIZE] in recent order, followed until the
+     *   server has no more rows. There is no page or row ceiling. Each page is processed (judged, adopted, registered) as soon as it
+     *   arrives, and [onProgress] then receives everything found so far with [ConversationListing.inProgress] set; no lock is held
+     *   while a page is being fetched, so what was found is usable (voice destinations, sends, new conversations) while later pages
+     *   are still being read. Offset pages of a changing list are not a snapshot: a row can move between pages, so a row seen twice
+     *   is used once, and a full page that brings no new row ends the scan as a failure rather than looping.
+     * - A scan that cannot add anything (the Watch reader, a revoke-only synchronization, the archived view) ends once every
+     *   registered conversation of its scope was seen. A scan that ended early, or failed, checks the registered conversations it did
+     *   not see one by one (at most [MAX_INDIVIDUAL]); those never seen are left as they are, never revoked for being unseen.
+     * - A previously unregistered session is adopted only when its created_source is the marker (never on `source` alone, never
+     *   when the field is absent), it is not the routing session, and an alias and one of the [DestinationAllowlist.MAX_ENTRIES]
+     *   places are free. The adoptions and compression re-keys of one page are ONE durable write; if it fails nothing of that page is
+     *   adopted. What earlier pages registered stays registered when a later page fails or the scan is cancelled.
+     * - Archived rows are not adopted, and the Watch reader never adopts.
+     */
+    suspend fun listConversations(
+        archived: Boolean,
+        adoptMarked: Boolean = true,
+        onProgress: (suspend (ConversationListing) -> Unit)? = null,
+    ): ConversationListing {
+        val adopting = adoptMarked && !archived
+        val registered = registry.all()
+        if (!adopting && registered.none { it.role == OwnedRole.CONVERSATION }) return ConversationListing(emptyList())
+        val filter = if (archived) ArchivedFilter.ONLY else ArchivedFilter.EXCLUDE
+        val scan = ListScan(archived, adopting)
         var offset = 0
-        for (page in 0 until MAX_LIST_PAGES) {
-            val result = api.listSessions(AppSources.CONVERSATION, if (archived) ArchivedFilter.ONLY else ArchivedFilter.EXCLUDE,
-                limit = PAGE_SIZE, offset = offset)
-            rows += result.sessions
+        var total = 0
+        var pages = 0
+        var complete = false
+        var error: String? = null
+        while (true) {
+            val result = try {
+                readWithRetries(ReadOp.LIST) { api.listSessions(null, filter, limit = PAGE_SIZE, offset = offset) }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (auth: HermesAuthRequiredException) {
+                throw auth
+            } catch (failure: Exception) {
+                if (pages == 0) throw failure
+                error = "the list stopped after ${scan.rowCount} of $total sessions (${failure.javaClass.simpleName})"
+                break
+            }
+            pages++
+            val fresh = scan.fresh(result.sessions)
             offset += result.sessions.size
-            if (result.sessions.size < PAGE_SIZE || offset >= result.total) break
-        }
-        return lock.withLock {
-            val owned = registry.all().filter { it.role == OwnedRole.CONVERSATION }.associateBy { it.storedSessionId }
-            rows.filter { it.source == AppSources.CONVERSATION }.mapNotNull { row ->
-                val mine = owned[row.id] ?: return@mapNotNull null
-                // The dashboard's archived flag wins, except that a conversation unarchived elsewhere whose
-                // alias is now used by another one stays archived here until it is renamed.
-                val synced = when {
-                    mine.archived == row.archived -> mine
-                    !row.archived && (aliasTaken(mine.alias, mine.storedSessionId) || active().size >= DestinationAllowlist.MAX_ENTRIES) -> mine
-                    else -> withContext(io) { registry.update(row.id) { it.copy(archived = row.archived) } }
+            total = maxOf(result.total, offset)
+            val full = result.sessions.size >= PAGE_SIZE
+            if (full && fresh.isEmpty()) {
+                error = "the list made no progress after ${scan.rowCount} of $total sessions (a full page held only rows already read)"
+                break
+            }
+            scan.absorb(fresh)
+            if (!full || offset >= result.total || scan.nothingLeftToFind()) {
+                complete = true
+                break
+            }
+            if (onProgress != null) {
+                try {
+                    onProgress(scan.listing(total, complete = false, error = null, inProgress = true))
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
                 }
-                AppConversation(synced, row)
+            }
+        }
+        // The default dashboard list may filter out a registered id (for example by delegate
+        // classification) even when pagination is complete. Only exact authenticated metadata,
+        // not absence from that list, can decide its marker eligibility.
+        scan.verifyUnseen()
+        return scan.listing(total, complete, error, inProgress = false)
+    }
+
+    /** The state of one [listConversations] scan: what was read, judged, registered and shown so far. */
+    private inner class ListScan(private val archived: Boolean, private val adopting: Boolean) {
+        private val rows = HashSet<String>()
+        private val seen = HashSet<String>()
+        private val rekeyed = HashSet<String>()
+        private val shown = LinkedHashMap<String, AppConversation>()
+        private val removed = HashSet<String>()
+        private val prejudged = HashMap<String, Verdict?>()
+        private var notAdopted = 0
+        private var degraded = false
+        private var judgeFailures = 0
+
+        val rowCount: Int get() = rows.size
+
+        fun fresh(page: List<StoredSession>): List<StoredSession> = page.filter { rows.add(it.id) }
+
+        fun nothingLeftToFind(): Boolean = !adopting &&
+            registry.all().filter { it.role == OwnedRole.CONVERSATION && it.archived == archived }.all { it.storedSessionId in seen }
+
+        fun listing(total: Int, complete: Boolean, error: String?, inProgress: Boolean) = ConversationListing(
+            shown.values.toList(), complete && !degraded, rows.size, total, notAdopted,
+            error ?: if (degraded) "some sessions could not be checked" else null, inProgress, removed.toSet())
+
+        private fun isProjected(row: StoredSession) = row.lineageIds.size > 1 && row.lineageIds.last() == row.id
+
+        private suspend fun prejudge(page: List<StoredSession>) {
+            val owned = registry.all().filter { it.role == OwnedRole.CONVERSATION }.map { it.storedSessionId }.toSet()
+            for (row in page) {
+                if (!isProjected(row) || !directlyEligible(row)) continue
+                if (!adopting && row.id !in owned && row.lineageIds.dropLast(1).none { it in owned }) continue
+                prejudged[row.id] = try {
+                    judge(row.id)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (auth: HermesAuthRequiredException) {
+                    throw auth
+                } catch (_: Exception) {
+                    null
+                }
+            }
+        }
+
+        private suspend fun judged(id: String): Verdict? {
+            if (prejudged.containsKey(id)) {
+                return prejudged.remove(id).also { if (it == null) { degraded = true; judgeFailures++ } }
+            }
+            return try {
+                judge(id)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (auth: HermesAuthRequiredException) {
+                throw auth
+            } catch (_: Exception) {
+                degraded = true
+                judgeFailures++
+                null
+            }
+        }
+
+        private suspend fun sync(pair: Pair<OwnedSession, StoredSession>) {
+            val (mine, row) = pair
+            // The dashboard's archived flag wins, except that a conversation unarchived elsewhere whose
+            // alias is now used by another one stays archived here until it is renamed.
+            val synced = when {
+                mine.archived == row.archived -> mine
+                !row.archived && (aliasTaken(mine.alias, mine.storedSessionId) || active().size >= DestinationAllowlist.MAX_ENTRIES) -> mine
+                else -> withContext(io) { registry.update(row.id) { it.copy(archived = row.archived) } }
+            }
+            shown[row.id] = AppConversation(synced, row)
+        }
+
+        suspend fun absorb(page: List<StoredSession>) {
+            if (page.isEmpty()) return
+            prejudge(page)
+            lock.withLock {
+                val all = registry.all()
+                val ownedById = all.filter { it.role == OwnedRole.CONVERSATION }.associateBy { it.storedSessionId }
+                val registeredIds = all.map { it.storedSessionId }.toSet()
+                val revoked = HashSet<String>()
+                val confirmed = LinkedHashMap<String, Pair<OwnedSession, StoredSession>>()
+                val rekeys = LinkedHashMap<String, String>()
+                val candidates = ArrayList<StoredSession>()
+                for (row in page) {
+                    if (row.id in rekeyed) continue
+                    val projected = isProjected(row)
+                    val entry = ownedById[row.id] ?: if (projected) row.lineageIds.dropLast(1).firstNotNullOfOrNull { ownedById[it] } else null
+                    if (entry == null) {
+                        val inRegisteredLineage = projected && row.lineageIds.any { it in registeredIds }
+                        if (adopting && !inRegisteredLineage && row.id !in registeredIds &&
+                            row.createdSource == AppSources.CONVERSATION) candidates += row
+                        continue
+                    }
+                    if (entry.storedSessionId in seen) continue
+                    seen += entry.storedSessionId
+                    val failuresBefore = judgeFailures
+                    val ok = if (projected) {
+                        directlyEligible(row) && judged(row.id)?.let { it.eligible && entry.storedSessionId in it.chain } == true
+                    } else {
+                        directlyEligible(row)
+                    }
+                    if (ok) {
+                        confirmed[row.id] = (if (row.id == entry.storedSessionId) entry else entry.copy(storedSessionId = row.id)) to row
+                        if (row.id != entry.storedSessionId) rekeys[entry.storedSessionId] = row.id
+                    } else if (judgeFailures == failuresBefore) {
+                        revoked += entry.storedSessionId
+                    }
+                }
+                val slots = (DestinationAllowlist.MAX_ENTRIES - active(all).size).coerceAtLeast(0)
+                val chosen = ArrayList<StoredSession>()
+                for (row in candidates) {
+                    if (!DestinationAllowlist.isValidSessionId(row.id) || chosen.size >= slots) {
+                        notAdopted++
+                        continue
+                    }
+                    val projected = isProjected(row)
+                    val ok = !projected || judged(row.id)?.let { it.eligible && (row.lineageRootId == null || it.chain.last() == row.lineageRootId) } == true
+                    if (ok) chosen += row else notAdopted++
+                }
+                val taken = active(all).map { it.alias }.toMutableSet()
+                val adopted = LinkedHashMap<String, OwnedSession>()
+                for (row in chosen.sortedBy { it.id }) {
+                    val alias = try {
+                        uniqueAlias(aliasFromTitle(row.title), row.id, taken)
+                    } catch (_: RecipientCreateException) {
+                        notAdopted++
+                        continue
+                    }
+                    taken += alias
+                    adopted[row.id] = OwnedSession(row.id, OwnedRole.CONVERSATION, TextSanitizer.clean(row.title).take(MAX_TITLE_CHARS).ifEmpty { alias },
+                        alias, "", archived = false, createdAtMs = clock())
+                }
+                if (rekeys.isNotEmpty() || adopted.isNotEmpty()) {
+                    withContext(io) {
+                        registry.replaceAll { current ->
+                            current.map { entry -> rekeys[entry.storedSessionId]?.let { entry.copy(storedSessionId = it) } ?: entry } + adopted.values
+                        }
+                    }
+                }
+                removed += revoked
+                removed += rekeys.keys
+                rekeyed += rekeys.keys
+                seen += rekeys.values
+                synchronized(ineligible) {
+                    ineligible -= confirmed.keys
+                    ineligible -= rekeys.keys
+                    ineligible -= adopted.keys
+                    ineligible += revoked
+                }
+                for (row in page) {
+                    val pair = confirmed[row.id]
+                    if (pair != null) sync(pair) else adopted[row.id]?.let { shown[row.id] = AppConversation(it, row) }
+                }
+            }
+        }
+
+        suspend fun verifyUnseen() {
+            val targets = registry.all()
+                .filter { it.role == OwnedRole.CONVERSATION && it.archived == archived && it.storedSessionId !in seen && it.storedSessionId !in rekeyed }
+                .take(MAX_INDIVIDUAL)
+            val verdicts = ArrayList<Pair<OwnedSession, Verdict>>()
+            for (entry in targets) {
+                val verdict = try {
+                    judge(entry.storedSessionId)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (auth: HermesAuthRequiredException) {
+                    throw auth
+                } catch (_: Exception) {
+                    degraded = true
+                    judgeFailures++
+                    null
+                } ?: continue
+                verdicts += entry to verdict
+            }
+            if (verdicts.isEmpty()) return
+            lock.withLock {
+                val revoked = HashSet<String>()
+                val individual = LinkedHashMap<String, Pair<OwnedSession, StoredSession>>()
+                for ((entry, verdict) in verdicts) {
+                    val current = registry.all().firstOrNull { it.role == OwnedRole.CONVERSATION && it.storedSessionId == entry.storedSessionId } ?: continue
+                    val row = verdict.row
+                    if (row == null || !verdict.eligible || row.archived != archived) removed += entry.storedSessionId
+                    if (row == null) continue
+                    if (!verdict.eligible) revoked += entry.storedSessionId
+                    if (verdict.eligible && row.archived == archived && row.endReason != COMPRESSION) individual[row.id] = current to row
+                }
+                synchronized(ineligible) {
+                    ineligible -= individual.keys
+                    ineligible += revoked
+                }
+                for (pair in individual.values) sync(pair)
             }
         }
     }
@@ -597,12 +871,16 @@ class AppSessionRepository(
     /** The stored rows of one of our conversations exactly as the server holds them (a voice request's row starts with its marker). */
     suspend fun history(storedSessionId: String, limit: Int = 50, offset: Int = 0): HistoryPage {
         verifyConversation(storedSessionId)
-        return api.getMessages(storedSessionId, limit, offset)
+        return readWithRetries(ReadOp.HISTORY) { api.getMessages(storedSessionId, limit, offset) }
+    }
+    suspend fun reconciliationHistory(storedSessionId:String,limit:Int=50,offset:Int=0):HistoryPage {
+        verifyConversation(storedSessionId)
+        return readWithRetries(ReadOp.RECONCILIATION) { api.getReconciliationMessages(storedSessionId,limit,offset) }
     }
 
     /** Archives, or unarchives when the alias is still free and there is room; a clash is refused. */
     suspend fun setArchived(storedSessionId: String, archived: Boolean): OwnedSession = lock.withLock {
-        verifyConversation(storedSessionId, forceServerCheck = true)
+        verifyConversation(storedSessionId)
         if (!archived) {
             requireAliasFree(registry.find(storedSessionId)!!.alias, exceptSessionId = storedSessionId)
             if (registry.find(storedSessionId)!!.archived) requireRoom()
@@ -631,9 +909,25 @@ class AppSessionRepository(
 
     /** The voice router's allowlist: our unarchived conversations (possibly none: the router may then ask for one); no router for a routing-off turn. */
     fun allowlist(routingStoredSessionId: String?): DestinationAllowlist = DestinationAllowlist.create(
-        active().map { DestinationEntry(it.alias, it.storedSessionId, it.description.ifBlank { TextSanitizer.clean(it.title) }) },
+        active().filter { synchronized(ineligible) { it.storedSessionId !in ineligible } }.map { DestinationEntry(it.alias, it.storedSessionId, it.description.ifBlank { TextSanitizer.clean(it.title) }) },
         routingStoredSessionId,
     )
+
+    /**
+     * [allowlist] after a look at the server's markers: a marker taken off drops the destination, so a voice turn never routes by a
+     * stale local registration. Nothing is adopted here (that is the refresh's job, so a session created for a pending voice turn is
+     * never claimed early). If the look fails the last known classification is used, and every submission is still checked against
+     * the server.
+     */
+    suspend fun synchronizedAllowlist(routingStoredSessionId: String?): DestinationAllowlist {
+        try {
+            listConversations(archived = false, adoptMarked = false)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+        }
+        return allowlist(routingStoredSessionId)
+    }
 
     /**
      * A conversation port that only ever submits to sessions this app owns (the router included),
@@ -656,25 +950,78 @@ class AppSessionRepository(
             }
             return conversations.submit(storedSessionId, text, attachments)
         }
+
+        override suspend fun reattach(storedSessionId: String, acceptance: com.rumi.hermesvoice.core.net.TurnAcceptance): SubmittedTurn {
+            val owned = registry.find(storedSessionId) ?: throw SessionNotOwnedException("session was not created by this app")
+            if (owned.role != OwnedRole.CONVERSATION || owned.retired || owned.archived) {
+                throw SessionNotOwnedException("the conversation '${owned.alias}' is archived or no longer used by this app")
+            }
+            // Acceptance is not permanent eligibility: use the same created_source/lineage check as a new conversation send.
+            verifyConversation(storedSessionId)
+            return conversations.reattach(storedSessionId, acceptance)
+        }
     }
 
-    private suspend fun verifyConversation(storedSessionId: String, forceServerCheck: Boolean = false) {
+    private suspend fun verifyConversation(storedSessionId: String) {
         val owned = registry.find(storedSessionId)
         if (owned == null || owned.role != OwnedRole.CONVERSATION) {
             throw SessionNotOwnedException("session was not created by this app")
         }
-        verifySource(storedSessionId, AppSources.CONVERSATION, forceServerCheck)
+        val verdict = judge(storedSessionId)
+        if (verdict.row == null) throw SessionNotOwnedException("session no longer exists on the dashboard")
+        markEligibility(storedSessionId, verdict.eligible)
+        if (!verdict.eligible) throw SessionNotOwnedException(NOT_MARKED)
+        verdict.row?.let { onConversationVerified(storedSessionId,it.lastActive) }
+    }
+
+    private fun markEligibility(storedSessionId: String, eligible: Boolean) {
+        synchronized(ineligible) { if (eligible) ineligible -= storedSessionId else ineligible += storedSessionId }
     }
 
     private suspend fun verifySource(storedSessionId: String, source: String, force: Boolean) {
         val key = "$source|$storedSessionId"
         if (!force && synchronized(verifiedSources) { key in verifiedSources }) return
         val row = api.getSession(storedSessionId) ?: throw SessionNotOwnedException("session no longer exists on the dashboard")
-        if (row.id != storedSessionId || row.source != source) {
-            throw SessionNotOwnedException("session is not tagged with this app's source")
+        if (row.id != storedSessionId || row.createdSource != source) {
+            throw SessionNotOwnedException("session is not the app's routing session (created_source)")
         }
         synchronized(verifiedSources) { verifiedSources += key }
     }
+
+    private class Verdict(val row: StoredSession?, val chain: List<String>, val eligible: Boolean)
+
+    /**
+     * Reads the session and decides whether it is marked for this app. The authority is `created_source` of the session itself, or,
+     * when it is the tip of a compression, of the root of its compression lineage, walked through the server's own compression
+     * edge (parent ended with end_reason compression and the child started at or after it). A parent that is not such an edge,
+     * a missing parent, a cycle or too long a chain is never followed. A missing, blank or different created_source (the routing
+     * marker included) is never eligible; neither the mutable `source` nor the local registry is consulted.
+     */
+    private suspend fun judge(storedSessionId: String): Verdict {
+        val row = readWithRetries(ReadOp.DETAIL) { api.getSession(storedSessionId) } ?: return Verdict(null, emptyList(), false)
+        if (row.id != storedSessionId) return Verdict(row, emptyList(), false)
+        val chain = arrayListOf(storedSessionId)
+        var root = row
+        while (true) {
+            val parentId = root.parentSessionId ?: break
+            if (parentId in chain || chain.size > MAX_LINEAGE_HOPS) return Verdict(row, chain, false)
+            val parent = readWithRetries(ReadOp.DETAIL) { api.getSession(parentId) }
+            if (parent == null || parent.id != parentId || !isCompressionEdge(parent, root)) break
+            chain += parentId
+            root = parent
+        }
+        return Verdict(row, chain, directlyEligible(root))
+    }
+
+    private fun isCompressionEdge(parent: StoredSession, child: StoredSession): Boolean {
+        val ended = parent.endedAt ?: return false
+        return parent.endReason == COMPRESSION && child.startedAt >= ended
+    }
+
+    private fun directlyEligible(row: StoredSession): Boolean = row.createdSource == AppSources.CONVERSATION
+
+    private fun aliasFromTitle(title: String): String =
+        TextSanitizer.clean(title).lowercase(Locale.ROOT).replace(Regex("[^a-z0-9_-]+"), "-").trim('-', '_').take(32).trim('-', '_').ifEmpty { "session" }
 
     private fun aliasTaken(alias: String, exceptSessionId: String?): Boolean =
         active().any { it.alias == alias && it.storedSessionId != exceptSessionId }
@@ -688,8 +1035,11 @@ class AppSessionRepository(
 
     companion object {
         const val PAGE_SIZE = 100
-        const val MAX_LIST_PAGES = 10
         const val MAX_TITLE_CHARS = 80
+        const val MAX_LINEAGE_HOPS = 64
+        const val MAX_INDIVIDUAL = 200
+        private const val COMPRESSION = "compression"
+        const val NOT_MARKED = "session is not marked as this app's (created_source); nothing was sent"
 
         /** Set (to the contract version) before an old routing session is replaced; see [ensureRoutingSession]. */
         const val KEY_ROUTER_MIGRATION = "router_migration_started"

@@ -156,9 +156,17 @@ class ReplyArrivalObservedTest {
             harness().use { h ->
                 val work = existing(h, "work", "x")
                 h.fake.scripts[work] = { listOf(FakeHermesDashboard.interim("Checking."), completion) }
-                phoneTurn(h, "a-nofinal-$index", TurnRouting.Direct(work), finalFails)
+                // R01 policy migration: a remote interrupted/error/empty completion is not
+                // genuine client Stop. Preserve no-answer-audio and strengthen silence to one
+                // exact notice. The old assertion and real h12g FAIL remain in custody.
+                val played = mutableListOf<SpokenRole>()
+                phoneTurn(h, "a-nofinal-$index", TurnRouting.Direct(work), PlaybackSink { _, cue -> played += cue.role })
+                assertTrue("a non-complete answer must not play FINAL audio: $played", SpokenRole.FINAL !in played)
+                waitFor("exact non-answer notice $index") { "a-nofinal-$index#notice@$work" in shown }
                 settle()
-                assertTrue("$index: $shown", shown.isEmpty())
+                assertEquals((0..index).map { "a-nofinal-$it#notice@$work" }, shown.toList())
+                assertTrue("never a successful-answer alert", shown.none { "#final@" in it || "#reply@" in it })
+                assertEquals("never resubmit a delivered request", 1, h.fake.rpcLog.count { it.optString("method") == "prompt.submit" })
             }
         }
     }
@@ -334,16 +342,74 @@ class ReplyArrivalObservedTest {
         }
     }
 
+    // F04 policy migration: remote terminal failures owe an honest notice; true client cancellation stays silent.
+    // The exact rejected no-alert assertion and native g5 FAIL are preserved outside the product in custody.
     @Test
-    fun `a failed or interrupted text send never alerts`() {
+    fun `terminal interrupted and error text completions show exact failure notices never answer alerts`() {
         harness().use { h ->
             val work = existing(h, "work", "x")
-            h.fake.scripts[work] = { listOf(FakeHermesDashboard.complete("partial", "interrupted")) }
-            runBlocking { h.core.chat.send(work, "hello") }
-            h.fake.scripts[work] = { listOf(FakeHermesDashboard.complete("", "error")) }
-            runBlocking { h.core.chat.send(work, "hello") }
+            val records = Collections.synchronizedList(mutableListOf<com.rumi.hermesvoice.core.notify.FinalReply>())
+            val alerts = com.rumi.hermesvoice.core.notify.ReplyAlerts(
+                com.rumi.hermesvoice.core.notify.ReplyAlertLedger(InMemoryKeyValueStore()),
+                { shown += "${it.identity}@${it.storedSessionId}"; true }, scope)
+            var next = 0
+            var spoken = 0
+            val chat = ChatService(h.core.sessions, newSendId = { "terminal-${++next}" }, finalReply = {
+                records += it
+                alerts.onFinalReply(it)
+            }, typedFinal = { _, _, _, _ -> spoken++; false })
+            for ((index, status) in listOf("interrupted", "error").withIndex()) {
+                h.fake.scripts[work] = { listOf(FakeHermesDashboard.complete(if (index == 0) "partial" else "", status)) }
+                val result = runBlocking { chat.send(work, "hello") }
+                // This legacy result carries the terminal status, not evidence of a successful final answer.
+                assertTrue("$result", result is ChatSendResult.Replied && result.status == status)
+            }
+            val expected = listOf("chat-terminal-1#notice", "chat-terminal-2#notice")
+            assertEquals("one honest failure, tied to each exact send, never the partial answer", expected, records.map { it.identity })
+            for (notice in records) {
+                assertEquals(work, notice.storedSessionId)
+                assertEquals(VoiceOrigin.PHONE, notice.target)
+                assertEquals(com.rumi.hermesvoice.core.notify.FinalReplySource.TEXT, notice.source)
+                assertFalse(notice.heard)
+                assertFalse(notice.cancelled) // A remote interrupted status is NOT cancellation of this client coroutine.
+                assertEquals("Your message reached Hermes, but the turn ended without a complete answer.", notice.text)
+                // Read the real public property when it exists; this same test must also compile on e52e52d7.
+                assertEquals("Reply not received", notice.javaClass.methods.singleOrNull { it.name == "getNoticeTitle" }?.invoke(notice))
+            }
+            waitFor("both honest notices") { shown.size == 2 }
+            // Replay the same actual delivery inputs: identity-based dedup must not show either a second time.
+            records.toList().forEach { alerts.onFinalReply(it) }
             settle()
-            assertTrue("$shown", shown.isEmpty())
+            assertEquals(expected.map { "$it@$work" }, shown.toList())
+            assertEquals("no failure text is spoken as an answer", 0, spoken)
+            assertEquals("one submission per request, never a recovery resubmit", 2,
+                h.fake.rpcLog.toList().count { it.optString("method") == "prompt.submit" })
+        }
+    }
+
+    @Test
+    fun `true text collector cancellation is silent even when the server later completes`() {
+        harness().use { h ->
+            val work = existing(h, "work", "Done after cancellation.")
+            h.fake.turnBehavior = { "hold" }
+            val accepted = CompletableDeferred<Unit>()
+            val records = Collections.synchronizedList(mutableListOf<com.rumi.hermesvoice.core.notify.FinalReply>())
+            var spoken = 0
+            val chat = ChatService(h.core.sessions, newSendId = { "true-cancel" }, finalReply = { records += it },
+                typedFinal = { _, _, _, _ -> spoken++; false })
+            val job = scope.launch { chat.send(work, "hello", onAccepted = { accepted.complete(Unit) }) }
+            runBlocking { withTimeout(5_000) { accepted.await() } }
+            waitFor("the accepted held turn") { h.fake.heldTurns.containsKey(work) }
+            job.cancel()
+            runBlocking { withTimeout(5_000) { job.join() } }
+            h.fake.finishHeldTurn(work)
+            settle()
+            assertTrue("the collecting coroutine was genuinely cancelled", job.isCancelled)
+            assertTrue("neither a notice nor a successful answer after cancellation", records.isEmpty())
+            assertTrue(shown.isEmpty())
+            assertEquals(0, spoken)
+            assertEquals("cancellation never resubmits", 1,
+                h.fake.rpcLog.toList().count { it.optString("method") == "prompt.submit" })
         }
     }
 }

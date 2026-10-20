@@ -8,6 +8,7 @@ import com.rumi.hermesvoice.core.HermesException
 import com.rumi.hermesvoice.core.HermesPlaybackBusyException
 import com.rumi.hermesvoice.core.HermesPlaybackException
 import com.rumi.hermesvoice.core.HermesProtocolException
+import com.rumi.hermesvoice.core.replyMayStillArrive
 import com.rumi.hermesvoice.core.HermesHttpException
 import com.rumi.hermesvoice.core.net.LaterEnd
 import com.rumi.hermesvoice.core.ResponsePlaybackSettings
@@ -137,7 +138,14 @@ class VoiceTurnRequest(
      * transcript; speech-server recovery never waits past it. Null: only the recovery budget applies.
      */
     val callerDeadlineMs: Long? = null,
-)
+) {
+    @Volatile var namespace: String? = null
+        private set
+    private var namespaceFrozen = false
+    internal fun freezeNamespace(value:String?) = synchronized(this) {
+        if (!namespaceFrozen) { namespace = value; namespaceFrozen = true }
+    }
+}
 
 enum class VoiceTurnStage {
     TRANSCRIBING, ROUTING, CREATING, ACKNOWLEDGING,
@@ -260,7 +268,7 @@ sealed class VoiceTurnOutcome {
     data class RoutingRejected(val transcript: String, val reason: String) : VoiceTurnOutcome()
 
     /** Failed before the destination accepted the transcript: nothing was delivered. */
-    data class NotDelivered(val stage: VoiceTurnStage, val reason: String, val authRequired: Boolean = false) :
+    data class NotDelivered(val stage: VoiceTurnStage, val reason: String, val authRequired: Boolean = false, val possiblySent: Boolean = false) :
         VoiceTurnOutcome() {
         /** Typed diagnostics only (not part of equality): the category and phase observed, never read from [reason]. */
         var diagCause: com.rumi.hermesvoice.core.diag.DiagCause? = null
@@ -412,10 +420,16 @@ class VoiceTurnOrchestrator(
     private val audioPolicy: AudioRecoveryPolicy = AudioRecoveryPolicy(),
     /** Where a reply that ended without audio is kept on this device so a manual Replay survives a process end (null: in memory only). */
     private val unplayedStore: UnplayedReplyStore? = null,
+    /** The accepted prompts whose reply is still owed, kept across a lost connection or a restart; null: none. */
+    private val acceptedTurns: com.rumi.hermesvoice.core.net.AcceptedTurnStore? = null,
+    /** Hands a final answer or notice to the arrival alert and reports whether it is taken care of; null: [finalReply] is used and counts as handled unless it throws. */
+    private val deliver: com.rumi.hermesvoice.core.notify.ReplyDelivery? = null,
+    private val replyNamespace: () -> String? = { null },
 ) {
     private val deliveryLock = Mutex()
     private val floorLock = ownership.lock
     private val recentTurnIds = LinkedHashSet<String>()
+    private val canonicalCancellations=java.util.concurrent.ConcurrentHashMap<String,FinalReply>()
 
     private val pendingTurns = PendingTurns()
 
@@ -610,6 +624,8 @@ class VoiceTurnOrchestrator(
     fun stopTurn(turnId: String): Boolean {
         val job = stoppable[turnId] ?: return false
         stopRequested += turnId
+        canonicalCancellations[turnId]?.let { hand(it) {} }
+        acceptedTurns?.settle(turnId)
         job.cancel(TurnStopped())
         listener.onStopRequested(turnId)
         return true
@@ -664,6 +680,7 @@ class VoiceTurnOrchestrator(
     }
 
     suspend fun run(request: VoiceTurnRequest): VoiceTurnOutcome {
+        request.freezeNamespace(replyNamespace())
         // From here until this request is delivered, answered or refused, later replies wait: the recording's
         // microphone claim becomes this count under the same lock, so there is no gap between them.
         val transmission = Transmission(request)
@@ -682,6 +699,7 @@ class VoiceTurnOrchestrator(
         } finally {
             transmission.end()
             pendingTurns.remove(request.turnId)
+            canonicalCancellations.remove(request.turnId)
             if (!stoppable.containsKey(request.turnId)) stopRequested.remove(request.turnId)
         }
     }
@@ -763,6 +781,12 @@ class VoiceTurnOrchestrator(
             if (!delivered.turn.attributable) {
                 unreleased = null
                 delivered.turn.release()
+                if (delivered.turn.submitStatus == "queued" && request.turnId !in stopRequested) {
+                    hand(FinalReply(ReplyAlert.identityOf(request.turnId, "notice"), delivered.route.destination.storedSessionId,
+                        request.origin, heard = false, cancelled = false, source = FinalReplySource.OWN,
+                        text = com.rumi.hermesvoice.core.HermesQueuedAttributionException().message!!, quiet = privateOutputNow(),
+                        noticeTitle = com.rumi.hermesvoice.core.net.AcceptedTurnReconciler.NOTICE_TITLE, namespace = request.namespace)) {}
+                }
                 return VoiceTurnOutcome.DeliveredUnattributed(delivered.route, delivered.turn.submitStatus)
             }
             transmission.end()
@@ -903,7 +927,23 @@ class VoiceTurnOrchestrator(
                 if (request.sentByVoice) VoiceTurnPrompt.compose(route.originalTranscript) else route.originalTranscript)
             diagnostic(request, "submitted", "status=${submitted.submitStatus} attributable=${submitted.attributable} " +
                 "created=${route.created} direct=${route.direct}")
+            submitted.acceptance?.let { acceptance ->
+                val saved = acceptedTurns?.begin(com.rumi.hermesvoice.core.net.AcceptedTurn(request.turnId, com.rumi.hermesvoice.core.net.AcceptedKind.VOICE,
+                    route.destination.storedSessionId, acceptance, System.currentTimeMillis(), request.namespace))
+                if (saved == false) {
+                    // Not saved: the live wait still delivers the reply, but a closed app could not recover it. Never sent again.
+                    hand(FinalReply(ReplyAlert.identityOf(request.turnId, "limit"), route.destination.storedSessionId, VoiceOrigin.PHONE, heard = false,
+                        cancelled = false, source = FinalReplySource.OWN, text = com.rumi.hermesvoice.core.notify.ReplyAlertContent.NOTICE_LIMIT_TEXT, quiet = true,
+                        noticeTitle = com.rumi.hermesvoice.core.notify.ReplyAlertContent.NOTICE_LIMIT_TITLE, namespace = request.namespace)) {}
+                }
+                if (request.turnId in stopRequested) acceptedTurns?.settle(request.turnId)
+            }
             return Delivered(route, submitted, prepared.settings)
+        } catch (error: com.rumi.hermesvoice.core.HermesPromptUncertainException) {
+            if (request.turnId !in stopRequested) hand(FinalReply(ReplyAlert.identityOf(request.turnId, "notice"), route.destination.storedSessionId,
+                request.origin, heard = false, cancelled = false, source = FinalReplySource.OWN, text = error.message!!,
+                quiet = privateOutputNow(), noticeTitle = com.rumi.hermesvoice.core.net.AcceptedTurnReconciler.NOTICE_TITLE, namespace = request.namespace)) {}
+            return VoiceTurnOutcome.NotDelivered(stage, error.message!!, possiblySent = true).typed(error, diagStageOf(stage))
         } catch (auth: HermesAuthRequiredException) {
             return VoiceTurnOutcome.NotDelivered(stage, auth.message ?: "auth_required", authRequired = true).typed(auth, diagStageOf(stage))
         } catch (error: HermesException) {
@@ -924,6 +964,9 @@ class VoiceTurnOrchestrator(
         val tracker = RecipientResponseTracker(delivered.settings)
         var finalDecision: ResponseDecision? = null
         var finalComplete = false
+        var replyMayArrive = false
+        var finalHandedOver = false
+        var finalRowId: Long? = null
         val privateSeen = java.util.concurrent.atomic.AtomicBoolean(false)
         activity?.begin(request.turnId, route.destination.storedSessionId)
         try {
@@ -934,8 +977,23 @@ class VoiceTurnOrchestrator(
                 when (event) {
                     is RecipientEvent.Activity -> activity?.update(request.turnId, event.label)
                     is RecipientEvent.Interim -> com.rumi.hermesvoice.core.activity.ActivityLabels.interim(event.text)?.let { activity?.update(request.turnId, it) }
-                    is RecipientEvent.Complete -> activity?.end(request.turnId, event.text.isNotBlank() && (event.status == null || event.status == "complete"))
+                    is RecipientEvent.Complete -> {
+                        finalRowId = event.finalRowId
+                        if(event.finalRowId!=null && event.text.isNotBlank() && (event.status==null || event.status=="complete")) {
+                            val target=playbackRoute.current()
+                            val cancellation=FinalReply(ReplyAlert.identityOf(request.turnId,"cancel"),route.destination.storedSessionId,
+                                target?.device?:request.origin,false,true,FinalReplySource.OWN,target?.sink?:request.sink,
+                                canonicalRowId=event.finalRowId,namespace=request.namespace)
+                            canonicalCancellations[request.turnId]=cancellation
+                            if(request.turnId in stopRequested) hand(cancellation) {}
+                        }
+                        activity?.end(request.turnId, event.text.isNotBlank() && (event.status == null || event.status == "complete"))
+                    }
                 }
+                // A remote interrupted/errored completion is terminal non-delivery, not a
+                // successful answer to synthesize (and not cancellation of this client).
+                // Let the exact notice below settle it only after confirmed handoff.
+                if (event is RecipientEvent.Complete && !(event.status == null || event.status == "complete")) return@collect
                 val decision = tracker.onEvent(event) ?: return@collect
                 if (decision.role == SpokenRole.FINAL) {
                     finalDecision = decision
@@ -960,17 +1018,37 @@ class VoiceTurnOrchestrator(
         } catch (error: HermesException) {
             failure = error.message ?: error.javaClass.simpleName
             failureError = error
+            replyMayArrive = !finalComplete && error.replyMayStillArrive()
         } catch (error: IOException) {
             failure = "network: ${error.javaClass.simpleName}"
             failureError = error
+            replyMayArrive = !finalComplete
         } finally {
             activity?.end(request.turnId, false)
+            acceptedTurns?.idle(request.turnId)
         }
         // A real, non-empty final answer was received (never an interim, empty or errored completion): its audio decides the alert.
         finalDecision?.takeIf { finalComplete && it.text.isNotEmpty() }?.let { final ->
             val heard = SpokenRole.FINAL in spoken ||
                 (final.reason == "final_already_spoken" && (SpokenRole.FIRST in spoken || SpokenRole.MIDDLE in spoken))
-            emitFinalReply(request, ReplyAlert.identityOf(request.turnId, "final"), route.destination.storedSessionId, FinalReplySource.OWN, heard, false, final.text, quiet = privateSeen.get())
+            finalHandedOver = true
+            emitFinalReply(request, ReplyAlert.identityOf(request.turnId, "final"), route.destination.storedSessionId, FinalReplySource.OWN, heard, false, final.text, quiet = privateSeen.get(),
+                handled = { if (!replyMayArrive) acceptedTurns?.settle(request.turnId) }, finalRowId=finalRowId)
+        }
+        if (!replyMayArrive && !finalHandedOver && request.turnId !in stopRequested) {
+            // A notice is not an answer to synthesize, replay or follow. Use normal delivery,
+            // retaining owed authority unless the exact identity's surface confirms handoff.
+            val target = playbackRoute.current()
+            val quiet = privateSeen.get() || privateOutputNow()
+            val notice = when (failureError) {
+                is com.rumi.hermesvoice.core.HermesTurnFailedException -> com.rumi.hermesvoice.core.net.AcceptedTurnReconciler.NOTICE_FAILED
+                is HermesException -> com.rumi.hermesvoice.core.net.AcceptedTurnReconciler.NOTICE_NOT_FOUND
+                else -> com.rumi.hermesvoice.core.net.AcceptedTurnReconciler.NOTICE_NO_ANSWER
+            }
+            hand(FinalReply(ReplyAlert.identityOf(request.turnId, "notice"), route.destination.storedSessionId,
+                target?.device ?: request.origin, heard = false, cancelled = false, source = FinalReplySource.OWN,
+                sink = if (quiet) null else target?.sink, text = notice, quiet = quiet,
+                noticeTitle = com.rumi.hermesvoice.core.net.AcceptedTurnReconciler.NOTICE_TITLE, namespace = request.namespace)) { acceptedTurns?.settle(request.turnId) }
         }
         val outcome = when {
             failure != null && SpokenRole.FINAL !in spoken -> VoiceTurnOutcome.DeliveredResponseFailed(route, spoken.toList(), failure!!).also {
@@ -1022,7 +1100,7 @@ class VoiceTurnOrchestrator(
                     val text = event.text.trim()
                     // Use headset on, but no headset connected now and no opt-in: exactly as if neither were on (nothing is spoken or alerted).
                     if (text.isNotEmpty() && (optedIn || forcedByHeadset)) {
-                        admit(arrived, LaterReply(request, storedSessionId, text, sequence++, monotonicMs() + laterDeferMaxMs, headsetOnly = forcedByHeadset))
+                        admit(arrived, LaterReply(request, storedSessionId, text, sequence++, monotonicMs() + laterDeferMaxMs, headsetOnly = forcedByHeadset, finalRowId = event.finalRowId))
                     }
                 }) {
                     LaterEnd.WINDOW -> "window"
@@ -1075,7 +1153,7 @@ class VoiceTurnOrchestrator(
     }
 
     /** One later reply that arrived: spoken (or not) and reported exactly once. */
-    private inner class LaterReply(request: VoiceTurnRequest, val storedSessionId: String, text: String, sequence: Int, deadlineMs: Long, headsetOnly: Boolean = false) :
+    private inner class LaterReply(request: VoiceTurnRequest, val storedSessionId: String, text: String, sequence: Int, deadlineMs: Long, headsetOnly: Boolean = false, val finalRowId:Long?=null) :
         Utterance(request, SpokenRole.FINAL, sequence, text, deadlineMs, own = false) {
         override val headsetOnly: Boolean = headsetOnly
 
@@ -1091,7 +1169,7 @@ class VoiceTurnOrchestrator(
             listener.onLaterReply(request.turnId, played, detail)
             request.listener?.onLaterReply(request.turnId, played, detail)
             emitFinalReply(request, ReplyAlert.identityOf(request.turnId, "later$sequence"), storedSessionId, FinalReplySource.LATER, played, cancelled && !played, text,
-                quiet = binding != null || headsetOnly)
+                quiet = binding != null || headsetOnly, finalRowId = finalRowId)
         }
 
         /** Not played for [detail], unless its sink already confirmed it played to the end: then that is the truth. */
@@ -1105,14 +1183,25 @@ class VoiceTurnOrchestrator(
      * [quiet]: the answer was meant for the headset only (or the headset is the private output now): its arrival alert is visual only
      * here, never a sound on the Phone and never handed to the Watch to sound there.
      */
-    private fun emitFinalReply(request: VoiceTurnRequest, identity: String, storedSessionId: String, source: FinalReplySource, heard: Boolean, cancelled: Boolean, text: String, quiet: Boolean = false) {
+    private fun emitFinalReply(request: VoiceTurnRequest, identity: String, storedSessionId: String, source: FinalReplySource, heard: Boolean, cancelled: Boolean, text: String, quiet: Boolean = false,
+                               handled: () -> Unit = {}, finalRowId:Long?=null) {
         val silent = quiet || privateOutputNow()
         if (!heard && !cancelled && text.isNotBlank()) {
             rememberUnplayed(identity, Unplayed(request.turnId, request.origin, request.sink, request.listener, text, silent, request.originNodeId, storedSessionId))
         }
         val target = playbackRoute.current()
+        hand(FinalReply(identity, storedSessionId, target?.device ?: request.origin, heard, cancelled, source, if (silent) null else target?.sink, text, quiet = silent, canonicalRowId=finalRowId, namespace=request.namespace), handled)
+    }
+
+    private fun hand(reply: FinalReply, handled: () -> Unit) {
+        val delivery = deliver
         runCatching {
-            finalReply(FinalReply(identity, storedSessionId, target?.device ?: request.origin, heard, cancelled, source, if (silent) null else target?.sink, text, quiet = silent))
+            if (delivery == null) {
+                finalReply(reply)
+                handled()
+            } else {
+                delivery(reply) { ok -> if (ok) handled() }
+            }
         }
     }
 

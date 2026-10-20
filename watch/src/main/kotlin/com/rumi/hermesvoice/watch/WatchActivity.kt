@@ -22,6 +22,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.wear.compose.material.Colors
 import androidx.wear.compose.material.MaterialTheme
 import com.google.android.gms.wearable.DataMapItem
@@ -113,11 +114,18 @@ class WatchActivity : ComponentActivity() {
             val reader by app.reader.collectAsStateWithLifecycle()
             val listening by voice.wakeListening.collectAsStateWithLifecycle()
             val unavailable by voice.wakeUnavailable.collectAsStateWithLifecycle()
+            val owed by app.owedFailure.collectAsStateWithLifecycle()
             val chatFocus = remember { FocusRequester() }
             val sessionsFocus = remember { FocusRequester() }
             val onScrollStep = { app.haptic(HapticEvent.SCROLL_STEP) }
             MaterialTheme(colors = WatchColors) {
                 val history = reader.selectedHistory
+                // A "not sent" state is on screen only where the status text is drawn and while it is not replaced by the recording line.
+                val failureOnScreen = owed != null && reader.surface != ReaderSurface.SESSIONS && talk.phase != WatchPhase.RECORDING
+                LaunchedEffect(owed?.turnId, failureOnScreen) {
+                    val id = owed?.turnId
+                    if (id != null && failureOnScreen) repeatOnLifecycle(Lifecycle.State.RESUMED) { app.onFailureDisplayed(id) }
+                }
                 // The whole main screen takes the one-second hold that starts and stops recording (no Talk button).
                 ReaderRoot(
                     modifier = Modifier.readerSwipe(::onSwipe),
@@ -130,12 +138,13 @@ class WatchActivity : ComponentActivity() {
                         reader.surface == ReaderSurface.SESSIONS -> SessionsSurface(reader.sessions, reader.selectedSessionId, sessionsFocus,
                             onSelect = app::selectSession, onRefresh = app::loadSessions, onScrollStep = onScrollStep,
                             onClearLog = app::clearLocalLog)
-                        history != null -> ChatSurface(
+                        history != null -> ReceivedChatSurface(
                             title = reader.sessions.rows.firstOrNull { it.id == history.sessionId }?.title ?: "Conversation",
                             history = history, focusRequester = chatFocus, onOlder = app::loadOlder, onRetry = app::refreshSelected,
                             onScrollStep = onScrollStep,
-                        ) { TalkStatusLine(talk, listening, onReplay = app::replayReply) }
-                        else -> TalkHome(phone, talk, settings.watchWakeEnabled, listening, unavailable, onReplay = app::replayReply)
+                            onDisplayed = { app.contentDisplayed(history.sessionId, it) },
+                        ) { TalkStatusLine(talk, listening, onReplay = app::replayReply, failure = owed?.detail ?: reader.sessions.alertNotice) }
+                        else -> TalkHome(phone, talk, settings.watchWakeEnabled, listening, unavailable, onReplay = app::replayReply, failure = owed?.detail)
                     }
                     // Bezel input goes to the list on screen; focus follows the surface.
                     LaunchedEffect(reader.surface, history != null) {
@@ -209,7 +218,7 @@ class WatchActivity : ComponentActivity() {
             voice.onSettingsPulled(visit)
         }
         // Titles for the chat header and the browser; the open conversation is re-read for new messages.
-        if (app.reader.value.sessions.status == LoadStatus.IDLE) app.loadSessions()
+        app.refreshSessionTitlesOnResume()
         if (app.reader.value.selectedSessionId != null) app.refreshSelected()
         askPermissionsOnce()
         qaHeardPending?.let { (text, final) ->

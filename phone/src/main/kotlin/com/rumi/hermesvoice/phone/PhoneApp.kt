@@ -64,6 +64,14 @@ import com.rumi.hermesvoice.core.notify.ConversationPresence
 import com.rumi.hermesvoice.core.notify.ReplyAlertLedger
 import com.rumi.hermesvoice.core.notify.ReplyAlerts
 import okhttp3.OkHttpClient
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import org.json.JSONArray
+import org.json.JSONObject
+import com.rumi.hermesvoice.core.sessions.AppConversation
+import com.rumi.hermesvoice.core.net.StoredSession
 
 /**
  * Process-wide graph. One [HermesVoiceCore] per (dashboard URL, profile), shared by the Phone UI,
@@ -90,11 +98,150 @@ class PhoneApp : Application() {
     /** This install's own flags (the relay opt-in, notifications asked), excluded from backup and transfer. */
     val localStore by lazy { SharedPreferencesKeyValueStore(prefs(DeviceLocalFlags.PHONE_PREFERENCES)) }
 
+    /** This phone's display preferences (text size), kept in [localStore]. */
+    val display: PhoneDisplaySettings by lazy { PhoneDisplaySettings(localStore) }
+
+    // A small display-only snapshot. It never participates in registry/marker authorization.
+    private val sessionTitlesWrites = Mutex()
+    private val sessionTitlesEpoch = java.util.concurrent.atomic.AtomicLong()
+    @Volatile private var sessionTitlesBlocked = false
+    private data class SessionTitlesHint(val scope: String, val version: Long, val rows: String)
+    private val sessionTitlesHintsLock = Any()
+    @Volatile private var sessionTitlesHints = emptyMap<Boolean, SessionTitlesHint>()
+    private val sessionTitlesRequests = java.util.concurrent.atomic.AtomicLongArray(2)
+    internal val sessionTitlesVersion: Long get() = sessionTitlesEpoch.get()
+
+    // Request order is process-wide (two screen callers), but active and archived scans are independent.
+    internal fun beginSessionTitlesRefresh(archived: Boolean): Long = sessionTitlesRequests.incrementAndGet(if (archived) 1 else 0)
+    internal fun isSessionTitlesRefreshCurrent(archived: Boolean, request: Long): Boolean =
+        sessionTitlesRequests.get(if (archived) 1 else 0) == request
+
+    /** Existing native-auth identity and endpoint/profile, not bearer bytes or an invented account id. */
+    fun sessionListScope(): String? {
+        return runCatching {
+            val auth = tokens.load() ?: return@runCatching null
+            if (auth.provider.isBlank() || auth.userId.isBlank()) return@runCatching null
+            val raw = "${HermesDashboardEndpoint.parse(settings.dashboardUrl)}|${settings.profile}|${auth.provider}|${auth.userId}"
+            MessageDigest.getInstance("SHA-256").digest(raw.toByteArray()).joinToString("") { "%02x".format(it) }
+        }.getOrNull()
+    }
+
+    /** Synchronous private metadata read BEFORE first state publication; never awaits network or a writer. */
+    fun cachedSessionTitles(archived: Boolean): List<AppConversation> {
+        val scope = sessionListScope() ?: return emptyList()
+        val version = sessionTitlesEpoch.get()
+        val recent = sessionTitlesHints[archived]?.takeIf { it.scope == scope && it.version == version }
+        if (recent == null && sessionTitlesBlocked) return emptyList()
+        val restored = runCatching {
+            val rows = if (recent != null) JSONArray(recent.rows) else {
+                val raw = localStore.getString(SESSION_TITLES_KEY) ?: return emptyList()
+                if (raw.length > 200_000) return emptyList()
+                val saved = JSONObject(raw)
+                if (saved.optInt("v") != 1 || saved.optString("scope") != scope) return emptyList()
+                saved.getJSONArray(if (archived) "archived" else "active")
+            }
+            if (rows.length() > 100) return emptyList()
+            val seen = HashSet<String>()
+            (0 until rows.length()).mapNotNull { i ->
+                val row = rows.getJSONObject(i)
+                val id = row.getString("id")
+                if (!com.rumi.hermesvoice.core.voice.DestinationAllowlist.isValidSessionId(id) || !seen.add(id)) return@mapNotNull null
+                val title = row.getString("title").take(512)
+                // No registry read or invented routing alias: this shell is display metadata ONLY.
+                // Every open/history/send/archive/recipient still resolves and verifies the real registry.
+                val display = com.rumi.hermesvoice.core.sessions.OwnedSession(id,
+                    com.rumi.hermesvoice.core.sessions.OwnedRole.CONVERSATION, title, "", "", archived, 0L)
+                AppConversation(display, StoredSession(id, "", title, "", 0.0,
+                    row.optDouble("last_active", 0.0).takeIf { it.isFinite() } ?: 0.0, 0, archived))
+            }
+        }.getOrDefault(emptyList())
+        return restored.takeIf { sessionTitlesEpoch.get() == version && sessionListScope() == scope }.orEmpty()
+    }
+
+    /** Coupled to progressive UI publication, not a durable write or eligibility grant. */
+    internal fun rememberSessionTitles(scope: String?, version: Long, archived: Boolean, rows: List<AppConversation>, current: () -> Boolean): String? {
+        if (scope == null || sessionListScope() != scope || sessionTitlesEpoch.get() != version || !current()) return null
+        val metadata = JSONArray().apply {
+            rows.distinctBy { it.owned.storedSessionId }.take(100).forEach {
+                put(JSONObject().put("id", it.owned.storedSessionId).put("title", it.stored.title.ifBlank { it.owned.title }.take(512))
+                    .put("last_active", it.stored.lastActive))
+            }
+        }.toString()
+        // Remember only title metadata BEFORE the IO dispatch/writer lock. This is not a disk-commit receipt.
+        synchronized(sessionTitlesHintsLock) {
+            if (sessionListScope() != scope || sessionTitlesEpoch.get() != version || !current()) return null
+            sessionTitlesHints = sessionTitlesHints.filterValues { it.scope == scope && it.version == version } +
+                (archived to SessionTitlesHint(scope, version, metadata))
+        }
+        return metadata
+    }
+
+    /** null means superseded, false means an actual persistence failure. UI was already published. */
+    suspend fun saveSessionTitles(scope: String?, version: Long, archived: Boolean, rows: List<AppConversation>, current: () -> Boolean): Boolean? {
+        val metadata = rememberSessionTitles(scope, version, archived, rows, current) ?: return null
+        return withContext(Dispatchers.IO) {
+            sessionTitlesWrites.withLock {
+                if (sessionListScope() != scope || sessionTitlesEpoch.get() != version || !current()) return@withLock null
+                try {
+                    val old = runCatching { JSONObject(localStore.getString(SESSION_TITLES_KEY) ?: "{}") }.getOrDefault(JSONObject())
+                    val saved = if (old.optInt("v") == 1 && old.optString("scope") == scope) old else
+                        JSONObject().put("v", 1).put("scope", scope).put("active", JSONArray()).put("archived", JSONArray())
+                    saved.put(if (archived) "archived" else "active", JSONArray(metadata))
+                    localStore.commitString(SESSION_TITLES_KEY, saved.toString()).also { ok ->
+                        if (!ok) sessionTitlesBlocked = true
+                        else if (sessionTitlesEpoch.get() == version && current()) sessionTitlesBlocked = false
+                    }
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { sessionTitlesBlocked = true; false }
+            }
+        }
+    }
+
+    /** Private recent canonical transcript pages; display-only and excluded with localStore from backup. */
+    /** Login-generation fencing is private to body/receive authority; preserve the title/list protocol scope. */
+    fun bodyScope(): String? = sessionListScope()?.let { stable ->
+        MessageDigest.getInstance("SHA-256").digest("$stable|${tokens.displayGeneration()}".toByteArray()).joinToString("") { "%02x".format(it) }
+    }
+    val recentBodies by lazy {
+        com.rumi.hermesvoice.core.sessions.RecentBodies(localStore, "conversation_bodies_v1", ::bodyScope, appScope) {
+            cacheNotice.value = "Recent messages not saved. Check device storage; online messages remain available."
+        }
+    }
+    val cacheNotice = MutableStateFlow<String?>(null)
+    val received by lazy { com.rumi.hermesvoice.core.sessions.ReceivedConversations(localStore, ::bodyScope) }
+    val finalRecovery by lazy { FinalRecovery(this) }
+    val readerLedger = com.rumi.hermesvoice.core.watchlink.ReaderRequestLedger()
+
+    /** Immediate in-memory fence, then serialized durable clearing; never waits for disk on the UI thread. */
+    fun invalidateSessionTitles() {
+        finalRecovery.invalidate()
+        recentBodies.invalidate()
+        val version = synchronized(sessionTitlesHintsLock) {
+            sessionTitlesBlocked = true
+            sessionTitlesHints = emptyMap()
+            sessionTitlesEpoch.incrementAndGet()
+        }
+        appScope.launch(Dispatchers.IO) {
+            sessionTitlesWrites.withLock {
+                if (sessionTitlesEpoch.get() != version) return@withLock
+                val ok = try { localStore.commitString(SESSION_TITLES_KEY, "{}") }
+                    catch (cancelled: CancellationException) { throw cancelled }
+                    catch (_: Exception) { false }
+                if (!ok) Log.w("HermesVoice", "Session list invalidation was not saved")
+            }
+        }
+    }
+
+    private val SESSION_TITLES_KEY = "session_list_titles_v1"
+
     /** Typed diagnostic events and the user-started, private export of them (see [PhoneDiagnostics]). */
     val diagnostics: PhoneDiagnostics by lazy { PhoneDiagnostics(this) }
 
     /** "Speak later replies": this install's own informed opt-in, off unless switched on here (device-local, never restored). */
     val laterConsent: LaterReplyConsent by lazy { LaterReplyConsent(localStore) }
+
+    /** The "not sent" states owed to Watch nodes until they acknowledge them; app-wide, so a rebuilt core keeps them. */
+    val watchFailureOutbox: com.rumi.hermesvoice.core.watchlink.WatchFailureOutbox by lazy { com.rumi.hermesvoice.core.watchlink.WatchFailureOutbox(localStore) }
 
     /**
      * "Use headset" (Phone-only, off by default): the live audio endpoints, the one policy over them and the preference, and the
@@ -235,6 +382,9 @@ class PhoneApp : Application() {
     fun onActivityStarted() {
         activityVisible = true
         presence.setForeground(true)
+        // Replies of accepted requests that finished while nothing here was waiting for them.
+        wiring?.core?.reconcileAccepted()
+        finalRecovery.start()
         _relayStatus.value = relay.onVisible(microphoneWanted = false, microphonePermission = false)
         // The app's own wake flow resumes next: the background listening gives the microphone back first.
         phoneWake.onAppShown()
@@ -390,6 +540,8 @@ class PhoneApp : Application() {
      */
     @Synchronized
     fun revokeUnplayedReplies(): Boolean {
+        asyncConnection.incrementAndGet()
+        deliveryGeneration.incrementAndGet()
         val current = wiring
         current?.core?.orchestrator?.stopFollowing()
         val orchestratorCleared = current?.core?.orchestrator?.revokeUnplayed() ?: true
@@ -488,16 +640,64 @@ class PhoneApp : Application() {
     }
 
     class Wiring(val key: String, val endpoint: HermesDashboardEndpoint, val core: HermesVoiceCore,
-                 val dashboard: HermesDashboardClient, val connector: HermesGatewayConnector)
+                 val dashboard: HermesDashboardClient, val connector: HermesGatewayConnector, val namespace: String?)
+
+    /** Captured by the initiating caller, not reconstructed by a replacement screen at completion.
+     * Scope contains only the existing endpoint/profile/provider/user identity, never bearer bytes. */
+    class AsyncActionOrigin internal constructor(internal val wiring: Wiring, internal val scope: String?,
+        internal val url: String, internal val profile: String, internal val connection: Long, internal val namespace: String?)
+    private val asyncConnection = java.util.concurrent.atomic.AtomicLong()
+    private val deliveryGeneration = java.util.concurrent.atomic.AtomicLong()
+
+    internal fun asyncActionOrigin(wiring: Wiring) = AsyncActionOrigin(wiring, sessionListScope(),
+        settings.dashboardUrl, settings.profile, asyncConnection.get(), wiring.namespace)
+
+    internal fun asyncActionCurrent(origin: AsyncActionOrigin, authLost: Boolean = false): Boolean {
+        if (wiring !== origin.wiring || asyncConnection.get() != origin.connection ||
+            settings.dashboardUrl != origin.url || settings.profile != origin.profile) return false
+        val scope = sessionListScope()
+        // The current client's rejected refresh clears tokens before reporting auth loss. An
+        // explicit sign-out/connection replacement has already changed this application epoch.
+        return (scope == origin.scope && bodyScope() == origin.namespace) || (authLost && scope == null && origin.scope != null)
+    }
+
+    /** The exchange has not touched live credentials yet. Commit only to its original login. */
+    @Synchronized
+    internal fun completeNativeSignIn(origin: AsyncActionOrigin, session: com.rumi.hermesvoice.core.auth.HermesBearerSession): Boolean {
+        if (!asyncActionCurrent(origin)) return false
+        revokeUnplayedReplies()
+        invalidateSessionTitles()
+        selectedConversationId = null
+        tokens.saveLogin(session)
+        wiring() // Bind the new core now, never dynamically relabel an old core's callbacks.
+        return true
+    }
 
     @Volatile private var wiring: Wiring? = null
+
+    /** Refresh may rotate a token in this construction's epoch. Retired work cannot load,
+     * save or clear a replacement login's credentials, even when the user id is unchanged. */
+    private fun tokensFor(namespace: String?, generation: Long) = object : com.rumi.hermesvoice.core.auth.HermesTokenStore {
+        private fun current() = deliveryGeneration.get() == generation && bodyScope() == namespace
+        override fun load(): com.rumi.hermesvoice.core.auth.HermesBearerSession? = synchronized(this@PhoneApp.tokens) {
+            if(namespace == null || !current()) null else this@PhoneApp.tokens.load()
+        }
+        override fun save(session: com.rumi.hermesvoice.core.auth.HermesBearerSession) = synchronized(this@PhoneApp.tokens) {
+            if(!current()) throw com.rumi.hermesvoice.core.HermesAuthRequiredException("Sign-in connection changed")
+            this@PhoneApp.tokens.save(session)
+        }
+        override fun clear() = synchronized(this@PhoneApp.tokens) {
+            if(current()) this@PhoneApp.tokens.clear()
+        }
+    }
 
     /** Throws [IllegalArgumentException] when the dashboard URL is missing or not an allowed transport. */
     @Synchronized
     fun wiring(): Wiring {
         val endpoint = HermesDashboardEndpoint.parse(settings.dashboardUrl)
         val key = "$endpoint|${settings.profile}"
-        wiring?.takeIf { it.key == key }?.let { return it }
+        val namespaceForReplies = bodyScope()
+        wiring?.takeIf { it.key == key && it.namespace == namespaceForReplies }?.let { return it }
         // The old core's follows end with its connection (their replies are reported as not played).
         wiring?.core?.orchestrator?.stopFollowing()
         wiring?.connector?.close()
@@ -507,7 +707,8 @@ class PhoneApp : Application() {
         // informed opt-in (Settings, off by default, device-local). The CPU is kept awake for each attempt
         // to synthesize and hand one off (bounded), never while it waits. Recordings claim this Phone's
         // microphone in [audio] before opening it, and a later reply is admitted there only when none does.
-        val (core, connector) = HermesVoiceCore.connect(endpoint, http, tokens, registry, settings, DiagVoiceListener(voiceTrace, diagnostics.log),
+        val generationForReplies = deliveryGeneration.incrementAndGet()
+        val (core, connector) = HermesVoiceCore.connect(endpoint, http, tokensFor(namespaceForReplies, generationForReplies), registry, settings, DiagVoiceListener(voiceTrace, diagnostics.log),
             laterScope = appScope, laterWork = ::laterReplyHold,
             wakeListening = { device -> device == VoiceOrigin.PHONE && phoneWakeListening() },
             laterEnabled = { laterConsent.enabled }, ownership = audio,
@@ -516,7 +717,11 @@ class PhoneApp : Application() {
             headset = headset, phoneSink = PhoneSpeakerSink(this, headsetDevices, focusEligible = ::playbackFocusEligible),
             recoveryClock = android.os.SystemClock::elapsedRealtime,
             unplayedStore = com.rumi.hermesvoice.core.voice.UnplayedReplyStore(FencedKeyValueStore({ SharedPreferencesKeyValueStore(unplayedPrefs()) }, ::unplayedCacheBlocked),
-                key = com.rumi.hermesvoice.core.voice.UnplayedReplyStore.KEY + "_" + digest(key)))
+                key = com.rumi.hermesvoice.core.voice.UnplayedReplyStore.KEY + "_" + digest(key)),
+            watchFailures = watchFailureOutbox, replyNamespace = { namespaceForReplies },
+            onConversationCreated = { id -> finalRecovery.created(id, namespaceForReplies) },
+            onConversationVerified = { id,after -> finalRecovery.verified(id,after,namespaceForReplies) },
+            replyGeneration = generationForReplies)
         val dashboard = core.speech as HermesDashboardClient
         pendingJob?.cancel()
         pendingJob = appScope.launch { core.orchestrator.pending.collect { pendingTurns.value = it } }
@@ -532,7 +737,7 @@ class PhoneApp : Application() {
             publishWakeEpoch(WakeEpochItem(episode.epoch, episode.claimId))
         }
         publishWakeEpoch(WakeEpochItem(core.wakeAdmission.epoch))
-        return Wiring(key, endpoint, core, dashboard, connector).also { wiring = it }
+        return Wiring(key, endpoint, core, dashboard, connector, namespaceForReplies).also { wiring = it }
     }
 
     private val laterAttempts = java.util.concurrent.atomic.AtomicInteger()
@@ -582,13 +787,27 @@ class PhoneApp : Application() {
      * The arrival alert for a final answer that was not spoken: decides once per answer (bounded, durable, device-local) and
      * shows it here, or hands a Watch-target answer to the Watch's own alert (see [ReplyAlerts]).
      */
-    val replyAlerts: ReplyAlerts by lazy { ReplyAlerts(ReplyAlertLedger(localStore), ReplyAlertNotifier(this), appScope, presence) }
+    val replyAlerts: ReplyAlerts by lazy {
+        ReplyAlerts(ReplyAlertLedger(localStore), ReplyAlertNotifier(this), appScope, presence, everyFinal = true).also { alerts ->
+            alerts.currentNamespace = ::bodyScope
+            alerts.currentGeneration = deliveryGeneration::get
+            alerts.canonicalFinal = finalRecovery::capture
+            alerts.confirmDisplay = { reply -> conversationDisplay?.confirmArrival(reply) ?: false }
+            alerts.confirmOpened = { id -> conversationDisplay?.confirmOpened(id) ?: false }
+        }
+    }
+
+    /** The text requests being sent and answered; they outlive any screen (see [TextSends]). */
+    val textSends: TextSends by lazy { TextSends(appScope) }
+
+    /** The conversation screen that can refresh and confirm what it shows (set by the view model while it lives). */
+    @Volatile var conversationDisplay: ConversationDisplay? = null
 
     /**
      * Which conversation is really in front of the user (foreground AND on the Chat tab). Each time one becomes visible this
      * app's stacked reply alerts for exactly that conversation are removed ([ReplyAlerts.onConversationOpened]).
      */
-    val presence: ConversationPresence by lazy { ConversationPresence().also { it.onOpened = { id -> replyAlerts.onConversationOpened(id) } } }
+    val presence: ConversationPresence by lazy { ConversationPresence().also { it.onOpened = { id -> replyAlerts.onConversationVisible(id) } } }
 
     /** The current wiring if one was already made (never creates one, so a missing dashboard URL is not reported). */
     fun existingWiring(): Wiring? = wiring
@@ -601,8 +820,14 @@ class PhoneApp : Application() {
      */
     val pendingOpen: StateFlow<String?> = _pendingOpen
 
+    private val _pendingOpenTaps = MutableStateFlow(0)
+
+    /** Counts taps, so a tap on an alert whose conversation did not open (its request was kept) tries again. */
+    val pendingOpenTaps: StateFlow<Int> = _pendingOpenTaps
+
     fun requestOpenConversation(storedSessionId: String) {
         _pendingOpen.value = storedSessionId
+        _pendingOpenTaps.update { it + 1 }
     }
 
     fun consumePendingOpen(storedSessionId: String) {

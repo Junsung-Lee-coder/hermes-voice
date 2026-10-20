@@ -30,7 +30,15 @@ open class HermesException(message: String, cause: Throwable? = null) : Exceptio
 /** No usable bearer session: the user must run the dashboard sign-in again. Never bypassed. */
 class HermesAuthRequiredException(message: String) : HermesException(message)
 
-class HermesHttpException(val status: Int, message: String, val sttCode: com.rumi.hermesvoice.core.net.SttCode? = null) : HermesException(message)
+class HermesHttpException(
+    val status: Int,
+    message: String,
+    val sttCode: com.rumi.hermesvoice.core.net.SttCode? = null,
+    /** The server's Retry-After for this answer in milliseconds, when it sent a usable one. */
+    val retryAfterMs: Long? = null,
+    /** True only for the non-success answer of a GET: the one kind of answer a read refresh may ask for again. */
+    val readResponse: Boolean = false,
+) : HermesException(message)
 
 open class HermesProtocolException(message: String, cause: Throwable? = null) : HermesException(message, cause)
 
@@ -46,7 +54,41 @@ class HermesStreamEndedException(message: String) : HermesProtocolException(mess
 /** Hermes itself reported the turn as failed (an error event or an error completion). */
 class HermesTurnFailedException(message: String) : HermesProtocolException(message)
 
-class HermesRpcException(val code: Int, message: String) : HermesException(message)
+/** The accepted turn's reply can never be matched to its request (the server restarted, dropped the events, or runs the session under another id). */
+open class HermesReplyUnrecoverableException(message: String) : HermesProtocolException(message)
+
+/** Queued ACK has no envelope identity; it is accepted but no final is attributable. */
+class HermesQueuedAttributionException : HermesReplyUnrecoverableException(
+    "Hermes accepted this message while busy, but this protocol cannot identify its queued reply. Open the conversation to check it; do not retry this request.")
+
+/** A prompt frame may have reached Hermes; NEVER retry that same request. */
+class HermesPromptUncertainException(cause: Throwable) : HermesProtocolException(
+    "Your message may have reached Hermes, but its acceptance could not be confirmed. Open the conversation to check it; do not retry this request.", cause)
+
+/** The WebSocket refused the prompt frame before taking it; a later explicit Retry is safe. */
+class HermesPromptNotSentException(cause: Throwable) : HermesProtocolException("The message was not sent; the gateway connection was unavailable.", cause)
+
+enum class SendDelivery { NOT_SENT, POSSIBLY_SENT, ACCEPTED }
+
+/** False when the failure shows the reply is not coming (Hermes failed the turn, or it can't be recovered): then nothing is left to wait for. */
+fun HermesException.replyMayStillArrive(): Boolean =
+    this is HermesAuthRequiredException || (this is HermesProtocolException && this !is HermesTurnFailedException && this !is HermesReplyUnrecoverableException)
+
+/** The gateway answered a call with a JSON-RPC error. [reason] is its machine-readable `data.reason` (bounded; "" when it sent none). */
+open class HermesRpcException(val code: Int, message: String, val reason: String = "") : HermesException(message)
+
+/**
+ * `prompt.submit` was refused with code 4090 and reason SESSION_NOT_OWNED: another Hermes process (the TUI, Desktop, another gateway)
+ * holds the session. The gateway refused before accepting the prompt, so nothing was sent. The message is written by this app.
+ */
+class SessionInUseException : HermesRpcException(CODE, MESSAGE, REASON) {
+    companion object {
+        const val CODE = 4090
+        const val REASON = "SESSION_NOT_OWNED"
+        const val MESSAGE = "This session is currently in use in the TUI or another Hermes runtime. " +
+            "Release or close it there and retry; nothing was sent."
+    }
+}
 
 /** The originating device could not play (or confirm playing) an utterance. */
 open class HermesPlaybackException(message: String) : HermesException(message)

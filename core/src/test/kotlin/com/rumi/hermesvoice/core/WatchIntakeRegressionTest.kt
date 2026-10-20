@@ -103,7 +103,7 @@ class WatchIntakeRegressionTest {
             val last = messages.last()
             assertEquals(WatchLinkPaths.STATE, last.first)
             assertTrue("the Watch leaves its waiting state", last.second.terminal)
-            assertEquals(com.rumi.hermesvoice.core.watchlink.WatchTurnIntake.STOPPED_ON_PHONE, last.second.detail)
+            assertEquals("stopped on the phone before the request was submitted: not sent", "Not sent: stopped on the phone before it was sent", last.second.detail)
             assertTrue("the utterance in progress is stopped on the Watch", messages.any { it.first == WatchLinkPaths.STOP })
             assertEquals("the transcript was not delivered after the stop", 0, h.fake.prompts.count { it.first == work })
         }

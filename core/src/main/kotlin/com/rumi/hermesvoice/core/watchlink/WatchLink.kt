@@ -40,6 +40,12 @@ import org.json.JSONObject
 object WatchLinkPaths {
     const val TURN_PREFIX = "/hv/v1/turn/"
     const val STATE = "/hv/v1/state"
+
+    /** Watch → Phone: this Watch has just seen the Phone; send again the "not sent" states still owed to it (empty body). Answered to the asking node only. */
+    const val STATE_SYNC = "/hv/v1/state/sync"
+
+    /** Watch → Phone: this Watch showed (or had already shown) the "not sent" state of this turn ([TurnStateMessage] with stage "ack"); the Phone stops owing it. */
+    const val STATE_ACK = "/hv/v1/state/ack"
     const val PLAY_PREFIX = "/hv/v1/play/"
     const val PLAYED = "/hv/v1/played"
 

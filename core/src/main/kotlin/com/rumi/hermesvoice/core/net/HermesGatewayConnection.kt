@@ -29,10 +29,13 @@ import org.json.JSONObject
 interface GatewayRpc {
     suspend fun call(method: String, params: JSONObject, timeoutMs: Long = HermesGatewayConnection.DEFAULT_CALL_TIMEOUT_MS): JSONObject
     fun subscribe(sessionId: String): GatewaySubscription
+
+    /** The server's replay epoch announced in `gateway.ready` (it changes when the server process restarts); "" when unknown. */
+    val replayEpoch: String get() = ""
 }
 
-/** One `{"method":"event","params":{type, session_id, payload}}` frame from the tui_gateway. */
-data class GatewayEvent(val type: String, val sessionId: String, val payload: JSONObject?)
+/** One `{"method":"event","params":{type, session_id, payload, seq}}` frame from the tui_gateway; [seq] is the per-session replay sequence (0: none). */
+data class GatewayEvent(val type: String, val sessionId: String, val payload: JSONObject?, val seq: Long = 0L)
 
 class GatewaySubscription(
     val sessionId: String,
@@ -40,6 +43,14 @@ class GatewaySubscription(
     private val onClose: (GatewaySubscription) -> Unit,
 ) : Closeable {
     val events: ReceiveChannel<GatewayEvent> get() = channel
+
+    /**
+     * The connection this subscription was opened on (null: the opener cannot say). Compared by reference only, never inspected: it lets
+     * a caller tell "the same socket" from "a replacement" through any wrapper that forwards [GatewayRpc.subscribe].
+     */
+    var origin: Any? = null
+        internal set
+
     override fun close() {
         onClose(this)
         channel.close()
@@ -58,6 +69,8 @@ class HermesGatewayConnection private constructor() : GatewayRpc, Closeable {
     private val ready = CompletableDeferred<Unit>()
     private val nextId = AtomicLong(1)
     @Volatile private var failure: Throwable? = null
+    @Volatile override var replayEpoch: String = ""
+        private set
     private lateinit var socket: WebSocket
 
     val isOpen: Boolean get() = failure == null
@@ -85,18 +98,36 @@ class HermesGatewayConnection private constructor() : GatewayRpc, Closeable {
     }
 
     override suspend fun call(method: String, params: JSONObject, timeoutMs: Long): JSONObject {
-        failure?.let { throw it }
+        failure?.let { if (method == "prompt.submit") throw com.rumi.hermesvoice.core.HermesPromptNotSentException(it) else throw it }
         val id = "r${nextId.getAndIncrement()}"
         val deferred = CompletableDeferred<JSONObject>()
         pending[id] = deferred
+        var sent = false
         try {
             val frame = JSONObject().put("jsonrpc", "2.0").put("id", id).put("method", method).put("params", params)
-            if (!socket.send(frame.toString())) throw failure ?: HermesProtocolException("gateway socket is closed")
+            if (!socket.send(frame.toString())) {
+                val error = failure ?: HermesProtocolException("gateway socket is closed")
+                if (method == "prompt.submit") throw com.rumi.hermesvoice.core.HermesPromptNotSentException(error) else throw error
+            }
+            sent = true
             return try {
                 withTimeout(timeoutMs) { deferred.await() }
             } catch (timeout: TimeoutCancellationException) {
                 throw HermesProtocolException("gateway call $method timed out", timeout)
             }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (refused: HermesRpcException) {
+            // An error envelope proves a response, not the absence of prompt effects. Only this
+            // installed-server guard is known to run before queue/db/build admission.
+            if (method == "prompt.submit" && sent &&
+                !(refused.code == com.rumi.hermesvoice.core.SessionInUseException.CODE && refused.reason == com.rumi.hermesvoice.core.SessionInUseException.REASON)) {
+                throw com.rumi.hermesvoice.core.HermesPromptUncertainException(refused)
+            }
+            throw refused
+        } catch (error: Exception) {
+            if (method == "prompt.submit" && sent) throw com.rumi.hermesvoice.core.HermesPromptUncertainException(error)
+            throw error
         } finally {
             pending.remove(id)
         }
@@ -107,6 +138,7 @@ class HermesGatewayConnection private constructor() : GatewayRpc, Closeable {
         val subscription = GatewaySubscription(sessionId, Channel(Channel.UNLIMITED)) { sub ->
             subscribers[sub.sessionId]?.remove(sub)
         }
+        subscription.origin = this
         subscribers.getOrPut(sessionId) { CopyOnWriteArrayList() }.add(subscription)
         failure?.let { subscription.channel.close(it) }
         return subscription
@@ -127,8 +159,15 @@ class HermesGatewayConnection private constructor() : GatewayRpc, Closeable {
         if (id != null && (frame.has("result") || frame.has("error"))) {
             val waiter = pending[id] ?: return
             val error = frame.optJSONObject("error")
-            if (error != null) {
-                waiter.completeExceptionally(HermesRpcException(error.optInt("code"), error.optString("message").take(300)))
+            if (frame.has("error")) {
+                if (error == null || frame.has("result")) {
+                    waiter.completeExceptionally(HermesProtocolException("malformed gateway RPC response"))
+                    return
+                }
+                val reason = (error.optJSONObject("data")?.opt("reason") as? String).orEmpty().take(MAX_REASON_CHARS)
+                // Do not coerce a string/fractional code into the exact known refusal's authority.
+                val code = error.opt("code") as? Int ?: 0
+                waiter.completeExceptionally(HermesRpcException(code, error.optString("message").take(300), reason))
             } else {
                 waiter.complete(frame.optJSONObject("result") ?: JSONObject())
             }
@@ -136,8 +175,9 @@ class HermesGatewayConnection private constructor() : GatewayRpc, Closeable {
         }
         if (frame.optString("method") != "event") return
         val params = frame.optJSONObject("params") ?: return
-        val event = GatewayEvent(params.optString("type"), params.optString("session_id"), params.optJSONObject("payload"))
+        val event = GatewayEvent(params.optString("type"), params.optString("session_id"), params.optJSONObject("payload"), params.optLong("seq", 0L))
         if (event.type == "gateway.ready") {
+            replayEpoch = event.payload?.optString("replay_epoch").orEmpty()
             ready.complete(Unit)
             return
         }
@@ -162,6 +202,7 @@ class HermesGatewayConnection private constructor() : GatewayRpc, Closeable {
         const val PROTOCOL = "hermes-gateway-v1"
         const val TICKET_PROTOCOL_PREFIX = "hermes-gateway-ticket."
         const val DEFAULT_CALL_TIMEOUT_MS = 30_000L
+        private const val MAX_REASON_CHARS = 64
 
         suspend fun open(http: OkHttpClient, url: HttpUrl, ticket: String, readyTimeoutMs: Long = 15_000): HermesGatewayConnection {
             require(ticket.isNotBlank() && ticket.none { it == ',' || it.isWhitespace() }) { "invalid ws ticket" }

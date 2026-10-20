@@ -135,7 +135,7 @@ class PhoneComposerFlowRoboTest {
 
     @Test fun F02_aFailedSendIsVisibleKeepsItsContentAndNeverOverwritesANewerDraft_andRetryDeliversIt() {
         val work = conversation("work")
-        fake.turnBehavior = { "session_limit" }
+        fake.turnBehavior = { "not_owned" }
         val model = open(work)
         model.setDraft("lost words")
         model.send()
@@ -155,7 +155,7 @@ class PhoneComposerFlowRoboTest {
 
     @Test fun F03_dismissingAFailedSendDropsItAndKeepsTheDraft() {
         val model = open(conversation("work"))
-        fake.turnBehavior = { "session_limit" }
+        fake.turnBehavior = { "not_owned" }
         model.setDraft("x")
         model.send()
         assertTrue(await { model.state.value.failedSends.size == 1 })
@@ -168,7 +168,7 @@ class PhoneComposerFlowRoboTest {
     @Test fun F04_aStoredImageOpensInTheViewerThroughTheAuthenticatedClient_andCloseEmptiesTheCache() {
         fake.storedFiles["/img/a.png"] = "image/png" to png
         val model = open(conversation("work"))
-        model.openAttachment(AttachmentRefs.extract("@image:/img/a.png").single())
+        openStoredAttachmentFixture(fake,model,model.state.value.selected!!.storedSessionId,AttachmentRefs.extract("@image:/img/a.png").single())
         assertTrue("ready", await { model.state.value.viewer?.phase == ViewerPhase.READY })
         val viewed = model.state.value.viewer!!.file!!
         assertEquals(PreviewKind.IMAGE, viewed.kind)
@@ -183,10 +183,10 @@ class PhoneComposerFlowRoboTest {
     @Test fun F05_aMissingFileShowsAVisibleNonBreakingFailureAndASecondOpenReplacesTheFirst() {
         fake.storedFiles["attachments/n.txt"] = "text/plain" to "hello".toByteArray()
         val model = open(conversation("work"))
-        model.openAttachment(AttachmentRefs.extract("@file:attachments/gone.txt").single())
+        openStoredAttachmentFixture(fake,model,model.state.value.selected!!.storedSessionId,AttachmentRefs.extract("@file:attachments/gone.txt").single())
         assertTrue(await { model.state.value.viewer?.phase == ViewerPhase.FAILED })
         assertTrue(model.state.value.viewer!!.error!!.contains("no longer has"))
-        model.openAttachment(AttachmentRefs.extract("@file:attachments/n.txt").single())
+        openStoredAttachmentFixture(fake,model,model.state.value.selected!!.storedSessionId,AttachmentRefs.extract("@file:attachments/n.txt").single())
         assertTrue(await { model.state.value.viewer?.phase == ViewerPhase.READY })
         assertEquals(PreviewKind.TEXT, model.state.value.viewer!!.file!!.kind)
         assertEquals("hello", model.state.value.viewer!!.file!!.text)

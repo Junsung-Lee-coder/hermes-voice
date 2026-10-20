@@ -66,7 +66,8 @@ class PhoneRetryScopeRoboTest : PhoneRoboBase() {
         })
     }
 
-    /** Conversation [a] holds an OLDER accepted "ok" and a FAILED, identical "ok"; its history is loaded with both rows. */
+    /** Conversation [a] holds two OLDER canonical identical rows and an exactly UNSENT identical request.
+     * The independent historical row preserves the original duplicate-row/baseline geometry without inventing an effect for a refusal. */
     private class Scenario(val a: String, val b: String, val model: PhoneViewModel, val failed: FailedSend, val inFlight: Int) { val failedId get() = failed.send.id }
 
     private fun failedInA(): Scenario {
@@ -77,7 +78,8 @@ class PhoneRetryScopeRoboTest : PhoneRoboBase() {
         model.send()
         assertTrue("the older send reached Hermes", await { prompts() == listOf("ok") })
         settle()
-        fake.turnBehavior = { "session_limit" }
+        fake.injectRow(a, "user", "ok") // independent older stored row, NOT the refused request
+        fake.turnBehavior = { "not_owned" }
         model.setDraft("ok")
         model.send()
         assertTrue("the second send failed and is kept", await { model.state.value.failedSends.size == 1 })
@@ -177,21 +179,46 @@ class PhoneRetryScopeRoboTest : PhoneRoboBase() {
         val promptsBefore = prompts().size
         val latch = CountDownLatch(1)
         fake.turnBehavior = { latch.await(20, TimeUnit.SECONDS); "start_first" }
-        model.open(app.wiring().core.sessions.activeConversation(s.b)!!)
-        assertEquals("the page of the other conversation has not landed: A is still selected", s.a, model.state.value.selected?.storedSessionId)
-        model.retryFailedSend(s.failedId)
-        val pending = model.state.value.pendingSends.single()
-        assertEquals(s.a, pending.send.sessionId)
-        assertEquals("A's own baseline", newest, pending.baselineRowId)
-        assertTrue(await { model.state.value.selected?.storedSessionId == s.b })
-        assertEquals("the other conversation shows nothing of A", 0, nodes("failed_send_${s.failedId}"))
-        assertTrue(model.state.value.pendingSends.filter { it.send.sessionId == s.b }.isEmpty())
-        latch.countDown()
-        assertTrue(await { prompts().size == promptsBefore + 1 })
-        openOwned(model, s.a)
-        assertTrue(await { userRows(model, "ok") == 3 && model.state.value.pendingSends.isEmpty() })
-        settle()
-        assertEquals(promptsBefore + 1, prompts().size)
+        val bHistoryEntered = CountDownLatch(1)
+        val releaseBHistory = CountDownLatch(1)
+        val bHistoryExited = CountDownLatch(1)
+        val previousMessagesHook = fake.messagesHook
+        fake.messagesHook = { rowId, offset, limit ->
+            if (rowId == s.b) {
+                bHistoryEntered.countDown()
+                try {
+                    assertTrue("B history is released within the bounded fixture window", releaseBHistory.await(20, TimeUnit.SECONDS))
+                } finally {
+                    bHistoryExited.countDown()
+                }
+            }
+            previousMessagesHook?.invoke(rowId, offset, limit) ?: 0
+        }
+        try {
+            model.open(app.wiring().core.sessions.activeConversation(s.b)!!)
+            assertTrue("the actual B history request entered", await { bHistoryEntered.count == 0L })
+            assertEquals("B history is still held before Retry admission", 1L, bHistoryExited.count)
+            assertEquals("the page of the other conversation has not landed: A is still selected", s.a, model.state.value.selected?.storedSessionId)
+            model.retryFailedSend(s.failedId)
+            val pending = model.state.value.pendingSends.single()
+            assertEquals(s.a, pending.send.sessionId)
+            assertEquals("A's own baseline", newest, pending.baselineRowId)
+            assertEquals("B history stayed held through A's actual Retry admission", 1L, bHistoryExited.count)
+            releaseBHistory.countDown()
+            assertTrue(await { model.state.value.selected?.storedSessionId == s.b })
+            assertEquals("the other conversation shows nothing of A", 0, nodes("failed_send_${s.failedId}"))
+            assertTrue(model.state.value.pendingSends.filter { it.send.sessionId == s.b }.isEmpty())
+            latch.countDown()
+            assertTrue(await { prompts().size == promptsBefore + 1 })
+            openOwned(model, s.a)
+            assertTrue(await { userRows(model, "ok") == 3 && model.state.value.pendingSends.isEmpty() })
+            settle()
+            assertEquals(promptsBefore + 1, prompts().size)
+        } finally {
+            releaseBHistory.countDown()
+            latch.countDown()
+            fake.messagesHook = previousMessagesHook
+        }
     }
 
     @Test fun R06_aSecondTapOnTheSameRetryIsRefused_oneAdmissionOneDispatch() {
@@ -238,7 +265,7 @@ class PhoneRetryScopeRoboTest : PhoneRoboBase() {
         val s = failedInA()
         val model = s.model
         val original = model.state.value.failedSends.single()
-        fake.turnBehavior = { "session_limit" }
+        fake.turnBehavior = { "not_owned" }
         model.setDraft("draft stays")
         model.retryFailedSend(s.failedId)
         assertTrue("failed again", await { model.state.value.failedSends.size == 1 && model.state.value.sendsInFlight == s.inFlight })
@@ -259,7 +286,7 @@ class PhoneRetryScopeRoboTest : PhoneRoboBase() {
         val file = File(app.cacheDir, "a-pick.png").also { it.writeBytes(byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0)) }
         model.addAttachment(android.net.Uri.fromFile(file))
         assertTrue(await { model.state.value.attachments.size == 1 })
-        fake.turnBehavior = { "session_limit" }
+        fake.turnBehavior = { "not_owned" }
         model.setDraft("with file")
         model.send()
         assertTrue(await { model.state.value.failedSends.size == 1 })

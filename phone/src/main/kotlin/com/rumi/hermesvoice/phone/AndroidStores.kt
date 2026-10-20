@@ -62,18 +62,35 @@ class KeystoreTokenStore(context: Context) : HermesTokenStore {
 
     @Synchronized
     override fun save(session: HermesBearerSession) {
+        persist(session, false)
+    }
+
+    /** Explicit native login, unlike an ordinary bearer refresh, starts new private authority. */
+    @Synchronized
+    fun saveLogin(session: HermesBearerSession) {
+        persist(session, true)
+    }
+
+    private fun persist(session: HermesBearerSession, freshLogin: Boolean) {
+        val old = load()
+        val epoch = if (!freshLogin && old?.provider == session.provider && old.userId == session.userId)
+            prefs.getString("display_generation_v1", null) ?: "legacy"
+            else java.util.UUID.randomUUID().toString()
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, key())
         val sealed = cipher.iv + cipher.doFinal(session.toJson().toByteArray(Charsets.UTF_8))
-        check(prefs.edit().putString(KEY_SESSION, Base64.encodeToString(sealed, Base64.NO_WRAP)).commit()) {
+        check(prefs.edit().putString(KEY_SESSION, Base64.encodeToString(sealed, Base64.NO_WRAP)).putString("display_generation_v1", epoch).commit()) {
             "could not persist the Hermes session"
         }
     }
 
     @Synchronized
     override fun clear() {
-        prefs.edit().remove(KEY_SESSION).commit()
+        // Same-user re-login is a new display namespace even if deleting body snapshots failed.
+        prefs.edit().remove(KEY_SESSION).putString("display_generation_v1", java.util.UUID.randomUUID().toString()).commit()
     }
+
+    @Synchronized fun displayGeneration(): String = prefs.getString("display_generation_v1", "legacy") ?: "legacy"
 
     private fun key(): SecretKey {
         val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }

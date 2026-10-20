@@ -384,7 +384,7 @@ class RoutingReviewRepairTest {
     }
 
     @Test
-    fun `rename and unarchive races keep aliases unique, and the limit of 32 holds for every way to add one`() {
+    fun `rename and unarchive races keep aliases unique, and the limit of 100 holds for every way to add one`() {
         CoreHarness().use { h ->
             val a = runBlocking { h.core.sessions.createConversation("A", "a", "") }
             val old = runBlocking { h.core.sessions.createConversation("Old garden", "garden", "") }

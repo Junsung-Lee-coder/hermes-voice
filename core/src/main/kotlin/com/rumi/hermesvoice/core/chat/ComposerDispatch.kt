@@ -69,14 +69,16 @@ object ComposerDispatch {
     }
 
     /** Whether Hermes has the message: everything except a failure before it was sent. */
-    fun delivered(result: ChatSendResult): Boolean = result !is ChatSendResult.Failed || result.reason.startsWith("sent,")
+    fun delivered(result: ChatSendResult): Boolean = result !is ChatSendResult.Failed || result.delivery != com.rumi.hermesvoice.core.SendDelivery.NOT_SENT
 
     fun failure(send: DispatchedSend, result: ChatSendResult): FailedSend? =
         if (delivered(result)) null else (result as ChatSendResult.Failed).let { FailedSend(send, it.reason, safeLabel(it)) }
 
     /** The fixed-word stage and category of a failed send ("Acceptance not observed: timed out while sending"), or null when none was observed. */
     fun safeLabel(result: ChatSendResult.Failed): String? =
-        com.rumi.hermesvoice.core.diag.DiagLabels.failure(result.stage, result.cause, result.acceptanceObserved)
+        if (result.delivery == com.rumi.hermesvoice.core.SendDelivery.POSSIBLY_SENT) "Acceptance uncertain; check the conversation. Do not retry this request"
+        else if (result.sessionInUse) null
+        else com.rumi.hermesvoice.core.diag.DiagLabels.failure(result.stage, result.cause, result.acceptanceObserved)
 
     /** What a status line shows: the safe label when the failure was typed, else the legacy text. */
     fun statusSafe(result: ChatSendResult): String =

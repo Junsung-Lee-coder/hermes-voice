@@ -90,7 +90,7 @@ class PhoneSentBubbleRoboTest : PhoneRoboBase() {
 
     @Test fun B05_aRejectedSendBecomesAVisibleFailedSendWithItsContent_andRetryShowsAFreshBubble() {
         val work = conversation("work")
-        fake.turnBehavior = { "session_limit" }
+        fake.turnBehavior = { "not_owned" }
         val model = open(work)
         model.setDraft("lost words")
         model.send()

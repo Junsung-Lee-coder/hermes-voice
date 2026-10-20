@@ -18,6 +18,12 @@ import com.google.android.gms.wearable.MessageEvent
 import com.google.android.gms.wearable.Node
 import com.google.android.gms.wearable.Wearable
 import com.rumi.hermesvoice.core.notify.ReplyAlert
+import com.rumi.hermesvoice.core.watchlink.LoadStatus
+import com.rumi.hermesvoice.core.watchlink.ReaderError
+import com.rumi.hermesvoice.core.watchlink.ReaderKind
+import com.rumi.hermesvoice.core.watchlink.ReaderMessageRow
+import com.rumi.hermesvoice.core.watchlink.ReaderRequest
+import com.rumi.hermesvoice.core.watchlink.ReaderResponse
 import com.rumi.hermesvoice.core.watchlink.ReaderSurface
 import com.rumi.hermesvoice.core.watchlink.WatchLinkPaths
 import io.mockk.every
@@ -26,6 +32,7 @@ import io.mockk.mockkStatic
 import io.mockk.unmockkAll
 import java.time.Duration
 import java.util.Collections
+import java.util.concurrent.ConcurrentLinkedQueue
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -54,6 +61,10 @@ class WatchAlertDismissRoboTest {
     private val sent: MutableList<Triple<String, String, ByteArray>> = Collections.synchronizedList(mutableListOf())
     private var controller: ActivityController<WatchActivity>? = null
     private var n = 0
+    private val requests = ConcurrentLinkedQueue<ReaderRequest>()
+    private var readerRows = listOf(ReaderMessageRow(1, "user", "question", false), ReaderMessageRow(2, "assistant", "answer", false))
+    private var readerError: String? = null
+    private var answerReads = true
 
     private val phone = "phone-node"
     private val work = "20260101_120000_workwork"
@@ -72,6 +83,7 @@ class WatchAlertDismissRoboTest {
         every { capability.getCapability(any(), any()) } returns Tasks.forResult(info)
         val messages = mockk<MessageClient>()
         every { messages.sendMessage(any(), any(), any()) } answers {
+            if (secondArg<String>() == WatchLinkPaths.READER_REQUEST) ReaderRequest.decode(thirdArg<ByteArray>())?.let(requests::add)
             sent += Triple(firstArg<String>(), secondArg<String>(), thirdArg<ByteArray>())
             Tasks.forResult(1)
         }
@@ -84,7 +96,21 @@ class WatchAlertDismissRoboTest {
         every { Wearable.getDataClient(any<Context>()) } returns data
     }
 
-    private fun idle(ms: Long = 50) = shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(ms))
+    /** Synthetic Phone pages reach the real request/node-fenced reader; no row carries a final-alert identity. */
+    private fun pump() {
+        if (!answerReads) return
+        while (true) {
+            val request = requests.poll() ?: break
+            app.onReaderResponse(phone, ReaderResponse(request.reqId, request.kind, readerError == null, error = readerError,
+                sessionId = request.sessionId, messages = if (readerError == null) readerRows else emptyList(), nextOffset = readerRows.size).encode())
+        }
+    }
+
+    private fun idle(ms: Long = 50) {
+        pump()
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(ms))
+        pump()
+    }
     private fun settle() = repeat(8) { idle(50); Thread.sleep(25) }
     private fun await(timeoutMs: Long = 5000, condition: () -> Boolean): Boolean {
         val end = System.currentTimeMillis() + timeoutMs
@@ -151,6 +177,97 @@ class WatchAlertDismissRoboTest {
 
     private fun readerRequests() = sent.count { it.second == WatchLinkPaths.READER_REQUEST }
 
+    private fun historyRequests() = sent.toList().filter { it.second == WatchLinkPaths.READER_REQUEST }
+        .mapNotNull { ReaderRequest.decode(it.third) }.filter { it.kind == ReaderKind.HISTORY }
+
+    private fun openWork() {
+        launch()
+        app.selectSession(work)
+        assertTrue("initial Phone page is displayed", await {
+            app.reader.value.historyFor(work)?.let { it.status == LoadStatus.READY && it.messages == readerRows } == true
+        })
+        settle()
+    }
+
+    private fun assertDestination(identity: String, session: String) {
+        val notification = alerts().single { it.tag == identity }.notification
+        assertEquals(session, notification.extras.getString("hv_reply_session"))
+        assertEquals(session, shadowOf(notification.contentIntent).savedIntent.getStringExtra("hv_reply_session"))
+    }
+
+
+    private fun heldOpeningResponse(request: ReaderRequest) = ReaderResponse(request.reqId, request.kind, true,
+        sessionId = request.sessionId, messages = readerRows, nextOffset = readerRows.size).encode()
+
+    @Test fun W12_leavingToListDuringOpeningReadKeepsAlertUntilCurrentSuccessfulRead() {
+        val identity = reply(work)
+        answerReads = false
+        launch(tap(work))
+        assertTrue(await { historyRequests().isNotEmpty() })
+        val request = historyRequests().last()
+        app.toggleReaderSurface()
+        assertEquals(ReaderSurface.SESSIONS, app.reader.value.surface)
+        app.onReaderResponse(phone, heldOpeningResponse(request))
+        settle()
+        assertTrue("an exact response off the CHAT surface cannot dismiss", identity in tags())
+        answerReads = true
+        app.toggleReaderSurface()
+        assertTrue("a current successful opening can dismiss", await { identity !in tags() })
+    }
+
+    @Test fun W13_backgroundDuringOpeningReadKeepsAlertUntilNewForegroundRead() {
+        val identity = reply(work)
+        answerReads = false
+        launch(tap(work))
+        assertTrue(await { historyRequests().isNotEmpty() })
+        val request = historyRequests().last()
+        controller!!.pause().stop()
+        idle(50)
+        app.onReaderResponse(phone, heldOpeningResponse(request))
+        settle()
+        assertTrue("successful history is not a foreground read after pause", identity in tags())
+        answerReads = true
+        controller!!.restart().start().resume().visible()
+        assertTrue(await { identity !in tags() })
+    }
+
+    @Test fun W14_sameSelectedWarmTapRetriesReadWithoutLifecycleRoundTrip() {
+        openWork()
+        val identity = reply(work)
+        readerError = ReaderError.UNAVAILABLE
+        controller!!.newIntent(tap(work, identity))
+        settle()
+        assertTrue("refused read retains the only alert", identity in tags())
+        readerError = null
+        val before = historyRequests().size
+        controller!!.newIntent(tap(work, identity))
+        assertTrue(await { historyRequests().size > before })
+        assertTrue("same selected warm tap dismisses only after successful read", await { identity !in tags() })
+        assertEquals(ReaderSurface.CHAT, app.reader.value.surface)
+    }
+
+    @Test fun W15_newOpeningCannotUseSupersededHeldReadOrWrongNodePage() {
+        val identity = reply(work)
+        answerReads = false
+        launch(tap(work))
+        assertTrue(await { historyRequests().isNotEmpty() })
+        val old = historyRequests().last()
+        app.toggleReaderSurface()
+        app.toggleReaderSurface()
+        settle()
+        val current = historyRequests().last()
+        app.onReaderResponse(phone, heldOpeningResponse(old))
+        settle()
+        assertTrue("an older opening cannot dismiss the newer opening", identity in tags())
+        app.onReaderResponse("wrong-node", heldOpeningResponse(current))
+        app.onReaderResponse(phone, ReaderResponse(current.reqId, ReaderKind.HISTORY, true, sessionId = work,
+            messages = readerRows, offset = 99, nextOffset = 101).encode())
+        settle()
+        assertTrue("wrong node/page cannot dismiss", identity in tags())
+        app.onReaderResponse(phone, heldOpeningResponse(current))
+        assertTrue(await { identity !in tags() })
+    }
+
     @Test fun W01_aTappedAlertOpensItsConversationAndRemovesEveryStackedAlertOfThatConversationOnly() {
         val w1 = reply(work)
         val w2 = reply(work)
@@ -177,17 +294,106 @@ class WatchAlertDismissRoboTest {
         assertTrue(await { tags().isEmpty() })
     }
 
-    @Test fun W04_aReplyArrivingWhileItsConversationIsShownPostsNoAlertAndAsksThePhoneForTheNewMessage() {
-        launch()
-        app.selectSession(work)
-        idle(100)
-        val before = readerRequests()
+    // Policy migration of historical W04: visibility / an old assistant row cannot prove this final identity.
+    // Retain the real Phone request and strengthen it to actual new-row display plus no forced navigation.
+    @Test fun W04_aVisibleArrivalRefreshesTheActualReaderAndKeepsAnUnboundFinalAlertWithoutSwitching() {
+        openWork()
+        val before = historyRequests().size
+        readerRows = readerRows + ReaderMessageRow(3, "assistant", "new synthetic final", false)
         deliverReply("turn-visible#later1", work)
-        settle()
-        assertTrue("no alert for what is already on screen: ${tags()}", tags().isEmpty())
-        assertTrue("the conversation on screen is re-read", readerRequests() > before)
+        assertTrue("arrival requests the current conversation from Phone", await { historyRequests().size > before })
+        val refresh = historyRequests().drop(before).single()
+        assertEquals(work, refresh.sessionId)
+        assertEquals(0, refresh.offset)
+        assertTrue(sent.toList().filter { it.second == WatchLinkPaths.READER_REQUEST }.all { it.first == phone })
+        assertTrue("the new page actually updates the displayed history, preserving old rows", await {
+            app.reader.value.selectedHistory?.let { it.status == LoadStatus.READY && it.messages == readerRows } == true
+        })
+        assertEquals(work, app.reader.value.selectedSessionId)
+        assertEquals(ReaderSurface.CHAT, app.reader.value.surface)
+        assertEquals("no supported final-to-row binding: keep the conservative alert", setOf("turn-visible#later1"), tags())
+        assertDestination("turn-visible#later1", work)
+        val after = historyRequests().size
         val other = reply(home)
-        assertEquals("a reply for another conversation still alerts", setOf(other), tags())
+        assertEquals("another conversation cannot refresh or switch this reader", after, historyRequests().size)
+        assertEquals(work, app.reader.value.selectedSessionId)
+        assertEquals(readerRows, app.reader.value.selectedHistory?.messages)
+        assertEquals("both exact destinations keep their own alerts", setOf("turn-visible#later1", other), tags())
+        assertDestination(other, home)
+    }
+
+    @Test fun W08_anUnchangedOldAssistantPageIsRefreshedButCannotSuppressAndReplayDoesNotDuplicate() {
+        openWork()
+        val old = app.reader.value.selectedHistory!!.messages
+        val before = historyRequests().size
+        deliverReply("turn-stale#later1", work)
+        assertTrue("even unchanged history must be requested again", await { historyRequests().size > before })
+        assertEquals(old, app.reader.value.selectedHistory?.messages)
+        assertEquals(LoadStatus.READY, app.reader.value.selectedHistory?.status)
+        assertEquals(setOf("turn-stale#later1"), tags())
+        assertDestination("turn-stale#later1", work)
+        val after = historyRequests().size
+        deliverReply("turn-stale#later1", work)
+        assertEquals(after, historyRequests().size)
+        assertEquals(setOf("turn-stale#later1"), tags())
+    }
+
+    @Test fun W09_aFailedArrivalReadPreservesOldHistoryAndAnUndeliveredIdentityRemainsRetryable() {
+        openWork()
+        val old = app.reader.value.selectedHistory!!.messages
+        val before = historyRequests().size
+        readerError = ReaderError.UNAVAILABLE
+        shadowOf(app).denyPermissions(Manifest.permission.POST_NOTIFICATIONS)
+        deliverReply("turn-read-failed#later1", work)
+        assertTrue("failed read is still a real Phone request", await { historyRequests().size > before })
+        assertTrue("failure is not relabelled successful display", await { app.reader.value.selectedHistory?.error == ReaderError.UNAVAILABLE })
+        assertEquals(old, app.reader.value.selectedHistory?.messages)
+        assertTrue(tags().isEmpty())
+        assertTrue("neither a failed read nor a denied alert spends the identity",
+            !app.localStore.getString("reply_alert_ledger_v1").orEmpty().contains("turn-read-failed#later1"))
+        shadowOf(app).grantPermissions(Manifest.permission.POST_NOTIFICATIONS)
+        deliverReply("turn-read-failed#later1", work)
+        assertEquals(setOf("turn-read-failed#later1"), tags())
+        assertDestination("turn-read-failed#later1", work)
+        assertEquals(ReaderError.UNAVAILABLE, app.reader.value.selectedHistory?.error)
+        deliverReply("turn-read-failed#later1", work)
+        assertEquals(setOf("turn-read-failed#later1"), tags())
+    }
+
+    @Test fun W10_aDelayedArrivalPageCannotSwitchBackAfterUserNavigationOrUpdateTheWrongConversation() {
+        openWork()
+        val before = historyRequests().size
+        answerReads = false
+        deliverReply("turn-delayed#later1", work)
+        assertTrue("arrival really started a refresh", await { historyRequests().size > before })
+        val refresh = historyRequests().drop(before).single()
+        app.selectSession(home)
+        assertTrue(await { app.reader.value.selectedSessionId == home })
+        app.onReaderResponse(phone, ReaderResponse(refresh.reqId, ReaderKind.HISTORY, true, sessionId = work,
+            messages = listOf(ReaderMessageRow(99, "assistant", "late old destination", false)), nextOffset = 1).encode())
+        assertEquals(home, app.reader.value.selectedSessionId)
+        assertTrue(app.reader.value.selectedHistory?.messages?.none { it.rowId == 99L } != false)
+        assertEquals(setOf("turn-delayed#later1"), tags())
+        assertDestination("turn-delayed#later1", work)
+        answerReads = true
+        settle()
+        assertEquals(home, app.reader.value.selectedSessionId)
+        assertEquals(readerRows, app.reader.value.selectedHistory?.messages)
+        assertEquals(setOf("turn-delayed#later1"), tags())
+    }
+
+    @Test fun W11_aTimedOutArrivalReadKeepsTheAlertAndDoesNotPretendTheOldPageWasRefreshed() {
+        openWork()
+        val old = app.reader.value.selectedHistory!!.messages
+        val before = historyRequests().size
+        answerReads = false
+        deliverReply("turn-timeout#later1", work)
+        assertTrue("arrival starts a bounded Phone request", await { historyRequests().size > before })
+        // Drive the production dispatch timeout through its main-looper coroutine; do not inject a reducer timeout.
+        assertTrue("timeout remains visible as timeout", await(20_000) { app.reader.value.selectedHistory?.error == ReaderError.TIMEOUT })
+        assertEquals(old, app.reader.value.selectedHistory?.messages)
+        assertEquals(setOf("turn-timeout#later1"), tags())
+        assertDestination("turn-timeout#later1", work)
     }
 
     @Test fun W05_aViewedIdentityIsNeverPostedAgainAndANewDistinctReplyAfterLeavingIsShown() {

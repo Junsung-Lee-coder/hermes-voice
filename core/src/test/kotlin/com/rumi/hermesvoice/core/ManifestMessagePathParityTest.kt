@@ -22,17 +22,21 @@ class ManifestMessagePathParityTest {
     private val watch = "watch/src/main/kotlin/com/rumi/hermesvoice/watch"
 
     private val constants: Map<String, String> by lazy {
-        Regex("""const val (\w+) = "(/hv/v1/[^"]*)"""").findAll(source("core/src/main/kotlin/com/rumi/hermesvoice/core/watchlink/WatchLink.kt"))
+        val link = Regex("""const val (\w+)\s*=\s*"(/hv/v1/[^"]*)"""").findAll(source("core/src/main/kotlin/com/rumi/hermesvoice/core/watchlink/WatchLink.kt"))
             .associate { it.groupValues[1] to it.groupValues[2] }
+        val finals = Regex("""const val (\w+)\s*=\s*"(/hv/v1/[^"]*)"""").findAll(source("$phone/FinalRecovery.kt"))
+            .associate { it.groupValues[1] to it.groupValues[2] }
+        link + finals
     }
 
-    private fun resolve(names: Collection<String>): Set<String> = names.map { constants.getValue(it) }.toSet()
+    private fun resolve(names: Collection<String>): Set<String> = names.map { if(it.startsWith("/")) it else constants.getValue(it) }.toSet()
 
     /** The constants named by the `when (event.path)` branches of the one `onMessageReceived` in [file]. */
     private fun handledNames(file: String): Set<String> {
         val body = source(file).substringAfter("override fun onMessageReceived(event: MessageEvent)").substringBefore("override fun onDataChanged")
             .substringBefore("\n    /**")
-        val branches = Regex("""WatchLinkPaths\.(\w+)\s*->""").findAll(body).map { it.groupValues[1] }.toSet()
+        val branches = Regex("""(?:WatchLinkPaths|FinalRecovery)\.(\w+)\s*->|"(/hv/v1/[^"]+)"\s*->""").findAll(body)
+            .map { it.groupValues[1].ifEmpty { it.groupValues[2] } }.toSet()
         assertTrue("onMessageReceived of $file has when-branches", branches.isNotEmpty())
         return branches
     }
@@ -72,14 +76,14 @@ class ManifestMessagePathParityTest {
 
     @Test
     fun `every message path the Watch sends to the Phone is handled by the Phone listener and delivered by its manifest`() {
-        val sent = Regex("""sendMessage\(\s*[^,]+,\s*WatchLinkPaths\.(\w+)""").findAll(
+        val sent = Regex("""sendMessage\(\s*[^,]+,\s*(?:WatchLinkPaths\.(\w+)|"(/hv/v1/[^"]+)")""").findAll(
             File(root, watch).walkTopDown().filter { it.isFile && it.extension == "kt" }.joinToString("\n") { it.readText() },
-        ).map { it.groupValues[1] }.toSet()
+        ).map { it.groupValues[1].ifEmpty { it.groupValues[2] } }.toSet()
         assertTrue("the Watch sends messages", sent.isNotEmpty())
         assertTrue("the private-output receipt is one of them", "PRIVATE_AUDIO" in sent)
-        val handled = handledNames("$phone/PhoneWatchBridge.kt")
+        val handled = resolve(handledNames("$phone/PhoneWatchBridge.kt"))
         val filters = serviceFilters(source("phone/src/main/AndroidManifest.xml"), ".PhoneWatchListenerService")
-        assertEquals("sent by the Watch but not handled by the Phone: ${sent - handled}", emptySet<String>(), sent - handled)
+        assertEquals("sent by the Watch but not handled by the Phone: ${resolve(sent) - handled}", emptySet<String>(), resolve(sent) - handled)
         val undelivered = resolve(sent).filterNot { deliverable(filters, it) }
         assertTrue("sent by the Watch but not delivered by the Phone manifest: $undelivered", undelivered.isEmpty())
     }
@@ -90,6 +94,14 @@ class ManifestMessagePathParityTest {
         val filters = serviceFilters(source("watch/src/main/AndroidManifest.xml"), ".WatchListenerService")
         val missing = handled.filterNot { deliverable(filters, it) }
         assertTrue("handled by the Watch but not delivered: $missing", missing.isEmpty())
+        // FinalRecovery has its own default and explicit sender paths, outside WatchLinkPaths.
+        val recovery=source("$phone/FinalRecovery.kt")
+        val defaultSend=Regex("""path\s*:\s*String\s*=\s*(\w+)""").find(recovery)!!.groupValues[1]
+        val explicit=Regex("""send\([^\n]*,\s*(\w+)\)""").findAll(recovery)
+            .map { it.groupValues[1] }.filter { it in constants }.toSet()
+        val sent=resolve(explicit+defaultSend)
+        assertTrue("actual Phone final sender paths have Watch handlers: ${sent-handled}",handled.containsAll(sent))
+        assertTrue("actual Phone final sender paths reach the Watch manifest",sent.all { deliverable(filters,it) })
     }
 
     @Test

@@ -54,7 +54,9 @@ class PhoneQuietReplyAlertTest {
         assertEquals("Done.", n.extras.getCharSequence(Notification.EXTRA_TEXT)?.toString())
         assertNotNull(n.contentIntent)
         assertEquals("the paired-system bridge is left as it was", 0, n.flags and Notification.FLAG_LOCAL_ONLY)
-        assertTrue(n.flags and Notification.FLAG_AUTO_CANCEL != 0)
+        // Review F08 migration: the old contract was `assertTrue(n.flags and Notification.FLAG_AUTO_CANCEL != 0)` (the tap itself removed the alert).
+        // The alert now stays until the tapped conversation was read again, so the platform must not remove it on the tap.
+        assertEquals("the tap does not remove the alert by itself", 0, n.flags and Notification.FLAG_AUTO_CANCEL)
     }
 
     @Test fun `a normal alert is unchanged - the default channel and no silent flag`() {

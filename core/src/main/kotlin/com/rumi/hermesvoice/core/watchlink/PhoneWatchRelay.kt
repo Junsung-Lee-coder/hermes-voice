@@ -137,6 +137,8 @@ class WatchPlaybackSink(
     /** How long the player's position may stand still, after it advanced at least once, before playback is taken as dead. */
     private val progressStallMs: Long = PROGRESS_STALL_MS,
 ) : PlaybackSink {
+    /** Actual paired destination of this existing route, never inferred from discovery order. */
+    val nodeId: String get() = transport.nodeId
     override suspend fun play(audio: SpokenAudio, cue: PlaybackCue) = playConfirmed(audio, cue) {}
 
     override suspend fun deliverReplyAlert(alert: com.rumi.hermesvoice.core.notify.ReplyAlert): Boolean = try {
@@ -231,6 +233,8 @@ class WatchTurnIntake(
      */
     private val navigation: () -> Boolean = { false },
     private val diag: DiagLog? = null,
+    /** Where a final "not sent" state is kept until the originating Watch acknowledges it; null: it is only sent once. */
+    private val failures: WatchFailureOutbox? = null,
     /** The Phone's routing switch for an upload, read when it arrives (routing off uses the Watch's selection). Last, so it is the trailing lambda. */
     private val routing: (WatchTurnUpload) -> TurnRouting = { TurnRouting.Model },
 ) {
@@ -240,6 +244,16 @@ class WatchTurnIntake(
      * sees it, so it is never accepted as a voice request and never moves the playback route.
      */
     private val origins = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /**
+     * Tells [transport]'s Watch, for [turnId], how the request ended when that is a failure (not sent, not delivered, or acceptance uncertain; nothing here sends it again). Kept in the outbox first, so a Watch that is away (or whose
+     * message is lost) gets it when it asks ([WatchLinkPaths.STATE_SYNC]), until it acknowledges it ([WatchLinkPaths.STATE_ACK]).
+     */
+    private suspend fun retainFailure(turnId: String, transport: WatchTransport, detail: String) {
+        // Kept (and retried by the outbox) before the live send; a refused write leaves it owed by this process only.
+        runCatching { failures?.add(turnId, transport.nodeId, detail) }
+        runCatching { transport.sendMessage(WatchLinkPaths.STATE, TurnStateMessage(turnId, "done", detail, true).encode()) }
+    }
 
     /**
      * The Watch's Stop for one of its own requests ([WatchLinkPaths.CANCEL]): only the node that sent the request may stop it.
@@ -297,12 +311,16 @@ class WatchTurnIntake(
         val listener = object : VoiceTurnListener {
             @Volatile private var navigationAtAccept = false
 
+            /** The submission to Hermes started (or finished): from here "not sent" can no longer be claimed. */
+            @Volatile var submitting = false
+
             // Told at once, before the turn waits its place in line: the Watch keeps its wake claim until this.
             override fun onAccepted(turnId: String, origin: VoiceOrigin) {
                 navigationAtAccept = navigation()
                 states.trySend(TurnStateMessage(turnId, "accepted", "", false))
             }
             override fun onStage(turnId: String, stage: VoiceTurnStage) {
+                if (stage == VoiceTurnStage.DELIVERING || stage == VoiceTurnStage.RESPONDING || stage == VoiceTurnStage.AUDIO_RECOVERING) submitting = true
                 states.trySend(TurnStateMessage(turnId, stage.name.lowercase(), "", false))
             }
             override fun onRouted(route: AssembledRoute) {
@@ -313,6 +331,7 @@ class WatchTurnIntake(
             // or a failure), only for a routed request (routing off already used the Watch's own selection), and only while the
             // choice held when the request was accepted and still holds now. An upload without a generation (an older Watch) is not told.
             override fun onDelivered(route: AssembledRoute) {
+                submitting = true
                 val generation = upload.selectionGeneration ?: return
                 if (route.direct || !navigationAtAccept || !navigation()) return
                 val target = route.destination.storedSessionId
@@ -326,11 +345,17 @@ class WatchTurnIntake(
         } catch (cancelled: CancellationException) {
             // The turn was stopped on the Phone (its background relay was stopped): the Watch is told, so it does not wait on.
             withContext(NonCancellable) {
-                runCatching {
-                    transport.sendMessage(WatchLinkPaths.STATE, TurnStateMessage(upload.turnId, "done", STOPPED_ON_PHONE, true).encode())
-                }
+                if (listener.submitting) {
+                    runCatching {
+                        transport.sendMessage(WatchLinkPaths.STATE, TurnStateMessage(upload.turnId, "done", STOPPED_ON_PHONE, true).encode())
+                    }
+                } else retainFailure(upload.turnId, transport, NOT_SENT_STOPPED)
             }
             throw cancelled
+        } catch (error: Exception) {
+            // The request ended on an unexpected error. Before the submission started it was not sent, and the Watch is told so.
+            withContext(NonCancellable) { if (!listener.submitting) retainFailure(upload.turnId, transport, NOT_SENT_FAILED) }
+            throw error
         } finally {
             origins.remove(upload.turnId)
         }
@@ -357,9 +382,12 @@ class WatchTurnIntake(
             }
             forwarder.join()
             navigator.join()
-            runCatching {
+            val text = VoiceOutcomeText.describe(outcome)
+            if (outcome is VoiceTurnOutcome.NotDelivered || outcome is VoiceTurnOutcome.NotAdmitted || outcome is VoiceTurnOutcome.RoutingRejected) {
+                retainFailure(upload.turnId, transport, text)
+            } else runCatching {
                 transport.sendMessage(WatchLinkPaths.STATE,
-                    TurnStateMessage(upload.turnId, "done", VoiceOutcomeText.describe(outcome), true,
+                    TurnStateMessage(upload.turnId, "done", text, true,
                         replay = outcome is VoiceTurnOutcome.DeliveredResponseFailed).encode())
             }
             outcome
@@ -367,6 +395,8 @@ class WatchTurnIntake(
 
     companion object {
         const val STOPPED_ON_PHONE = "Stopped on the phone"
+        const val NOT_SENT_STOPPED = "Not sent: stopped on the phone before it was sent"
+        const val NOT_SENT_FAILED = "Not sent: the phone could not finish the request. Say it again"
         const val REPLAYED = "Reply played"
         const val REPLAY_UNAVAILABLE = "That reply can't be played again now. Read it on the phone"
     }
@@ -374,6 +404,9 @@ class WatchTurnIntake(
 
 /** Short user-facing text for a turn outcome (Phone status line and Watch terminal state). */
 object VoiceOutcomeText {
+    /** The start of every status that says the request never left the Phone. */
+    const val NOT_SENT = "Not sent"
+
     fun describe(outcome: VoiceTurnOutcome): String = when (outcome) {
         is VoiceTurnOutcome.Completed ->
             "Delivered to ${outcome.route.destination.alias}" + if (outcome.route.created) " (new conversation)" else ""
@@ -385,14 +418,19 @@ object VoiceOutcomeText {
                 (outcome.note?.let { ": ${it.removePrefix("not played: ")}" }
                     ?: com.rumi.hermesvoice.core.diag.DiagLabels.detail(outcome.diagStage, outcome.diagCause)?.let { " ($it)" } ?: "")
         is VoiceTurnOutcome.RoutingRejected -> "Not delivered: routing rejected (${outcome.reason})"
-        is VoiceTurnOutcome.NotDelivered -> when {
-            outcome.authRequired -> "Not delivered: sign in on the phone"
-            outcome.reason == TurnRouting.TARGET_UNAVAILABLE ->
-                "Not sent: routing is off and the selected conversation isn't available. Select another"
-            outcome.diagCause == com.rumi.hermesvoice.core.diag.DiagCause.STT_UNAVAILABLE ->
-                "Not delivered: the speech server stayed unavailable; the recording was discarded. Say it again"
-            else -> com.rumi.hermesvoice.core.diag.DiagLabels.detail(outcome.diagStage, outcome.diagCause)
-                ?.let { "Not delivered: $it" } ?: "Not delivered: ${outcome.reason.take(120)}"
+        is VoiceTurnOutcome.NotDelivered -> {
+            // Before the submission started nothing reached Hermes: that is "not sent". From the submission on, whether it arrived is not known here.
+            val head = if (outcome.stage == VoiceTurnStage.DELIVERING) "Not delivered" else NOT_SENT
+            when {
+                outcome.possiblySent -> "Acceptance uncertain: check the conversation. Do not retry this request"
+                outcome.authRequired -> "$head: sign in on the phone"
+                outcome.reason == TurnRouting.TARGET_UNAVAILABLE ->
+                    "Not sent: routing is off and the selected conversation isn't available. Select another"
+                outcome.diagCause == com.rumi.hermesvoice.core.diag.DiagCause.STT_UNAVAILABLE ->
+                    "$head: the speech server stayed unavailable; the recording was discarded. Say it again"
+                else -> com.rumi.hermesvoice.core.diag.DiagLabels.detail(outcome.diagStage, outcome.diagCause)
+                    ?.let { "$head: $it" } ?: "$head: ${outcome.reason.take(120)}"
+            }
         }
         VoiceTurnOutcome.NoSpeech -> "No speech detected"
         is VoiceTurnOutcome.Duplicate -> "Duplicate turn ignored"

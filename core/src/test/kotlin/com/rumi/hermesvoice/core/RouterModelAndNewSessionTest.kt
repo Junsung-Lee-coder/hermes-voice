@@ -272,7 +272,9 @@ class RouterModelAndNewSessionTest {
             h.fake.turnBehavior = { stored -> if (h.fake.rows[stored]?.source == AppSources.CONVERSATION) "session_limit" else "start_first" }
             val turn = phoneTurn(h, "ns-limit-1")
             val outcome = turn.outcome
-            assertTrue("$outcome", outcome is VoiceTurnOutcome.NotDelivered && outcome.reason.contains("active session limit"))
+            assertTrue("$outcome", outcome is VoiceTurnOutcome.NotDelivered && outcome.possiblySent &&
+                outcome.reason == HermesPromptUncertainException(Exception()).message)
+            assertEquals("Acceptance uncertain: check the conversation. Do not retry this request", com.rumi.hermesvoice.core.watchlink.VoiceOutcomeText.describe(outcome!!))
             assertEquals(1, turn.played.size)
         }
     }

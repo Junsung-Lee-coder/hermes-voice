@@ -50,8 +50,20 @@ data class StoredSession(
     val lastActive: Double,
     val messageCount: Int,
     val archived: Boolean,
+    /** `sessions.created_source`: stamped once when the row is created; null when the server has no value (or no such field). */
+    val createdSource: String? = null,
+    val parentSessionId: String? = null,
+    val endReason: String? = null,
+    val endedAt: Double? = null,
+    /** On a list row that is a compression chain projected onto its tip: the chain's root id, all ids root-first, and the kind. */
+    val lineageRootId: String? = null,
+    val lineageIds: List<String> = emptyList(),
+    val continuationKind: String? = null,
 ) {
     companion object {
+        private fun text(json: JSONObject, key: String): String? =
+            if (json.isNull(key)) null else json.optString(key).trim().takeIf { it.isNotEmpty() }
+
         fun fromJson(json: JSONObject): StoredSession = StoredSession(
             id = json.optString("id"),
             source = json.optString("source"),
@@ -61,6 +73,13 @@ data class StoredSession(
             lastActive = json.optDouble("last_active", json.optDouble("started_at", 0.0)).takeUnless { it.isNaN() } ?: 0.0,
             messageCount = json.optInt("message_count"),
             archived = json.optBoolean("archived", false),
+            createdSource = text(json, "created_source"),
+            parentSessionId = text(json, "parent_session_id"),
+            endReason = text(json, "end_reason"),
+            endedAt = if (json.isNull("ended_at")) null else json.optDouble("ended_at").takeUnless { it.isNaN() },
+            lineageRootId = text(json, "_lineage_root_id"),
+            lineageIds = json.optJSONArray("_lineage_ids")?.let { ids -> (0 until ids.length()).mapNotNull { ids.optString(it).takeIf(String::isNotEmpty) } }.orEmpty(),
+            continuationKind = text(json, "continuation_kind"),
         )
     }
 }
@@ -69,12 +88,23 @@ data class StoredSessionPage(val sessions: List<StoredSession>, val total: Int)
 
 enum class ArchivedFilter(val wire: String) { EXCLUDE("exclude"), ONLY("only"), INCLUDE("include") }
 
-/** A displayable transcript row. Tool rows and `display_kind: hidden` rows are dropped by [HistoryPage.parse]. */
-data class HistoryMessage(val rowId: Long, val role: String, val text: String, val timestamp: Double)
+/** A displayable transcript row. Tool rows, `display_kind: hidden` rows and the server's typed internal rows are dropped by [HistoryPage.parse]. */
+data class HistoryMessage(val rowId: Long, val role: String, val text: String, val timestamp: Double, val truncated: Boolean = false,
+    val messageUid: String = "", val finishReason: String? = null, val hasToolCalls: Boolean = false) {
+    /** Explicit stop only. Length/tool/verification continuations and unknown legacy finality are not finals. */
+    val final: Boolean get() = role == "assistant" && finishReason == "stop" && !hasToolCalls && text.isNotBlank()
+    /** Visible length-limited content is a receipt, not an authoritative final. */
+    val received: Boolean get() = role == "assistant" && !hasToolCalls && text.isNotBlank() &&
+        (finishReason == null || finishReason == "stop" || finishReason == "length")
+}
 
-data class HistoryPage(val sessionId: String, val messages: List<HistoryMessage>, val returned: Int) {
+/** [rawIds] are the ids of every row the server returned, shown or not, in the server's order; [messages] keeps the shown ones only. */
+data class HistoryPage(val sessionId: String, val messages: List<HistoryMessage>, val returned: Int, val rawIds: List<Long> = emptyList()) {
     companion object {
         private val VISIBLE_ROLES = setOf("user", "assistant")
+
+        /** Rows the server stamps as its own synthetic input or delivery (background-process completions, delegation deliveries): the model reads them, the transcript does not show them. */
+        private val INTERNAL_DISPLAY_KINDS = setOf("hidden", "internal_notification", "async_delegation_complete", "process_complete")
 
         /** `GET /api/sessions/{id}/messages`: `display_content` (desktop projection) wins over raw `content`. */
         fun parse(json: JSONObject): HistoryPage {
@@ -82,13 +112,17 @@ data class HistoryPage(val sessionId: String, val messages: List<HistoryMessage>
             val messages = (0 until rows.length()).mapNotNull { index ->
                 val row = rows.optJSONObject(index) ?: return@mapNotNull null
                 val role = row.optString("role")
-                if (role !in VISIBLE_ROLES || row.optString("display_kind") == "hidden") return@mapNotNull null
+                if (role !in VISIBLE_ROLES || row.optString("display_kind") in INTERNAL_DISPLAY_KINDS) return@mapNotNull null
                 val text = contentText(if (row.has("display_content")) row.opt("display_content") else row.opt("content")).trim()
                 if (text.isEmpty()) return@mapNotNull null
-                HistoryMessage(row.optLong("id", -1), role, text, row.optDouble("timestamp", 0.0).takeUnless { it.isNaN() } ?: 0.0)
+                HistoryMessage(row.optLong("id", -1), role, text, row.optDouble("timestamp", 0.0).takeIf { it.isFinite() } ?: 0.0,
+                    messageUid = row.optString("message_uid").takeUnless { it == "null" }.orEmpty(),
+                    finishReason = row.optString("finish_reason").takeUnless { it.isBlank() || it == "null" },
+                    hasToolCalls = row.optJSONArray("tool_calls")?.length()?.let { it > 0 } == true)
             }
             val pagination = json.optJSONObject("pagination")
-            return HistoryPage(json.optString("session_id"), messages, pagination?.optInt("returned", rows.length()) ?: rows.length())
+            val rawIds = (0 until rows.length()).mapNotNull { index -> rows.optJSONObject(index)?.takeIf { it.has("id") }?.optLong("id") }
+            return HistoryPage(json.optString("session_id"), messages, pagination?.optInt("returned", rows.length()) ?: rows.length(), rawIds)
         }
 
         /** Content is a string or an OpenAI-style parts list; only text parts are shown. */
@@ -124,13 +158,13 @@ class HermesDashboardClient(
 ) : HermesSpeechGateway, HermesSessionsApi, StoredFileSource {
     private val refreshLock = Mutex()
 
-    suspend fun exchangeNativeCode(code: String, codeVerifier: String): HermesBearerSession = withContext(Dispatchers.IO) {
+    suspend fun exchangeNativeCode(code: String, codeVerifier: String, persist: Boolean = true): HermesBearerSession = withContext(Dispatchers.IO) {
         val body = JSONObject().put("code", code).put("code_verifier", codeVerifier)
         val session = execute(request(endpoint.route("auth/native/token"), "POST", body, bearer = null)).use {
             if (it.code != 200) throw HermesHttpException(it.code, "native token exchange failed (${it.code})")
             HermesBearerSession.fromJson(it.body?.string().orEmpty())
         }
-        tokens.save(session)
+        if (persist) tokens.save(session)
         session
     }
 
@@ -175,11 +209,14 @@ class HermesDashboardClient(
         return SpokenAudio(bytes, mime)
     }
 
-    /** `GET /api/sessions?source=…` — the server-side source filter; `source` is categorization, not access control. */
-    override suspend fun listSessions(source: String, archived: ArchivedFilter, limit: Int, offset: Int): StoredSessionPage {
-        require(source.isNotBlank()) { "source filter is required" }
+    /** `GET /api/sessions`, optionally with the server's `source` / `exclude_sources` filters; `source` is a routing label, not access control. */
+    override suspend fun listSessions(source: String?, archived: ArchivedFilter, limit: Int, offset: Int, excludeSources: List<String>): StoredSessionPage {
+        require(source == null || source.isNotBlank()) { "source filter must not be blank" }
         val url = endpoint.route("api/sessions").newBuilder()
-            .addQueryParameter("source", source)
+            .apply {
+                if (source != null) addQueryParameter("source", source)
+                if (excludeSources.isNotEmpty()) addQueryParameter("exclude_sources", excludeSources.joinToString(","))
+            }
             .addQueryParameter("archived", archived.wire)
             .addQueryParameter("order", "recent")
             .addQueryParameter("limit", limit.coerceIn(1, 100).toString())
@@ -199,11 +236,14 @@ class HermesDashboardClient(
     }
 
     /** `GET /api/sessions/{id}/messages`, newest page first when [offset] is 0 (`order=latest`). */
-    override suspend fun getMessages(sessionId: String, limit: Int, offset: Int): HistoryPage {
+    override suspend fun getMessages(sessionId: String, limit: Int, offset: Int): HistoryPage = historyPage(sessionId,limit,offset,false)
+    override suspend fun getReconciliationMessages(sessionId:String,limit:Int,offset:Int):HistoryPage = historyPage(sessionId,limit,offset,true)
+    private suspend fun historyPage(sessionId:String,limit:Int,offset:Int,reconciliation:Boolean):HistoryPage {
         val url = endpoint.route("api/sessions").newBuilder().addPathSegment(sessionId).addPathSegment("messages")
             .addQueryParameter("limit", limit.coerceIn(1, 500).toString())
             .addQueryParameter("offset", offset.coerceAtLeast(0).toString())
             .addQueryParameter("order", "latest")
+            .apply { if(reconciliation) addQueryParameter("hv_read","reconciliation") }
             .build()
         return HistoryPage.parse(authorized(url, "GET", null))
     }
@@ -304,13 +344,16 @@ class HermesDashboardClient(
             val response = try {
                 execute(request(target, method, body, session.accessToken), client, callRef)
             } catch (error: IOException) {
+                // An exceptionally resumed await can win dispatch over Stop. At the STT boundary,
+                // an inactive caller still owns cancellation, not a failed transcription attempt.
+                if (sttBoundary) currentCoroutineContext().ensureActive()
                 throw sttTransportOr(error, callRef, sttBoundary)
             }
             response.use {
                 when {
                     response.code == 401 && attempt == 0 -> session = refreshAfterRejection(session, callRef)
                     response.code == 401 -> throw HermesAuthRequiredException("Hermes dashboard rejected the refreshed session")
-                    response.code !in 200..299 -> throw failure(url, response).also { if (sttBoundary) currentCoroutineContext().ensureActive() }
+                    response.code !in 200..299 -> throw failure(url, response, read = method == "GET").also { if (sttBoundary) currentCoroutineContext().ensureActive() }
                     else -> return try {
                         parseObject(response, maxBytes)
                     } catch (error: IOException) {
@@ -333,17 +376,26 @@ class HermesDashboardClient(
     private suspend fun refreshAfterRejection(rejected: HermesBearerSession,
                                               call: java.util.concurrent.atomic.AtomicReference<Call?>? = null): HermesBearerSession = refreshLock.withLock {
         val current = tokens.load() ?: throw HermesAuthRequiredException("Hermes dashboard sign-in required")
+        if (current.provider != rejected.provider || current.userId != rejected.userId) {
+            throw HermesAuthRequiredException("Hermes dashboard sign-in changed")
+        }
         if (current.accessToken != rejected.accessToken) return current
+        // The refresh mutex coalesces this client, not a browser sign-in/sign-out. Compare and
+        // commit under the token store's own monitor; never retain it over network/body reads.
+        fun commitIfCurrent(refreshed: HermesBearerSession?) = synchronized(tokens) {
+            if (tokens.load() != current) throw HermesAuthRequiredException("Hermes dashboard sign-in changed during refresh")
+            if (refreshed == null) tokens.clear() else tokens.save(refreshed)
+        }
         if (current.refreshToken.isBlank()) {
-            tokens.clear()
+            commitIfCurrent(null)
             throw HermesAuthRequiredException("Hermes dashboard session expired")
         }
         val body = JSONObject().put("refresh_token", current.refreshToken).put("provider", current.provider)
         execute(request(endpoint.route("auth/native/refresh"), "POST", body, bearer = null), http, call).use { response ->
             when (response.code) {
-                200 -> HermesBearerSession.fromJson(refreshBody(response, call)).also(tokens::save)
+                200 -> HermesBearerSession.fromJson(refreshBody(response, call)).also(::commitIfCurrent)
                 400, 401 -> {
-                    tokens.clear()
+                    commitIfCurrent(null)
                     throw HermesAuthRequiredException("Hermes dashboard session expired; sign in again")
                 }
                 else -> throw HermesHttpException(response.code, "session refresh failed (${response.code})")
@@ -385,7 +437,16 @@ class HermesDashboardClient(
         return buffer.readUtf8()
     }
 
-    private fun failure(url: HttpUrl, response: Response): HermesHttpException {
+    private fun retryAfterMillis(response: Response): Long? {
+        val raw = response.header("Retry-After")?.trim().orEmpty()
+        if (raw.isEmpty()) return null
+        raw.toLongOrNull()?.let { return if (it < 0 || it > Long.MAX_VALUE / 1000) null else it * 1000 }
+        val date = response.headers.getDate("Retry-After") ?: return null
+        return (date.time - System.currentTimeMillis()).coerceAtLeast(0)
+    }
+
+    private fun failure(url: HttpUrl, response: Response, read: Boolean = false): HermesHttpException {
+        val retryAfter = retryAfterMillis(response)
         val detail = runCatching { JSONObject(response.body?.string().orEmpty()).optString("detail") }.getOrNull()
         val path = url.encodedPath
         // Only the transcription route carries the speech envelope, and only an allowlisted code is taken from it: the
@@ -399,7 +460,8 @@ class HermesDashboardClient(
         // The speech-synthesis failure text reaches the later-reply status line and the diagnostic log: the server's wording (it may
         // carry a URL, token or path) is not taken there either.
         if (path.endsWith("/api/audio/speak")) return HermesHttpException(response.code, "$path failed (${response.code})")
-        return HermesHttpException(response.code, "$path failed (${response.code})" + if (detail.isNullOrBlank()) "" else ": ${detail.take(200)}")
+        return HermesHttpException(response.code, "$path failed (${response.code})" + if (detail.isNullOrBlank()) "" else ": ${detail.take(200)}",
+            retryAfterMs = retryAfter, readResponse = read)
     }
 
     private suspend fun execute(request: Request, client: OkHttpClient = http,

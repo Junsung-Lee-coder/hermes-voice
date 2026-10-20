@@ -33,7 +33,7 @@ class ChatAndAttachmentTest {
         val id = conversation()
         val png = byteArrayOf(0x89.toByte(), 'P'.code.toByte(), 'N'.code.toByte(), 'G'.code.toByte(), 1, 2, 3)
         h.core.chat.send(id, "what is this?", listOf(OutgoingAttachment("../../etc/photo.png", "image/png", png)))
-        assertEquals(listOf("session.create", "session.resume", "image.attach_bytes", "prompt.submit"), methods())
+        assertEquals(listOf("session.create", "session.resume", "image.attach_bytes", "session.events.since", "prompt.submit"), methods())
         val attach = h.fake.rpcLog[2].getJSONObject("params")
         assertEquals("photo.png", attach.getString("filename"))
         assertEquals("rt-$id", attach.getString("session_id"))

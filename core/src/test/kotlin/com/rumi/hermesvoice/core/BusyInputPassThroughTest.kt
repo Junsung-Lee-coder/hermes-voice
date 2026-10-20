@@ -42,6 +42,7 @@ class BusyInputPassThroughTest {
     }
 
     private suspend fun collect(turn: SubmittedTurn): List<RecipientEvent> {
+        if (turn.submitStatus == "queued") { r7Refused(turn); return emptyList() }
         val events = mutableListOf<RecipientEvent>()
         turn.collect(8_000) { events += it }
         return events
@@ -66,7 +67,7 @@ class BusyInputPassThroughTest {
         waitFor("B reached the backend while A is unanswered") { submitCalls.size == 2 }
         assertFalse("A is still pending", aEvents.isCompleted)
         assertEquals(listOf("first request", "second request while Hermes works"), fake.rawPrompts.map { it.second })
-        assertTrue("B is attributable behind the in-flight A", b.attributable)
+        assertFalse("a queued ACK is not attributable even behind known A", b.attributable)
         assertEquals("queued", b.submitStatus)
         for (call in submitCalls) {
             assertEquals("only the session and the unchanged text are sent", setOf("session_id", "text"), call.keys().asSequence().toSet() - "profile")
@@ -77,7 +78,7 @@ class BusyInputPassThroughTest {
         fake.pushLaterTurn("dest", complete("answer to A"), withStart = false)
         assertEquals(listOf(RecipientEvent.Complete("answer to A", "complete")), aEvents.await())
         fake.pushLaterTurn("dest", complete("answer to B"))
-        assertEquals(listOf(RecipientEvent.Complete("answer to B", "complete")), bEvents.await())
+        assertEquals(emptyList<RecipientEvent>(), bEvents.await())
     }
 
     @Test
@@ -113,7 +114,7 @@ class BusyInputPassThroughTest {
         fake.pushLaterTurn("dest", complete("stopped early", "interrupted"), withStart = false)
         assertEquals(listOf(RecipientEvent.Complete("stopped early", "interrupted")), aEvents.await())
         fake.pushLaterTurn("dest", complete("B answer"))
-        assertEquals(listOf(RecipientEvent.Complete("B answer", "complete")), bEvents.await())
+        assertEquals(emptyList<RecipientEvent>(), bEvents.await())
     }
 
     @Test
@@ -130,13 +131,13 @@ class BusyInputPassThroughTest {
         val c = port.submit("dest", "C")
         val cEvents = async { collect(c) }
         waitFor("C") { submitCalls.size == 3 }
-        assertTrue(a.attributable && b.attributable && c.attributable)
+        assertTrue(a.attributable); assertFalse(b.attributable); assertFalse(c.attributable)
         fake.pushLaterTurn("dest", complete("a"), withStart = false)
         fake.pushLaterTurn("dest", complete("b"))
         fake.pushLaterTurn("dest", complete("c"))
         assertEquals(listOf(RecipientEvent.Complete("a", "complete")), aEvents.await())
-        assertEquals(listOf(RecipientEvent.Complete("b", "complete")), bEvents.await())
-        assertEquals(listOf(RecipientEvent.Complete("c", "complete")), cEvents.await())
+        assertEquals(emptyList<RecipientEvent>(), bEvents.await())
+        assertEquals(emptyList<RecipientEvent>(), cEvents.await())
     }
 
     @Test
@@ -196,6 +197,6 @@ class BusyInputPassThroughTest {
         assertEquals(listOf(RecipientEvent.Complete("a", "complete")), aEvents.await())
         assertEquals(LaterEnd.SUPERSEDED, a.collectLater(500) { })
         fake.pushLaterTurn("dest", complete("b"))
-        assertEquals(listOf(RecipientEvent.Complete("b", "complete")), bEvents.await())
+        assertEquals(emptyList<RecipientEvent>(), bEvents.await())
     }
 }

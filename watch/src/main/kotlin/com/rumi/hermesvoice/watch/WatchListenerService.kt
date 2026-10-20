@@ -14,6 +14,7 @@ import com.rumi.hermesvoice.core.watchlink.LinkFrame
 import com.rumi.hermesvoice.core.watchlink.PlayRequest
 import com.rumi.hermesvoice.core.watchlink.PlayedAck
 import com.rumi.hermesvoice.core.watchlink.TurnStateMessage
+import com.rumi.hermesvoice.core.watchlink.WatchTalkState
 import com.rumi.hermesvoice.core.watchlink.WatchLinkPaths
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -60,7 +61,13 @@ class WatchListenerService : WearableListenerService() {
     override fun onMessageReceived(event: MessageEvent) {
         val app = WatchApp.from(this)
         when (event.path) {
-            WatchLinkPaths.STATE -> TurnStateMessage.decode(event.data)?.let { app.scope.launch { app.onPhoneState(it) } }
+            "/hv/v1/finals/intake" -> app.onSessionFinals(event.sourceNodeId, event.data)
+            "/hv/v1/finals/receipt_ack" -> app.onSessionFinalReceipt(event.sourceNodeId, event.data)
+            WatchLinkPaths.STATE -> TurnStateMessage.decode(event.data)?.let { state ->
+                // The Phone node is needed only to acknowledge a "not sent" end to it.
+                val source = if (state.terminal && WatchTalkState.isRetainedFailure(state.detail)) event.sourceNodeId else null
+                app.scope.launch { app.onPhoneState(state, source) }
+            }
             WatchLinkPaths.STOP -> TurnStateMessage.decode(event.data)?.let { app.scope.launch { app.stopPlayback("stopped", it.turnId) } }
             WatchLinkPaths.DIAG_REQUEST -> app.onDiagRequest(event.sourceNodeId, event.data, DiagWire.SCHEMA)
             WatchLinkPaths.DIAG_REQUEST_V2 -> app.onDiagRequest(event.sourceNodeId, event.data, DiagWireV2.SCHEMA)

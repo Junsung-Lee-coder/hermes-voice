@@ -67,8 +67,8 @@ class HermesGatewayClientTest {
                 "message.start" to null, FakeHermesDashboard.interim("mine first"), FakeHermesDashboard.complete("mine final"))
         }
         val turn = port.submit("dest", "hello")
-        assertTrue(turn.attributable)
-        assertEquals(listOf(RecipientEvent.Interim("mine first"), RecipientEvent.Complete("mine final", "complete")), collect(turn))
+        assertFalse(turn.attributable)
+        r7Refused(turn)
     }
 
     @Test

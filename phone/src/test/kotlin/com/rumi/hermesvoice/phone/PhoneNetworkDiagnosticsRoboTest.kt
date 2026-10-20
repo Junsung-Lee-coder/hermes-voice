@@ -98,16 +98,22 @@ class PhoneNetworkDiagnosticsRoboTest : PhoneRoboBase() {
         val model = open(work)
         model.setDraft("same words")
         model.send()
-        assertTrue(await { model.state.value.failedSends.size == 1 })
-        val first = model.state.value.failedSends.single()
-        assertEquals("Acceptance not observed: rejected by Hermes while sending", first.label)
-        assertTrue(model.state.value.status.contains("rejected by Hermes"))
+        assertTrue(await { model.state.value.sendsInFlight == 0 && events(DiagCode.REQUEST_FAILED).size == 1 })
+        val firstId = app.textSends.ids.get()
+        assertTrue(model.state.value.failedSends.isEmpty())
+        assertTrue(model.state.value.pendingSends.isEmpty())
+        assertEquals("Acceptance uncertain; check the conversation. Do not retry this request", model.state.value.status)
         assertEquals("one submission only", listOf("same words"), prompts())
         settle()
         assertEquals("no automatic resubmission", listOf("same words"), prompts())
 
-        model.retryFailedSend(first.send.id)
-        assertTrue(await { prompts().size == 2 && model.state.value.failedSends.size == 1 })
+        model.retryFailedSend(firstId)
+        settle()
+        assertEquals("unproved rejection grants no same-send Retry", listOf("same words"), prompts())
+        model.setDraft("same words"); model.send() // independently authored NEW send, not Retry
+        assertTrue(await { prompts().size == 2 && model.state.value.sendsInFlight == 0 && events(DiagCode.REQUEST_FAILED).size == 2 })
+        assertTrue(model.state.value.failedSends.isEmpty())
+        assertEquals("Acceptance uncertain; check the conversation. Do not retry this request", model.state.value.status)
         assertEquals(listOf("same words", "same words"), prompts())
         val failed = events(DiagCode.REQUEST_FAILED)
         assertEquals(2, failed.size)
@@ -140,7 +146,7 @@ class PhoneNetworkDiagnosticsRoboTest : PhoneRoboBase() {
 
     @Test fun theExportCarriesVersionIdentityCoverageAndNoSecrets() {
         val work = conversation("work")
-        fake.turnBehavior = { "session_limit" }
+        fake.turnBehavior = { "not_owned" }
         val model = open(work)
         model.setDraft("SECRET-user-words")
         model.send()
@@ -169,7 +175,7 @@ class PhoneNetworkDiagnosticsRoboTest : PhoneRoboBase() {
 
     @Test fun theJournalIsAppPrivateOutsideTheShareFoldersAndHoldsNoPlaintextIds() {
         val work = conversation("work")
-        fake.turnBehavior = { "session_limit" }
+        fake.turnBehavior = { "not_owned" }
         val model = open(work)
         model.setDraft("SECRET-journal-words")
         model.send()
@@ -185,7 +191,7 @@ class PhoneNetworkDiagnosticsRoboTest : PhoneRoboBase() {
 
     @Test fun aFlushedLogComesBackWhenTheProcessIsRecreated() {
         val work = conversation("work")
-        fake.turnBehavior = { "session_limit" }
+        fake.turnBehavior = { "not_owned" }
         val model = open(work)
         model.setDraft("persist me")
         model.send()
@@ -204,7 +210,7 @@ class PhoneNetworkDiagnosticsRoboTest : PhoneRoboBase() {
 
     @Test fun clearingThisPhonesLogRemovesOnlyDiagnostics() {
         val work = conversation("work")
-        fake.turnBehavior = { "session_limit" }
+        fake.turnBehavior = { "not_owned" }
         val model = open(work)
         model.setDraft("keep my draft state")
         model.send()

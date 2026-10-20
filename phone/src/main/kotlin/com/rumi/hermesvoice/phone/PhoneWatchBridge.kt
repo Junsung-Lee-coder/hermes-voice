@@ -103,12 +103,31 @@ class PhoneWatchListenerService : WearableListenerService() {
 
     override fun onMessageReceived(event: MessageEvent) {
         when (event.path) {
+            FinalRecovery.RECEIPT -> PhoneApp.from(this).finalRecovery.onReceipt(event.sourceNodeId, event.data)
             WatchLinkPaths.PLAYED -> {
                 val accepted = runCatching { PhoneApp.from(this).wiring().core.watchAcks.onPlayedMessage(event.sourceNodeId, event.data) }
                 if (accepted.getOrNull() != true) Log.w(TAG, "ignored playback ack from ${event.sourceNodeId.take(8)}")
             }
             WatchLinkPaths.PLAY_PROGRESS ->
                 runCatching { PhoneApp.from(this).wiring().core.watchAcks.onProgressMessage(event.sourceNodeId, event.data) }
+            WatchLinkPaths.STATE_SYNC -> {
+                // The asking Watch sees the Phone again: what is still owed to THAT node (and to no other) is sent to it again.
+                val app = PhoneApp.from(this)
+                val owed = app.watchFailureOutbox.owedTo(event.sourceNodeId)
+                if (owed.isNotEmpty()) {
+                    val transport = DataLayerWatchTransport(applicationContext, event.sourceNodeId)
+                    app.appScope.launch {
+                        for (failure in owed) runCatching {
+                            transport.sendMessage(WatchLinkPaths.STATE, TurnStateMessage(failure.turnId, "done", failure.detail, true).encode())
+                        }
+                    }
+                }
+            }
+            WatchLinkPaths.STATE_ACK -> {
+                val ack = TurnStateMessage.decode(event.data)
+                val settled = ack != null && PhoneApp.from(this).watchFailureOutbox.acknowledge(ack.turnId, event.sourceNodeId)
+                Log.i(TAG, "watch failure acknowledgement from=${event.sourceNodeId.take(8)} settled=$settled")
+            }
             WatchLinkPaths.CANCEL -> {
                 val request = TurnStateMessage.decode(event.data)
                 val stopped = request != null && runCatching {
@@ -161,20 +180,52 @@ class PhoneWatchListenerService : WearableListenerService() {
         val context = applicationContext
         val app = PhoneApp.from(context)
         val request = ReaderRequest.decode(data) ?: return
+        // Bind at listener admission, before the application coroutine can be delayed.
+        val scope = app.sessionListScope()
+        val requestedNamespace = app.bodyScope()
+        val url = app.settings.dashboardUrl
+        val profile = app.settings.profile
+        val carriedRetries = app.readerLedger.admit(nodeId, request) ?: return
+        var retriesSpent: Int? = null
         app.appScope.launch {
+          try {
+            if(app.bodyScope()!=requestedNamespace || app.settings.dashboardUrl!=url || app.settings.profile!=profile) return@launch
             val wiring = runCatching { app.wiring() }.getOrNull()
+            val origin = wiring?.let(app::asyncActionOrigin)
             val response = when {
                 wiring == null -> ReaderResponse(request.reqId, request.kind, ok = false, error = ReaderError.NOT_CONFIGURED,
                     sessionId = request.sessionId).encode()
                 app.tokens.load() == null -> ReaderResponse(request.reqId, request.kind, ok = false, error = ReaderError.SIGN_IN_REQUIRED,
                     sessionId = request.sessionId).encode()
-                else -> PhoneReaderService(wiring.core.sessions).handle(data)
+                else -> {
+                    app.finalRecovery.requestReconcile(origin?.namespace)
+                    PhoneReaderService(wiring.core.sessions, readLog = { Log.i(TAG, it) }, stillCurrent = {
+                        app.bodyScope() == requestedNamespace && app.settings.dashboardUrl == url && app.settings.profile == profile &&
+                            origin != null && app.asyncActionCurrent(origin)
+                    }).handle(data, carriedRetries) { retriesSpent = it }
+                }
             } ?: return@launch
+            val currentScope = app.sessionListScope()
+            val decoded = ReaderResponse.decode(response) ?: return@launch
+            // A list/history read of the previous connection/account cannot be relabelled as the new one.
+            val currentAuthLoss = currentScope == null && decoded.error == ReaderError.SIGN_IN_REQUIRED &&
+                origin != null && app.asyncActionCurrent(origin, authLost = true)
+            val currentOrigin = origin != null && app.asyncActionCurrent(origin)
+            val currentUnconfigured = origin == null && decoded.error == ReaderError.NOT_CONFIGURED && scope == currentScope &&
+                app.settings.dashboardUrl == url && app.settings.profile == profile && app.bodyScope() == requestedNamespace
+            val scoped = if ((scope == currentScope && currentOrigin) || currentAuthLoss || currentUnconfigured)
+                decoded.copy(scope = currentScope, bodyScope = origin?.namespace?.takeIf { currentOrigin }) else
+                ReaderResponse(request.reqId, request.kind, ok = false, error = ReaderError.UNAVAILABLE,
+                    sessionId = request.sessionId, scope = currentScope)
+            val scopedBytes = if (scoped.ok && scoped.scope != null) app.finalRecovery.reader(nodeId, scoped).encode() else scoped.encode()
             val sent = runCatching {
-                Wearable.getMessageClient(context).sendMessage(nodeId, WatchLinkPaths.READER_RESPONSE, response).await()
+                Wearable.getMessageClient(context).sendMessage(nodeId, WatchLinkPaths.READER_RESPONSE, scopedBytes).await()
             }
             Log.i(TAG, "reader ${request.kind.wire} req=${request.reqId.take(12)} to=${nodeId.take(8)} bytes=${response.size} " +
                 "sent=${sent.isSuccess}")
+          } finally {
+            app.readerLedger.finish(nodeId, request.reqId, retriesSpent)
+          }
         }
     }
 

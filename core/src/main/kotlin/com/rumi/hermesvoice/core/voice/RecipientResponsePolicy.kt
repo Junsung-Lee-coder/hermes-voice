@@ -10,7 +10,7 @@ import com.rumi.hermesvoice.core.SpokenRole
  */
 sealed class RecipientEvent {
     data class Interim(val text: String) : RecipientEvent()
-    data class Complete(val text: String, val status: String?) : RecipientEvent()
+    data class Complete(val text: String, val status: String?, val finalRowId: Long? = null) : RecipientEvent()
 
     /** What Hermes is doing right now (a tool or status line), already a bounded display label: shown, never a response and never spoken. */
     data class Activity(val label: String) : RecipientEvent()

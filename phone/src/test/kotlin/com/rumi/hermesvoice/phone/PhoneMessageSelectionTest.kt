@@ -208,13 +208,13 @@ class PhoneMessageSelectionTest {
     fun `S06 a short tap on a link opens it once, a long press on the same link only selects`() {
         val text = "https://example.com/docs/guide 를 참고하세요."
         show(listOf(message(1, "user", text)))
-        rule.onNodeWithTag(textTag(1)).performTouchInput { click(Offset(10f, height / 2f)) }
+        rule.onNodeWithTag(textTag(1)).performTouchInput { click(Offset(10f, 8f)) }
         rule.waitForIdle()
         assertEquals(listOf("https://example.com/docs/guide"), links)
         assertEquals("a tap is not a selection", TextToolbarStatus.Hidden, toolbar.status)
 
         links.clear()
-        rule.onNodeWithTag(textTag(1)).performTouchInput { down(Offset(10f, height / 2f)); advanceEventTime(viewConfiguration.longPressTimeoutMillis + 100); up() }
+        rule.onNodeWithTag(textTag(1)).performTouchInput { down(Offset(10f, 8f)); advanceEventTime(viewConfiguration.longPressTimeoutMillis + 100); up() }
         rule.waitForIdle()
         assertTrue("a long press never opens a link: $links", links.isEmpty())
         val copied = copyFromToolbar()

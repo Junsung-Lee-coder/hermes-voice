@@ -53,14 +53,16 @@ class ComposerScreenContractTest {
         assertTrue(composer.contains("testTag(\"failed_send_\${failed.send.id}\")"))
         assertTrue(composer.contains("onRetry(failed.send.id)"))
         assertTrue(composer.contains("onDismissFailed(failed.send.id)"))
-        val dispatch = block(model, "    private fun dispatch(", "    // ── viewing attachments")
+        val dispatch = block(model, "    private fun onSendAccepted(", "    // ── viewing attachments")
         assertFalse("late callbacks never touch the draft or attachments", dispatch.contains("draft =") || dispatch.contains("attachments ="))
         assertTrue(model.contains("_state.compareAndSet(current, cleared)"))
     }
 
     @Test
     fun `messages render through the link renderer and the file buttons, and links open only on a tap through a plain view intent`() {
-        assertTrue(main.contains("MessageBody(message.text, \"message_text_\${message.rowId}\", onOpenLink, onOpenAttachment"))
+        assertTrue(main.contains("MessageBody(message.text, \"message_text_\${message.rowId}\", onOpenLink,"))
+        assertTrue("actual file button retains its canonical row", main.contains("onOpenMessageAttachment(message, ref)"))
+        assertTrue("actual ChatTab binds source and login generation before click", main.contains("onOpenMessageAttachment = openMessageAttachment") && main.contains("state.historyNamespace"))
         assertTrue("selectable text whose links open on a short tap", content.contains("SelectionContainer {") && content.contains("detectTapGestures("))
         assertTrue(content.contains("MessageLinks.safeUrl(url)"))
         assertTrue(content.contains("Intent(Intent.ACTION_VIEW, Uri.parse(safe)).addCategory(Intent.CATEGORY_BROWSABLE)"))

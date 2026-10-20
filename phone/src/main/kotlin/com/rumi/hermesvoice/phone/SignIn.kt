@@ -19,7 +19,9 @@ import kotlinx.coroutines.withContext
  * redeemed with the PKCE verifier. Returns a short status for the settings screen.
  */
 suspend fun runNativeSignIn(context: Context, timeoutMs: Long = 5 * 60_000L): String {
-    val wiring = PhoneApp.from(context).wiring()
+    val app = PhoneApp.from(context)
+    val wiring = app.wiring()
+    val origin = app.asyncActionOrigin(wiring)
     val pkce = PkcePair.generate()
     val state = HermesNativeSignIn.newState()
     val result = withContext(Dispatchers.IO) {
@@ -36,7 +38,9 @@ suspend fun runNativeSignIn(context: Context, timeoutMs: Long = 5 * 60_000L): St
     return when (result) {
         is LoopbackCallbackResult.Failed -> "Sign-in failed: ${result.reason}"
         is LoopbackCallbackResult.Code -> {
-            val session = wiring.dashboard.exchangeNativeCode(result.code, pkce.verifier)
+            // Stage the exchange result: an old browser callback may not overwrite a new login.
+            val session = wiring.dashboard.exchangeNativeCode(result.code, pkce.verifier, persist = false)
+            check(app.completeNativeSignIn(origin, session)) { "Sign-in connection changed" }
             "Signed in as ${session.userId.ifBlank { "dashboard user" }}"
         }
     }

@@ -4,11 +4,14 @@ import com.rumi.hermesvoice.core.HermesProtocolException
 import com.rumi.hermesvoice.core.diag.DiagStage
 import com.rumi.hermesvoice.core.diag.diagMark
 import com.rumi.hermesvoice.core.voice.RecipientEvent
+import com.rumi.hermesvoice.core.voice.VoiceTurnPrompt
 import java.util.Base64
 import java.util.Locale
 import com.rumi.hermesvoice.core.HermesAuthRequiredException
 import com.rumi.hermesvoice.core.HermesException
 import com.rumi.hermesvoice.core.HermesRpcException
+import com.rumi.hermesvoice.core.HermesReplyUnrecoverableException
+import com.rumi.hermesvoice.core.SessionInUseException
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
@@ -150,6 +153,9 @@ interface SubmittedTurn {
     /** Hermes's `prompt.submit` status (`streaming`, `queued`, ...). */
     val submitStatus: String
 
+    /** What identifies this accepted turn on the gateway, when its events can be found again after a lost connection ([HermesConversationPort.reattach]); null: not recoverable. */
+    val acceptance: TurnAcceptance? get() = null
+
     /**
      * False when Hermes accepted the prompt but its events cannot be attributed to it with
      * certainty; [collect] then refuses (fail closed) rather than speak another turn's reply.
@@ -204,15 +210,22 @@ interface HermesConversationPort {
         throw SessionRuntimeException("unsupported", "this connection can't pin a session's model")
 
     suspend fun submit(storedSessionId: String, text: String, attachments: List<OutgoingAttachment> = emptyList()): SubmittedTurn
+
+    /**
+     * The turn [acceptance] describes, found again on a fresh connection (never sent again): the same runtime session, resumed, and the
+     * server's replay of the events after the prompt was accepted. Throws [com.rumi.hermesvoice.core.HermesReplyUnrecoverableException] when
+     * the events can't be matched to that request (another server epoch, evicted events, another runtime id).
+     */
+    suspend fun reattach(storedSessionId: String, acceptance: TurnAcceptance): SubmittedTurn =
+        throw HermesProtocolException("this connection can't re-attach an accepted turn")
 }
 
 /**
- * `session.resume` (stored id → runtime id), optional attach RPCs, then `prompt.submit` with
- * `queued: true`, so a busy destination queues the turn instead of redirecting/steering its live
- * turn. Events carry no per-prompt id, so attribution is by order: a `streaming` submit owns the
- * next `message.start`; a `queued` submit owns the turn after the in-flight one, and only when the
- * resume snapshot shows no other queued prompt. Anything else is returned as delivered but not
- * [SubmittedTurn.attributable].
+ * `session.resume` (stored id → runtime id), optional attach RPCs, then `prompt.submit` WITHOUT a `queued` flag: the gateway's own
+ * busy-input policy decides whether a busy destination steers, redirects or queues it. Events carry no per-prompt id, so attribution is
+ * by order for proven sequential `streaming` admissions only. A `queued` ACK may merge/drop or sit behind invisible foreign envelopes:
+ * this head-only protocol cannot prove its identity, so every queued send is accepted but NOT attributable. No collector or durable
+ * acceptance is armed. Unresolved work is never retired by an idle-shaped queue projection; no prompt is replayed to recover a reply.
  */
 class GatewayConversationPort(
     private val profile: String? = null,
@@ -227,8 +240,18 @@ class GatewayConversationPort(
     /** Turns submitted here whose subscription is still open, per runtime session id. */
     private val open = ConcurrentHashMap<String, MutableSet<GatewaySubmittedTurn>>()
 
-    /** Orders this app's `prompt.submit` calls per runtime session, so the position of a queued turn is counted in submit order. Held for the RPC only, never for a reply. */
-    private val submitOrder = ConcurrentHashMap<String, Mutex>()
+    /** Known streaming tail plus conservative provisional custody, per runtime and port instance.
+     * Local Stop/release never dequeues remote work. Unknown/queued work stays unproved: neither
+     * text equality, a timer, a replacement socket nor an idle-shaped head projection can clear it.
+     * This is not process-death durability; persisted acceptance has its own admission provenance. */
+    private class SubmitOrder {
+        val mutex = Mutex()
+        var tail: TurnAcceptance? = null
+        var unproven = false
+        fun custody() = unproven
+        fun restore(prior: Boolean) { unproven = prior }
+    }
+    private val submitOrder = ConcurrentHashMap<String, SubmitOrder>()
 
     /** Every RPC is stamped with the same `profile` the REST calls use, so both hit one session store. */
     private fun params(): JSONObject = JSONObject().apply { if (!profile.isNullOrBlank()) put("profile", profile) }
@@ -408,33 +431,178 @@ class GatewayConversationPort(
         val runtimeId = resumed.optString("session_id").ifBlank {
             throw HermesProtocolException("session.resume returned no runtime session id")
         }
-        val alreadyQueued = resumed.has("queued") && !resumed.isNull("queued")
-        val prompt = attach(connection, runtimeId, text, attachments)
+        val order = submitOrder.getOrPut(runtimeId) { SubmitOrder() }
+        val attached = attach(connection, runtimeId, text, attachments)
+        val prompt = attached.prompt
         // This app sends something new to the session: an earlier turn on it no longer follows later
         // replies there (they would be this one's), and one already following stops now.
-        open[runtimeId]?.toList()?.forEach { it.supersede() }
+        open[runtimeId]?.toTypedArray()?.forEach { it.supersede() }
         diagMark(DiagStage.SUBMIT)
-        val subscription = connection.subscribe(runtimeId)
-        try {
-            // No `queued` flag: the gateway's own busy-input policy (display.busy_input_mode) decides whether a
-            // submit to a running session steers, redirects or queues. The app only reports what it was told.
-            return submitOrder.getOrPut(runtimeId) { Mutex() }.withLock {
-                val waitingOfOurs = open[runtimeId]?.count { it.waitingToStart } ?: 0
-                val result = connection.call("prompt.submit", params().put("session_id", runtimeId).put("text", prompt))
-                val status = result.optString("status")
+        // No `queued` flag: the gateway's own busy-input policy (display.busy_input_mode) decides whether a
+        // submit to a running session steers, redirects or queues. The app only reports what it was told.
+        return order.mutex.withLock {
+            // Subscribe first: every event after the replay basis below must reach this turn,
+            // even when a predecessor completes before prompt.submit is accepted.
+            val subscription = connection.subscribe(runtimeId)
+            try {
+                // Only replay of proven streaming admissions can advance known positions.
+                // A head-only/omitted queue cannot retire possibly accepted work, even on this socket.
+                val basis = if (order.unproven) OrdinalBasis(null, lost = true)
+                    else ordinalBasis(connection, runtimeId, listOfNotNull(order.tail))
+                val anchor = basis.anchor
+                // MAYBE-ACCEPTED custody, recorded under this mutex before the frame can leave. Once it
+                // has left the server may have queued it, so every exit that cannot prove otherwise keeps it: Stop/cancellation, a
+                // deadline, a lost socket, a protocol error or a reply this client cannot classify. Only a returned acceptance,
+                // a definitive refusal (restores the PRIOR state below) or a proven streaming admission replaces it.
+                val prior = order.custody()
+                order.unproven = true
+                val result = try {
+                    connection.call("prompt.submit", params().put("session_id", runtimeId).put("text", prompt))
+                } catch (notSent: com.rumi.hermesvoice.core.HermesPromptNotSentException) {
+                    order.restore(prior)
+                    detachQueued(connection, runtimeId, attached.queuedImages)
+                    throw notSent
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (refused: HermesRpcException) {
+                    if (refused.code == SessionInUseException.CODE && refused.reason == SessionInUseException.REASON) {
+                        // Confirmed pre-admission guard: restore only this attempt's provisional custody.
+                        order.restore(prior)
+                        detachQueued(connection, runtimeId, attached.queuedImages)
+                        throw SessionInUseException()
+                    }
+                    throw com.rumi.hermesvoice.core.HermesPromptUncertainException(refused)
+                } catch (uncertain: com.rumi.hermesvoice.core.HermesPromptUncertainException) {
+                    throw uncertain
+                } catch (error: Exception) {
+                    throw com.rumi.hermesvoice.core.HermesPromptUncertainException(error)
+                }
+                val status = (result.opt("status") as? String).orEmpty()
+                if (status !in setOf("streaming", "queued", "steered", "redirected")) {
+                    // No supported acceptance proof: retain provisional custody and close via the
+                    // outer catch BEFORE ChatService/voice can publish accepted or delivered.
+                    throw com.rumi.hermesvoice.core.HermesPromptUncertainException(HermesProtocolException("unsupported prompt submit result"))
+                }
+                val deliveryUnrecoverable = basis.lost && status in setOf("streaming", "queued")
+                // There is no queued envelope identity/cardinality in this protocol. ALL queued
+                // acknowledgements close here: no post-ACK guessing RPC, collector, or durable authority.
                 val turnsToSkip = when {
-                    status == "streaming" -> 0
-                    // Queued behind the turn in flight and any of this app's own queued turns. The resume snapshot shows
-                    // only the head of the gateway's queue: a queue we did not put there, or none where ours should be, is unattributable.
-                    status == "queued" && (alreadyQueued == (waitingOfOurs > 0)) -> 1 + waitingOfOurs
-                    // "steered" / "redirected" (merged into the running turn, whose reply answers it) or an unknown status.
+                    status == "queued" -> -1
+                    deliveryUnrecoverable -> 0
+                    status == "streaming" -> basis.remaining
                     else -> -1
                 }
                 if (turnsToSkip < 0) subscription.close()
-                val turn = GatewaySubmittedTurn(subscription, status, turnsToSkip, status == "queued" && turnsToSkip >= 0) { done -> open[runtimeId]?.remove(done) }
-                if (turnsToSkip >= 0) open.getOrPut(runtimeId) { ConcurrentHashMap.newKeySet() }.add(turn)
+                val acceptance = if (!deliveryUnrecoverable && anchor != null && turnsToSkip >= 0) TurnAcceptance(runtimeId, anchor, connection.replayEpoch, turnsToSkip, admission = "streaming-v1") else null
+                // The returned reply replaces the provisional marker with the prior custody ...
+                order.unproven = prior
+                if (acceptance != null) order.tail = acceptance
+                // ... except accepted without a provable ordinal: the remote tail now includes this work
+                // too. Even restored replay of an older tail cannot silently omit it. A status that is neither
+                // an acceptance (streaming/queued) nor a merge into the live turn (steered/redirected: no FIFO position)
+                // may still have been accepted: unrecognised answers stay unproven.
+                val unclassified = status !in setOf("streaming", "queued", "steered", "redirected")
+                if (acceptance == null && (unclassified || status in setOf("streaming", "queued"))) order.unproven = true
+                val reopener = acceptance?.let { accepted -> TurnReopener { after -> reopen(storedSessionId, accepted, after) } }
+                val turn = GatewaySubmittedTurn(subscription, status, turnsToSkip, status == "queued" && turnsToSkip >= 0, acceptance, reopener,
+                    deliveryUnrecoverable = deliveryUnrecoverable) { done -> open[runtimeId]?.remove(done) }
+                if (turnsToSkip >= 0 && !deliveryUnrecoverable) open.getOrPut(runtimeId) { ConcurrentHashMap.newKeySet() }.add(turn)
                 turn
+            } catch (error: Throwable) {
+                subscription.close()
+                throw error
             }
+        }
+    }
+
+    private class OrdinalBasis(val anchor: Long?, val remaining: Int = 0, val lost: Boolean = false)
+
+    /** Rebase known local FIFO positions on one server replay snapshot, not on collector progress.
+     * This proves only the known same-app FIFO: unknown producers/merged turns are not assigned ids
+     * by this calculation. Expired, restarted or ambiguous replay is a visible delivery failure. */
+    private suspend fun ordinalBasis(connection: GatewayRpc, runtimeId: String, accepted: List<TurnAcceptance>): OrdinalBasis {
+        if (accepted.isEmpty()) return OrdinalBasis(replayAnchor(connection, runtimeId))
+        val first = accepted.minOf { it.anchorSeq }
+        val since = try {
+            connection.call("session.events.since", params().put("session_id", runtimeId).put("last_seen", first), ANCHOR_TIMEOUT_MS)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return OrdinalBasis(null, lost = true)
+        }
+        val anchor = since.optLong("latest_seq", -1L)
+        val epoch = since.optString("epoch")
+        if (anchor < first || since.optBoolean("truncated") || accepted.any {
+            it.epoch.isNotEmpty() && (it.epoch != connection.replayEpoch || (epoch.isNotEmpty() && it.epoch != epoch))
+        }) return OrdinalBasis(null, lost = true)
+        val frames = since.optJSONArray("events") ?: return OrdinalBasis(null, lost = true)
+        val events = (0 until frames.length()).mapNotNull { frames.optJSONObject(it) }
+        // No gap/duplicate/out-of-order frame can silently advance an ordinal.
+        if (events.size != frames.length() || events.size.toLong() != anchor - first || events.withIndex().any { (i, e) ->
+            e.optString("session_id") != runtimeId || e.optLong("seq", -1L) != first + i + 1L
+        }) return OrdinalBasis(null, lost = true)
+        var remaining = 0
+        for (a in accepted) {
+            var left = a.skip + 1
+            for (e in events) {
+                if (e.optLong("seq") <= a.anchorSeq || left == 0) continue
+                when (e.optString("type")) {
+                    "error" -> return OrdinalBasis(null, lost = true) // bare error need not have a terminal complete
+                    "message.complete" -> left--
+                }
+            }
+            remaining = maxOf(remaining, left)
+        }
+        return OrdinalBasis(anchor, remaining)
+    }
+
+    private suspend fun replayAnchor(connection: GatewayRpc, runtimeId: String): Long? = try {
+        connection.call("session.events.since", params().put("session_id", runtimeId).put("last_seen", Long.MAX_VALUE), ANCHOR_TIMEOUT_MS)
+            .optLong("latest_seq", -1L).takeIf { it >= 0 }
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
+        null
+    }
+
+    override suspend fun reattach(storedSessionId: String, acceptance: TurnAcceptance): SubmittedTurn {
+        requireStreamingAdmission(acceptance)
+        val reopened = reopen(storedSessionId, acceptance, acceptance.anchorSeq)
+        return GatewaySubmittedTurn(reopened.subscription, "reattached", acceptance.skip, false, acceptance,
+            TurnReopener { after -> reopen(storedSessionId, acceptance, after) }, reopened.replay) { }
+    }
+
+    private fun requireStreamingAdmission(a: TurnAcceptance) {
+        if (a.admission != "streaming-v1" || a.skip < 0 || a.anchorSeq < 0 || a.runtimeId.isBlank())
+            throw com.rumi.hermesvoice.core.HermesReplyUnrecoverableException("This saved request has no proven streaming admission; its reply cannot be safely attributed.")
+    }
+
+    /** A new connection to the same runtime session, subscribed, with the server's replay of the events after [afterSeq]. */
+    private suspend fun reopen(storedSessionId: String, acceptance: TurnAcceptance, afterSeq: Long): Reopened {
+        requireStreamingAdmission(acceptance)
+        val connection = connections()
+        val resumed = connection.call("session.resume", params().put("session_id", storedSessionId).put("omit_messages", true))
+        if (resumed.optString("session_id") != acceptance.runtimeId) {
+            throw com.rumi.hermesvoice.core.HermesReplyUnrecoverableException("the conversation now runs under another session on the server")
+        }
+        if (acceptance.epoch.isNotEmpty() && connection.replayEpoch != acceptance.epoch) {
+            throw com.rumi.hermesvoice.core.HermesReplyUnrecoverableException("the server restarted after the message was accepted")
+        }
+        val subscription = connection.subscribe(acceptance.runtimeId)
+        try {
+            val since = connection.call("session.events.since", params().put("session_id", acceptance.runtimeId).put("last_seen", afterSeq), ANCHOR_TIMEOUT_MS)
+            if (since.optBoolean("truncated")) {
+                throw com.rumi.hermesvoice.core.HermesReplyUnrecoverableException("the server no longer holds the events after the message was accepted")
+            }
+            val epoch = since.optString("epoch")
+            if (acceptance.epoch.isNotEmpty() && epoch.isNotEmpty() && epoch != acceptance.epoch) {
+                throw com.rumi.hermesvoice.core.HermesReplyUnrecoverableException("the server restarted after the message was accepted")
+            }
+            val frames = since.optJSONArray("events") ?: JSONArray()
+            val replay = (0 until frames.length()).mapNotNull { frames.optJSONObject(it) }.map {
+                GatewayEvent(it.optString("type"), it.optString("session_id"), it.optJSONObject("payload"), it.optLong("seq", 0L))
+            }
+            return Reopened(subscription, replay)
         } catch (error: Throwable) {
             subscription.close()
             throw error
@@ -442,8 +610,8 @@ class GatewayConversationPort(
     }
 
     /** Attaches in order; on any failure, queued images are detached so they cannot leak into a later turn. */
-    private suspend fun attach(connection: GatewayRpc, runtimeId: String, text: String, attachments: List<OutgoingAttachment>): String {
-        if (attachments.isEmpty()) return text
+    private suspend fun attach(connection: GatewayRpc, runtimeId: String, text: String, attachments: List<OutgoingAttachment>): AttachedPrompt {
+        if (attachments.isEmpty()) return AttachedPrompt(text, emptyList())
         diagMark(DiagStage.UPLOAD)
         val queuedImages = mutableListOf<String>()
         val refs = mutableListOf<String>()
@@ -471,13 +639,19 @@ class GatewayConversationPort(
                 }
             }
         } catch (error: Throwable) {
-            for (path in queuedImages) {
-                runCatching { connection.call("image.detach", params().put("session_id", runtimeId).put("path", path)) }
-            }
+            detachQueued(connection, runtimeId, queuedImages)
             throw error
         }
-        if (refs.isEmpty()) return text
-        return (refs + text.ifBlank { null }).filterNotNull().joinToString("\n")
+        if (refs.isEmpty()) return AttachedPrompt(text, queuedImages)
+        return AttachedPrompt((refs + text.ifBlank { null }).filterNotNull().joinToString("\n"), queuedImages)
+    }
+
+    private class AttachedPrompt(val prompt: String, val queuedImages: List<String>)
+
+    private suspend fun detachQueued(connection: GatewayRpc, runtimeId: String, paths: List<String>) {
+        for (path in paths) {
+            runCatching { connection.call("image.detach", params().put("session_id", runtimeId).put("path", path)) }
+        }
     }
 
     companion object {
@@ -529,16 +703,34 @@ class GatewayConversationPort(
     }
 }
 
+private const val ANCHOR_TIMEOUT_MS = 10_000L
+private const val RECOVERY_ATTEMPTS = 4
+private val RECOVERY_BACKOFF_MS = longArrayOf(500, 1_000, 2_000)
+
 private val KNOWN_TYPES = setOf("message.start", "message.interim", "message.delta", "message.complete", "error")
 
 /** Event types that only keep a connection alive: they are not progress of a response. */
 private val KEEP_ALIVE_TYPES = setOf("ping", "pong", "heartbeat", "keepalive", "keep_alive")
 
+/** A new connection's subscription to a runtime session plus the events the server replayed after a watermark. */
+private class Reopened(val subscription: GatewaySubscription, val replay: List<GatewayEvent>)
+
+private fun interface TurnReopener {
+    suspend fun reopen(afterSeq: Long): Reopened
+}
+
 private class GatewaySubmittedTurn(
-    private val subscription: GatewaySubscription,
+    @Volatile private var subscription: GatewaySubscription,
     override val submitStatus: String,
     private var turnsToSkip: Int,
     private val queuedAtSubmit: Boolean,
+    override val acceptance: TurnAcceptance? = null,
+    private val reopener: TurnReopener? = null,
+    /** Events the server already replayed for a re-attached turn: processed before any live one. */
+    replayed: List<GatewayEvent> = emptyList(),
+    /** Accepted, but no trustworthy ordinal can be saved or delivered. Keep the real caller's
+     * normal terminal-failure path instead of silently returning Accepted/untracked. */
+    private val deliveryUnrecoverable: Boolean = false,
     private val onReleased: (GatewaySubmittedTurn) -> Unit,
 ) : SubmittedTurn {
     override val attributable: Boolean = turnsToSkip >= 0
@@ -566,11 +758,70 @@ private class GatewaySubmittedTurn(
     @Volatile private var endedAfterMs = -1L
     @Volatile private var ending = "waiting"
 
+    /** The highest replay sequence handled; an event at or below it (delivered live and again by a replay) is handled once. */
+    private var lastSeq: Long = acceptance?.anchorSeq ?: 0L
+    private val backlog = ArrayDeque(replayed)
+    @Volatile private var recoveries = 0
+
     override fun diagnostics(): String {
         val counts = listOf("message.start", "message.interim", "message.delta", "message.complete", "error")
             .joinToString(" ") { "${it.substringAfter('.')}=${seen[it] ?: 0}" }
         return "submit=$submitStatus skip_left=$turnsToSkip $counts other=${seen["other"] ?: 0} " +
-            "owned_ms=$ownedAfterMs ended_ms=$endedAfterMs end=$ending"
+            "owned_ms=$ownedAfterMs ended_ms=$endedAfterMs recoveries=$recoveries end=$ending"
+    }
+
+    private sealed class Polled {
+        class Got(val event: GatewayEvent) : Polled()
+        class Ended(val cause: Throwable?) : Polled()
+        object Silent : Polled()
+    }
+
+    private suspend fun poll(timeoutMs: Long): Polled {
+        if (backlog.isNotEmpty()) return Polled.Got(backlog.removeFirst())
+        // Waits for the next event that is progress; a keep-alive does not restart the bound.
+        val received = try {
+            withTimeoutOrNull(timeoutMs) { nextProgressEvent() }
+        } catch (lost: HermesException) {
+            return Polled.Ended(lost)
+        } ?: return Polled.Silent
+        return received.getOrNull()?.let { Polled.Got(it) } ?: Polled.Ended(null)
+    }
+
+    /**
+     * The connection was lost or went silent: reconnects to the SAME runtime session and reads the server's replay after [lastSeq]
+     * (never sending the prompt again), up to a few attempts. False when this turn can't be recovered or the server can't be reached;
+     * a reply that can never be matched throws [com.rumi.hermesvoice.core.HermesReplyUnrecoverableException]. After a silence, true only if
+     * the replay held something new (a silent but healthy connection is the inactivity bound's business).
+     */
+    private suspend fun recover(silent: Boolean): Boolean {
+        val reopen = reopener ?: return false
+        var failures = 0
+        while (true) {
+            val reopened = try {
+                reopen.reopen(lastSeq)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (unrecoverable: com.rumi.hermesvoice.core.HermesReplyUnrecoverableException) {
+                ending = "unrecoverable"
+                throw unrecoverable
+            } catch (auth: HermesAuthRequiredException) {
+                throw auth
+            } catch (_: HermesException) {
+                if (++failures >= RECOVERY_ATTEMPTS) return false
+                delay(RECOVERY_BACKOFF_MS[failures - 1])
+                continue
+            } catch (_: java.io.IOException) {
+                if (++failures >= RECOVERY_ATTEMPTS) return false
+                delay(RECOVERY_BACKOFF_MS[failures - 1])
+                continue
+            }
+            val old = subscription
+            subscription = reopened.subscription
+            old.close()
+            backlog.addAll(reopened.replay)
+            recoveries++
+            return !silent || reopened.replay.any { it.seq == 0L || it.seq > lastSeq }
+        }
     }
 
     /**
@@ -578,23 +829,47 @@ private class GatewaySubmittedTurn(
      * message start, delta, interim or complete, an error, any other typed event) starts it afresh; keep-alive
      * pings and timers do not. It never runs while [onEvent] runs, so the synthesis and playback of a reply
      * are not part of it, and no total time limit applies to a healthy response.
+     * A lost connection is recovered inside this call ([recover]) when the turn can be found again; the events of the
+     * normal stream and of the replay are handled once, in sequence order.
      */
     override suspend fun collect(timeoutMs: Long, onEvent: suspend (RecipientEvent) -> Unit) {
-        if (!attributable) throw HermesProtocolException("prompt.submit status '$submitStatus' cannot be attributed to this turn")
+        if (!attributable) {
+            if (submitStatus == "queued") throw com.rumi.hermesvoice.core.HermesQueuedAttributionException()
+            throw HermesProtocolException("prompt.submit status '$submitStatus' cannot be attributed to this turn")
+        }
         var completed = false
         val startedAt = System.nanoTime()
         fun elapsed() = (System.nanoTime() - startedAt) / 1_000_000
         try {
+            if (deliveryUnrecoverable) {
+                ending = "queue_attribution_lost"
+                throw com.rumi.hermesvoice.core.HermesReplyUnrecoverableException("the replay no longer proves the accepted prompt's FIFO position")
+            }
             var owned = false
             while (true) {
-                // Waits for the next event that is progress; a keep-alive does not restart the bound.
-                val received = withTimeoutOrNull(timeoutMs) { nextProgressEvent() }
-                if (received == null) {
-                    ending = "timeout"
-                    endedAfterMs = elapsed()
-                    throw com.rumi.hermesvoice.core.HermesInactivityTimeoutException("no gateway activity for ${timeoutMs}ms before message.complete")
+                val event = when (val polled = poll(timeoutMs)) {
+                    is Polled.Got -> polled.event
+                    is Polled.Ended -> {
+                        if (recover(silent = false)) continue
+                        ending = "stream_ended"
+                        endedAfterMs = elapsed()
+                        throw polled.cause ?: com.rumi.hermesvoice.core.HermesStreamEndedException("gateway event stream ended before message.complete")
+                    }
+                    Polled.Silent -> {
+                        if (recover(silent = true)) continue
+                        ending = "timeout"
+                        endedAfterMs = elapsed()
+                        throw com.rumi.hermesvoice.core.HermesInactivityTimeoutException("no gateway activity for ${timeoutMs}ms before message.complete")
+                    }
                 }
-                val event = received.getOrNull() ?: break
+                if (event.type.lowercase() in KEEP_ALIVE_TYPES) {
+                    seen.merge("keepalive", 1, Int::plus)
+                    continue
+                }
+                if (event.seq > 0) {
+                    if (event.seq <= lastSeq) continue
+                    lastSeq = event.seq
+                }
                 val known = event.type in KNOWN_TYPES
                 seen.merge(if (known) event.type else "other", 1, Int::plus)
                 when (event.type) {
@@ -624,7 +899,8 @@ private class GatewaySubmittedTurn(
                         endedAfterMs = elapsed()
                         if (superseded) release()
                         onEvent(RecipientEvent.Complete(payloadText(payload),
-                            payload.optString("status").ifBlank { null }))
+                            payload.optString("status").ifBlank { null },
+                            payload.optJSONObject("persisted_turn")?.optLong("final_assistant_row_id", -1)?.takeIf { it >= 0 }))
                         return
                     }
                     "message.interim" -> if (owned) onEvent(RecipientEvent.Interim(payloadText(event.payload ?: JSONObject())))
@@ -636,6 +912,12 @@ private class GatewaySubmittedTurn(
                         ending = "error"
                         endedAfterMs = elapsed()
                         throw com.rumi.hermesvoice.core.HermesTurnFailedException("destination turn failed: ${event.payload?.optString("message").orEmpty().take(200)}")
+                    } else if (turnsToSkip > 0) {
+                        // A prior accepted turn may emit only a bare error (no start/complete).
+                        // It may also emit a complete afterwards. Neither advancing nor keeping
+                        // the ordinal can prove the queued prompt's position: never adopt a neighbour.
+                        ending = "queue_attribution_lost"
+                        throw com.rumi.hermesvoice.core.HermesReplyUnrecoverableException("an earlier turn failed without a reliable queued-turn boundary")
                     } else if (turnsToSkip == 0) {
                         // Ours, refused or cancelled before it started (tui_gateway emits a bare error, no
                         // message.start: _admit_prompt_turn, "cancelled before the agent was ready").
@@ -646,8 +928,6 @@ private class GatewaySubmittedTurn(
                     }
                 }
             }
-            ending = "stream_ended"
-            throw com.rumi.hermesvoice.core.HermesStreamEndedException("gateway event stream ended before message.complete")
         } finally {
             // Kept open after this turn's own reply only, until [collectLater] or [release].
             if (!completed) release()
@@ -683,7 +963,8 @@ private class GatewaySubmittedTurn(
                             started = false
                             val payload = event.payload ?: JSONObject()
                             val status = payload.optString("status").ifBlank { null }
-                            if (status == null || status == "complete") onLater(RecipientEvent.Complete(payloadText(payload), status))
+                            if (status == null || status == "complete") onLater(RecipientEvent.Complete(payloadText(payload), status,
+                                payload.optJSONObject("persisted_turn")?.optLong("final_assistant_row_id", -1)?.takeIf { it >= 0 }))
                         }
                     }
                 }

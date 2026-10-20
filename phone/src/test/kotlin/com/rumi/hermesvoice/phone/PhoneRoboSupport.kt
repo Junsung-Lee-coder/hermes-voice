@@ -58,6 +58,27 @@ class ComposeDispatcherCleanup : org.junit.rules.ExternalResource() {
  * SCRATCH HARNESS (never packaged). The real PhoneApp wiring, MainActivity and PhoneViewModel against the Hermes dashboard contract
  * double. Simulated: the Data Layer (mockk) and the keystore (in-memory AES). No device, UI automation or real notification service.
  */
+
+/** Legacy viewer/auth tests now supply the real source tuple required by the attachment UI.
+ * Keep their original HTTP/materialization assertions; this is test-fixture data, not authority. */
+internal fun openStoredAttachmentFixture(fake: com.rumi.hermesvoice.core.FakeHermesDashboard, model: PhoneViewModel,
+    sessionId: String, ref: com.rumi.hermesvoice.core.attachments.AttachmentRef) {
+    val marker=when(ref.kind) {
+        com.rumi.hermesvoice.core.attachments.RefKind.IMAGE -> "@image:"
+        com.rumi.hermesvoice.core.attachments.RefKind.FILE -> "@file:"
+        com.rumi.hermesvoice.core.attachments.RefKind.MEDIA -> "MEDIA:"
+    }
+    val text=marker+ref.path
+    fake.injectRow(sessionId,"assistant",text)
+    val row=fake.rows.getValue(sessionId).messages.last()
+    val opener=model.javaClass.declaredMethods.firstOrNull { it.name.startsWith("attachmentOpener") && it.parameterCount==1 }
+    if(opener==null) model.openAttachment(ref) else {
+        @Suppress("UNCHECKED_CAST")
+        val action=opener.invoke(model,sessionId) as (com.rumi.hermesvoice.core.net.HistoryMessage,com.rumi.hermesvoice.core.attachments.AttachmentRef)->Unit
+        action(com.rumi.hermesvoice.core.net.HistoryMessage(row.getLong("id"),"assistant",text,0.0),ref)
+    }
+}
+
 open class PhoneRoboBase {
     lateinit var app: PhoneApp
     lateinit var fake: FakeHermesDashboard
@@ -98,7 +119,7 @@ open class PhoneRoboBase {
 
     fun settle() = repeat(8) { pump(); Thread.sleep(25) }
 
-    fun baseSetUp() {
+    fun baseSetUp(authenticated: Boolean = true) {
         ComposeDispatcherIsolation.reset()
         ViewModelProvider.AndroidViewModelFactory::class.java.declaredFields
             .filter { java.lang.reflect.Modifier.isStatic(it.modifiers) && it.type == ViewModelProvider.AndroidViewModelFactory::class.java }
@@ -108,11 +129,14 @@ open class PhoneRoboBase {
         stubWearable()
         fake = FakeHermesDashboard()
         app.settings.dashboardUrl = fake.baseUrl
-        app.tokens.save(HermesBearerSession(fake.accessToken, fake.refreshToken, null, "basic", "jun"))
+        if (authenticated) app.tokens.save(HermesBearerSession(fake.accessToken, fake.refreshToken, null, "basic", "jun"))
     }
 
     fun baseTearDown() {
-        runCatching { controller?.destroy() }
+        // End the disposable Application only after all assertions. Recovery must outlive
+        // Activity recreation during a test, but must not poll another test's fake server.
+        runCatching { controller?.pause()?.stop()?.destroy() }
+        runCatching { app.appScope.coroutineContext[kotlinx.coroutines.Job]?.cancel() }
         runCatching { fake.close() }
         unmockkAll()
         ComposeDispatcherIsolation.drainAndReset()

@@ -179,7 +179,9 @@ class PhoneReplyAlertRoboTest {
         assertEquals("the collapsed text is the delivered answer", "Done.", n.extras.getCharSequence(Notification.EXTRA_TEXT)?.toString())
         assertEquals("the expanded text is the delivered answer", "Done.", n.extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString())
         assertTrue("an expandable BigText notification: ${n.extras.getString(Notification.EXTRA_TEMPLATE)}", n.extras.getString(Notification.EXTRA_TEMPLATE)?.contains("BigTextStyle") == true)
-        assertTrue("dismissed on tap", n.flags and Notification.FLAG_AUTO_CANCEL != 0)
+        // Migrated (review F08): the e52e52d7 assertion was `assertTrue("dismissed on tap", n.flags and FLAG_AUTO_CANCEL != 0)`. A tap no longer
+        // removes the alert by itself: it goes only after the conversation's history was read again (PhoneReviewRepairRoboTest, PhoneReplyDeliveryRoboTest R11).
+        assertEquals("not removed by the tap itself", 0, n.flags and Notification.FLAG_AUTO_CANCEL)
         assertEquals("not local-only: the paired system may bridge it", 0, n.flags and Notification.FLAG_LOCAL_ONLY)
         assertEquals(Notification.VISIBILITY_PRIVATE, n.visibility)
         assertEquals(Wire.PUBLIC_TITLE, n.publicVersion.extras.getString(Notification.EXTRA_TITLE))
@@ -210,7 +212,14 @@ class PhoneReplyAlertRoboTest {
         fake.scripts[work] = { listOf(FakeHermesDashboard.complete("partial", "interrupted")) }
         runBlocking { app.wiring().core.chat.send(work, "hello") }
         settle()
-        assertTrue(alerts().isEmpty())
+        // Review F04 migration: the old contract was `assertTrue(alerts().isEmpty())`. A failed send is still never announced as a reply, but a
+        // request Hermes accepted whose turn ended without a complete answer now ends in ONE honest, deduplicated notice (not silence).
+        assertTrue("the interrupted partial text is never announced as a reply: ${alerts().map { it.notification.extras.getCharSequence(Notification.EXTRA_TEXT) }}",
+            alerts().none { it.notification.extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.contains("partial") == true })
+        assertTrue("one notice is shown: ${alerts().map { it.tag }}", await { alerts().size == 1 })
+        val notice = alerts().single().notification
+        assertEquals(com.rumi.hermesvoice.core.net.AcceptedTurnReconciler.NOTICE_TITLE, notice.extras.getString(Notification.EXTRA_TITLE))
+        assertEquals(com.rumi.hermesvoice.core.net.AcceptedTurnReconciler.NOTICE_NO_ANSWER, notice.extras.getCharSequence(Notification.EXTRA_TEXT)?.toString())
     }
 
     @Test fun P05_theTapFromTheShownAlertOpensItsConversationInTheRealScreen() {

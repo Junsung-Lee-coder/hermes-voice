@@ -149,7 +149,10 @@ class WatchReplyAlertRoboTest {
         assertEquals(Wire.TITLE, n.extras.getString(Notification.EXTRA_TITLE))
         assertEquals(Wire.BODY, n.extras.getCharSequence(Notification.EXTRA_TEXT)?.toString())
         assertTrue("local-only: never bridged to the Phone", n.flags and Notification.FLAG_LOCAL_ONLY != 0)
-        assertTrue("dismissed on tap", n.flags and Notification.FLAG_AUTO_CANCEL != 0)
+        // Migrated (review F08): the e52e52d7 assertion was `assertTrue("dismissed on tap", n.flags and FLAG_AUTO_CANCEL != 0)`. A tap no longer
+        // removes the alert by itself: it goes only after the conversation was read again (WatchAlertDismissRoboTest, WatchFailureDisplayRoboTest).
+        assertEquals("not removed by the tap itself", 0, n.flags and Notification.FLAG_AUTO_CANCEL)
+        assertNotNull("but still tappable", n.contentIntent)
         assertEquals(Notification.VISIBILITY_PRIVATE, n.visibility)
         assertEquals(Wire.PUBLIC_TITLE, n.publicVersion.extras.getString(Notification.EXTRA_TITLE))
         assertEquals(Wire.PUBLIC_BODY, n.publicVersion.extras.getCharSequence(Notification.EXTRA_TEXT)?.toString())

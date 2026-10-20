@@ -22,7 +22,7 @@ class DestinationAllowlist private constructor(val entries: List<DestinationEntr
     fun resolve(alias: String): DestinationEntry? = normalizeAlias(alias)?.let(byAlias::get)
 
     companion object {
-        const val MAX_ENTRIES = 32
+        const val MAX_ENTRIES = 100
         const val MAX_DESCRIPTION_CHARS = 160
         private val ALIAS = Regex("^[a-z0-9][a-z0-9_-]{0,31}$")
         private val SESSION_ID = Regex("^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")

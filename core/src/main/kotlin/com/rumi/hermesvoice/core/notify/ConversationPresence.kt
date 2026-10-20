@@ -13,6 +13,15 @@ class ConversationPresence {
     private val lock = Any()
     private var foreground = false
     private var shown: String? = null
+    private var epoch = 0L
+
+    /** Changes on leaving as well as entering a visible opening, even when the selection stays. */
+    val generation: Long get() = synchronized(lock) { epoch }
+
+    /** Short visible-state commit only; never hold this monitor over a read/network operation. */
+    fun ifVisible(storedSessionId: String, generation: Long, commit: () -> Unit) = synchronized(lock) {
+        if (foreground && shown == storedSessionId && epoch == generation) commit()
+    }
 
     val visibleSession: String? get() = synchronized(lock) { if (foreground) shown else null }
 
@@ -27,6 +36,7 @@ class ConversationPresence {
             val before = if (foreground) shown else null
             update()
             val after = if (foreground) shown else null
+            if (after != before) epoch++
             after?.takeIf { it != before }
         }
         if (opened != null) {

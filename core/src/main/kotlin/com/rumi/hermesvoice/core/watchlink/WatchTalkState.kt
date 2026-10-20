@@ -39,6 +39,8 @@ data class WatchTalkState(
     val replayTurnId: String? = null,
     /** The finished request whose reply the Phone was asked to play again; its next terminal state is shown even though the request had ended. */
     val replayingTurnId: String? = null,
+    /** The "not sent" status of a request that is not the current one (an earlier request, or one this Watch no longer tracks); shown until the next request or Stop. */
+    val notice: String = "",
 ) {
     /** Whether another request may start while this one waits: a waiting request only waits, and the bound is not reached. */
     private val roomToStart: Boolean get() = phase == WatchPhase.IDLE || (phase == WatchPhase.WAITING && earlier.size < MAX_EARLIER)
@@ -78,11 +80,13 @@ data class WatchTalkState(
         if (replayTurnId == null) this else copy(replayTurnId = null, replayingTurnId = replayTurnId, line = REPLAY_REQUESTED)
 
     fun onPhoneState(message: TurnStateMessage): WatchTalkState {
+        val failure = message.terminal && isRetainedFailure(message.detail)
         if (message.turnId in earlier) {
             // An earlier request ended or only changed stage: its own end leaves the waiting list, nothing else touches the current one.
-            return if (message.terminal) copy(earlier = earlier - message.turnId) else this
+            return if (message.terminal) copy(earlier = earlier - message.turnId, notice = if (failure) message.detail else notice) else this
         }
         if (message.turnId != turnId) {
+            if (failure) return copy(notice = message.detail)
             if (message.turnId != replayingTurnId || !message.terminal) return this
             // A newer request of this Watch is in progress: its state is not overwritten by the older reply's replay result.
             if (phase != WatchPhase.IDLE) return copy(replayingTurnId = null)
@@ -90,7 +94,7 @@ data class WatchTalkState(
                 replayTurnId = if (message.replay) message.turnId else null)
         }
         if (message.terminal) return WatchTalkState(line = message.detail, speakingTurnId = speakingTurnId, earlier = earlier,
-            replayTurnId = if (message.replay) message.turnId else null)
+            replayTurnId = if (message.replay) message.turnId else null, notice = notice)
         val line = when (message.stage) {
             "transcribing" -> "Transcribing…"
             "stt_recovering" -> STT_RECOVERING
@@ -125,6 +129,19 @@ data class WatchTalkState(
 
     companion object {
         const val PLAYING_OTHER = "Playing reply…"
+
+        /** The start of a terminal status that says the request never left the Phone (see [VoiceOutcomeText.NOT_SENT]). */
+        const val NOT_SENT = "Not sent"
+
+        /** The start of a terminal status for a request that was refused at delivery, see [VoiceOutcomeText.describe]. */
+        const val NOT_DELIVERED = "Not delivered"
+
+        /** The start of a terminal status for a request that may have reached Hermes; it is never sent again. */
+        const val ACCEPTANCE_UNCERTAIN = "Acceptance uncertain"
+
+        /** A terminal status the Phone keeps owing, and the Watch keeps showing until the person has seen it, then acknowledges. */
+        fun isRetainedFailure(detail: String): Boolean =
+            detail.startsWith(NOT_SENT) || detail.startsWith(NOT_DELIVERED) || detail.startsWith(ACCEPTANCE_UNCERTAIN)
 
         /** The request waits for the earlier request to the same conversation to be answered; it is sent after that. */
         const val QUEUED = "Queued behind an earlier request…"

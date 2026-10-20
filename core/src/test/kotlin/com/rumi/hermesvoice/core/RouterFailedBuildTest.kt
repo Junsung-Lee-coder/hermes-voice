@@ -63,7 +63,7 @@ class RouterFailedBuildTest {
     private val sentinel = "/home/sentinel-user/.hermes/profiles/x/SENTINEL-TOKEN-0000"
 
     private class Api : HermesSessionsApi {
-        override suspend fun listSessions(source: String, archived: ArchivedFilter, limit: Int, offset: Int): StoredSessionPage = error("unused")
+        override suspend fun listSessions(source: String?, archived: ArchivedFilter, limit: Int, offset: Int, excludeSources: List<String>): StoredSessionPage = error("unused")
         override suspend fun getSession(sessionId: String): StoredSession? = error("unused")
         override suspend fun getMessages(sessionId: String, limit: Int, offset: Int): HistoryPage = error("unused")
         override suspend fun setArchived(sessionId: String, archived: Boolean) = error("unused")
