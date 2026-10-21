@@ -160,7 +160,7 @@ class ReceivedFinalR10RoboTest : PhoneNavRoboBase() {
             assertFalse("sendMessage success is not a Watch post receipt",durableRow()!!.getBoolean("watch_done"))
             assertTrue("no prompt is submitted by discovery or reconnect",fake.prompts.isEmpty())
             val temp=java.io.File(System.getenv("TEMP")?:error("owned native TEMP missing"))
-            assertTrue("task-owned serial native slot only",Regex("""\\rvdev\\runs\\mr-r(?:10-20261019-r10(?:c1|b)|11-20261020-r11)-""").containsMatchIn(temp.canonicalPath.lowercase()))
+            assertTrue("task-owned serial native slot only",Regex("""\\rvdev\\runs\\mr-r(?:10-20261019-r10(?:c1|b)|11-20261020-r11|12-20261021-r12|9-20261012-hv21)-""").containsMatchIn(temp.canonicalPath.lowercase()))
             java.nio.file.Files.write(java.io.File(temp,"r10-phone-watch-wire.json").toPath(),bytes,
                 java.nio.file.StandardOpenOption.CREATE_NEW,java.nio.file.StandardOpenOption.WRITE)
             println("R10_PHONE_WATCH_WIRE_BASE64="+java.util.Base64.getEncoder().encodeToString(bytes))
@@ -226,7 +226,7 @@ class ReceivedFinalR10RoboTest : PhoneNavRoboBase() {
             fake.reconciliationMessagesHook=fake.messagesHook
             val vm=androidx.lifecycle.ViewModelProvider(store,androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory(app))[PhoneViewModel::class.java]
             vm.open(app.wiring().core.sessions.registry.find(a)!!)
-            waitFor("empty conversation really opened before submission") { vm.state.value.selected?.storedSessionId==a }
+            waitFor("empty conversation really opened before submission") { vm.state.value.selected?.storedSessionId==a && !vm.state.value.opening }
             fake.scripts[a]={listOf(FakeHermesDashboard.complete("first-lookup retained final"))};fake.turnBehavior={"hold"}
             vm.setDraft("only first-lookup prompt");vm.send()
             waitFor("first real prompt accepted") { fake.heldTurns.containsKey(a) }
@@ -271,7 +271,9 @@ class ReceivedFinalR10RoboTest : PhoneNavRoboBase() {
         }.getOrNull()
         fake.injectFinalRow(a,"same canonical content already read",750.0,"read-before-finality",reason="")
         vm.refresh();waitFor("incoming unknown-finality content is unread") { weight("Already read content")==FontWeight.Bold }
-        openCard(vm,a);systemBack()
+        openCard(vm,a)
+        waitFor("the opened conversation shows the canonical body") { vm.state.value.history.any { it.text=="same canonical content already read" } }
+        systemBack()
         waitFor("actual foreground placement really read this canonical body") { stored()?.optBoolean("read")==true && weight("Already read content")!=FontWeight.Bold }
         synchronized(fake.rows[a]!!.messages) { fake.rows[a]!!.messages.last().put("finish_reason","stop") }
         vm.refresh()

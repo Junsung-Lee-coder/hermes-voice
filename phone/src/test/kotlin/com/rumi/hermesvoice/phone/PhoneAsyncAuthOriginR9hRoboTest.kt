@@ -54,7 +54,7 @@ class PhoneAsyncAuthOriginR9hRoboTest : PhoneNavRoboBase() {
     private fun stale(status: Int, preview: Boolean, replace: Boolean=false) {
         val a=titled("A title","r9h-a");val b=titled("B title","r9h-b")
         seed(a,2,"A");seed(b,2,"B")
-        var m=showWith(a,b);openCard(m,a)
+        var m=showWith(a,b);openSettled(m,a)
         waitFor("A initial list closes") { listJob(m)?.isCompleted==true }
         fake.storedFiles[ref.path]="text/plain" to "A file".toByteArray()
         val original=fake.server.dispatcher
@@ -116,7 +116,7 @@ class PhoneAsyncAuthOriginR9hRoboTest : PhoneNavRoboBase() {
 
     private fun current(preview: Boolean, loss: Boolean) {
         val a=titled("Current title","r9h-current");seed(a,2,"current")
-        val m=showWith(a);openCard(m,a)
+        val m=showWith(a);openSettled(m,a)
         waitFor("initial list closes") { listJob(m)?.isCompleted==true }
         fake.storedFiles[ref.path]="text/plain" to "current file".toByteArray()
         val scope=app.sessionListScope()

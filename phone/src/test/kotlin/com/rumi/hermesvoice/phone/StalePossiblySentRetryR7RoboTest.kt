@@ -35,7 +35,7 @@ class StalePossiblySentRetryR7RoboTest : PhoneRoboBase() {
         // is still alive (multi-Activity/back-stack case) and retains its legitimate old failed row.
         val newer = ViewModelProvider(secondStore, ViewModelProvider.AndroidViewModelFactory(app))[PhoneViewModel::class.java]
         newer.open(app.wiring().core.sessions.activeConversation(work)!!)
-        assertTrue(await { newer.state.value.selected?.storedSessionId == work && newer.state.value.failedSends.any { it.send.id == id } })
+        assertTrue(await { newer.state.value.selected?.storedSessionId == work && !newer.state.value.opening && newer.state.value.failedSends.any { it.send.id == id } })
         val accepted = AtomicBoolean(false)
         fake.turnBehavior = { "async_hold" }
         fake.beforeAsyncReply = { accepted.set(true); fake.dropGateway() }

@@ -56,6 +56,7 @@ class PhoneCacheClosureR9dRoboTest : PhoneNavRoboBase() {
         val id=titled("Saved","auth-loss")
         seed(id,2)
         val model=showWith(id);openCard(model,id)
+        waitFor("the opened conversation's page is shown") { model.state.value.history.isNotEmpty() }
         check(model.state.value.history.isNotEmpty())
         waitFor("initial list committed") { app.localStore.getString(key)?.contains(id)==true }
         reject();model.refresh()

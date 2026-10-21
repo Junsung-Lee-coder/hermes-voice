@@ -65,7 +65,7 @@ class PhoneSendCustodyR9iRoboTest : PhoneNavRoboBase() {
     private fun crossAccount(active: Boolean) {
         val id=titled("Shared legitimate marker-valid session","r9i-shared")
         seed(id,2,"shared")
-        val old=showWith(id);openCard(old,id);waitFor("initial list closes") { listJob(old)?.isCompleted==true }
+        val old=showWith(id);openSettled(old,id);waitFor("initial list closes") { listJob(old)?.isCompleted==true }
         attach(old)
         val original=fake.server.dispatcher
         val entered=CountDownLatch(1);val release=CountDownLatch(1)
@@ -121,7 +121,7 @@ class PhoneSendCustodyR9iRoboTest : PhoneNavRoboBase() {
 
     @Test fun A03_staleScreenManualRetryCannotCrossExplicitLogoutEvenForSameUser() {
         val id=titled("Same user new authentication","r9i-new-auth")
-        val old=showWith(id);openCard(old,id);fake.turnBehavior={ "not_owned" }
+        val old=showWith(id);openSettled(old,id);fake.turnBehavior={ "not_owned" }
         val started=begin(old);waitFor("definitive refusal") { started.first.isCompleted && old.state.value.failedSends.isNotEmpty() }
         val before=fake.rawPrompts.size
         login(old,"jun");openOwned(old,id)
@@ -131,7 +131,7 @@ class PhoneSendCustodyR9iRoboTest : PhoneNavRoboBase() {
         assertEquals("R09H-F01 explicit sign-out starts a new custody generation",before,fake.rawPrompts.size)
     }
     @Test fun C01_sameAccountRotationRecreationAndDefinitiveUnsentRetryClaimExactlyOnce() {
-        val id=titled("Same account","r9i-rotation");val old=showWith(id);openCard(old,id);attach(old)
+        val id=titled("Same account","r9i-rotation");val old=showWith(id);openSettled(old,id);attach(old)
         fake.turnBehavior={ "not_owned" }
         val started=begin(old);waitFor("NOT_SENT failed request") { started.first.isCompleted && old.state.value.failedSends.size==1 }
         val kept=old.state.value.failedSends.single().send
@@ -164,7 +164,7 @@ class PhoneSendCustodyR9iRoboTest : PhoneNavRoboBase() {
         }
     }
     @Test fun C02_sameAccountActiveRecreationStillObservesOwnCompletion() {
-        val id=titled("Own active","r9i-own-active");val old=showWith(id);openCard(old,id)
+        val id=titled("Own active","r9i-own-active");val old=showWith(id);openSettled(old,id)
         val entered=CountDownLatch(1);val release=CountDownLatch(1)
         val heldReaders=java.util.concurrent.atomic.AtomicInteger()
         val store=ViewModelStore();var job: ExactSendObservation?=null;var completionSent=false
@@ -209,7 +209,7 @@ class PhoneSendCustodyR9iRoboTest : PhoneNavRoboBase() {
     }
     private fun appChildren()=app.appScope.coroutineContext[Job]!!.children.toSet()
     @Test fun D00_wiringRebuildInsideSendCreatesMoreThanOneAppScopeChildWithOneExactRequest() {
-        val id=titled("Extra child census","r11d-census");val old=showWith(id);openCard(old,id)
+        val id=titled("Extra child census","r11d-census");val old=showWith(id);openSettled(old,id)
         fake.scripts[id]={ listOf(FakeHermesDashboard.complete("census exact answer")) }
         val idsBefore=app.textSends.ids.get();val promptsBefore=fake.rawPrompts.size;val children=appChildren()
         wiringRebuildInsideNextSend()
@@ -225,7 +225,7 @@ class PhoneSendCustodyR9iRoboTest : PhoneNavRoboBase() {
         assertNull(activeSend(pending.send.id));assertTrue(old.state.value.failedSends.isEmpty())
     }
     @Test fun D01_extraAppScopeChildrenDuringHeldAcceptedSendDoNotChangeTheExactRequestObservation() {
-        val id=titled("Extra child held","r11d-held");val old=showWith(id);openCard(old,id)
+        val id=titled("Extra child held","r11d-held");val old=showWith(id);openSettled(old,id)
         val entered=CountDownLatch(1);val release=CountDownLatch(1)
         val heldReaders=java.util.concurrent.atomic.AtomicInteger()
         var settled: (() -> Boolean)?=null;var completionSent=false
@@ -266,7 +266,7 @@ class PhoneSendCustodyR9iRoboTest : PhoneNavRoboBase() {
         }
     }
     @Test fun D02_extraAppScopeChildrenDuringDefinitiveRefusalKeepOneUnsentRequestAndExactlyOneRetry() {
-        val id=titled("Extra child refusal","r11d-refusal");val old=showWith(id);openCard(old,id)
+        val id=titled("Extra child refusal","r11d-refusal");val old=showWith(id);openSettled(old,id)
         fake.turnBehavior={ "not_owned" }
         val promptsBefore=fake.rawPrompts.size;val children=appChildren()
         wiringRebuildInsideNextSend()

@@ -200,6 +200,10 @@ class AcceptedTurnReconciler(
             reattached.release()
         }
         val reply = complete
+        if (reply != null && (reply.status == null || reply.status == "complete") && SilentControl.isWholeResponse(reply.text)) {
+            turns.settle(turn.id)
+            return
+        }
         if (reply == null || reply.text.isBlank() || !(reply.status == null || reply.status == "complete")) return noticeAndSettle(turn, NOTICE_NO_ANSWER)
         if (handOff(turn, "reply", "final", reply.text, null, reply.finalRowId)) turns.settle(turn.id)
     }

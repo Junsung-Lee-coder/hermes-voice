@@ -1,5 +1,6 @@
 package com.rumi.hermesvoice.phone
 
+import com.rumi.hermesvoice.core.net.SilentControl
 import com.rumi.hermesvoice.core.HermesAuthRequiredException
 import com.rumi.hermesvoice.core.SessionNotOwnedException
 import com.rumi.hermesvoice.core.VoiceOrigin
@@ -43,6 +44,18 @@ class FinalRecovery(private val app:PhoneApp) {
         } catch(cancelled:CancellationException) { throw cancelled }
         catch(_:Exception) { if(app.bodyScope()==ns) notice.value="Receive tracking not saved. Check storage and refresh." }
         }
+    }
+    private val observations = java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.Job>()
+
+    /** Same intake as [observedNewest], started in the background: the interactive page publish never waits for the receive store.
+     * Observations of one conversation run in order, and a foreground read of it waits for them ([displayed]). */
+    fun observeNewestAsync(page:com.rumi.hermesvoice.core.net.HistoryPage,ns:String?) {
+        val id=page.sessionId
+        val job=synchronized(observations) {
+            val previous=observations[id]
+            app.appScope.launch(Dispatchers.IO) { previous?.join();observedNewest(page,ns) }.also { observations[id]=it }
+        }
+        job.invokeOnCompletion { observations.remove(id,job) }
     }
     /** An authoritative newest page can establish intake before a later reply lookup fails. */
     suspend fun observedNewest(page:com.rumi.hermesvoice.core.net.HistoryPage,ns:String?) = withContext(Dispatchers.IO) {
@@ -212,6 +225,7 @@ class FinalRecovery(private val app:PhoneApp) {
             if(!current()) return
             if(id in revoked) continue
             if("$ns|$id|${row.optLong("row_id",-1)}" in cancelledRows) continue
+            if(SilentControl.isWholeResponse(row.optString("text"))) { if(!settleControl(ns,row)) denied=true;continue }
             val alert=ReplyAlert(row.getString("identity"),id)
             val currentPrivate=app.headset.output()!=null
             if(currentPrivate && app.received.scoped(ns) { restrictQuiet(alert.identity) }!=true) { denied=true;continue }
@@ -229,7 +243,7 @@ class FinalRecovery(private val app:PhoneApp) {
         }
         // Retry Watch separately even after the fallback Phone post succeeded.
         if(current() && app.headset.output()==null) {
-            val groups=app.received.pending(true).filter { !it.optBoolean("private_origin") && it.getString("session_id") !in revoked && it.optString("node").isNotBlank() }.groupBy { it.getString("node") }
+            val groups=app.received.pending(true).filter { row -> !SilentControl.isWholeResponse(row.optString("text")).also { silent -> if(silent) settleControl(ns,row) } }.filter { !it.optBoolean("private_origin") && it.getString("session_id") !in revoked && it.optString("node").isNotBlank() }.groupBy { it.getString("node") }
             for((node,pending) in groups) for(batch in pending.chunked(100)) {
                 if(!current()) return
                 send(node,JSONObject().put("v",1).put("scope",ns).put("finals",JSONArray().apply { batch.forEach { put(wire(it)) } }))
@@ -240,6 +254,11 @@ class FinalRecovery(private val app:PhoneApp) {
             app.received.pending(true).isNotEmpty() -> "Watch reply alerts pending. Reconnect the Watch and allow its notifications."
             else -> null
         }
+    }
+    /** A control saved by an earlier build owes no alert on either device and is not unread activity. */
+    private fun settleControl(ns:String,row:JSONObject):Boolean {
+        val identity=row.getString("identity")
+        return app.received.scoped(ns) { acknowledge(identity,false) && acknowledge(identity,true) && acknowledge(identity,false,read=true) }==true
     }
     private fun wire(row:JSONObject)=JSONObject(row.toString()).apply { remove("text");remove("phone");remove("read");remove("watch_done") }
     private suspend fun send(node:String,json:JSONObject,path:String=FINALS) {
@@ -279,6 +298,7 @@ class FinalRecovery(private val app:PhoneApp) {
         if(!app.presence.isVisible(id)) return
         val ns=app.bodyScope()?:return
         app.appScope.launch(Dispatchers.IO) {
+            observations[id]?.join()
             if(app.bodyScope()==ns && app.presence.isVisible(id) && app.received.scoped(ns) { displayed(id,messages) }==true) revision.value++
         }
     }

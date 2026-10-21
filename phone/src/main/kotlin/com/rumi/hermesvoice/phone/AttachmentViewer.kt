@@ -142,7 +142,8 @@ internal fun AttachmentViewerHost(state: AttachmentViewerState?, model: PhoneVie
 @Composable
 private fun ViewerBody(viewed: ViewedAttachment) {
     when (viewed.kind) {
-        PreviewKind.IMAGE -> ImageBody(viewed)
+        PreviewKind.IMAGE ->
+            if (viewed.bytes.isEmpty()) FileCard(viewed, "This picture is too large to preview here. Use Open with or Save.") else ImageBody(viewed)
         PreviewKind.PDF -> PdfBody(viewed)
         PreviewKind.TEXT -> Text(viewed.text.orEmpty(), Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp).testTag("viewer_text"),
             fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)

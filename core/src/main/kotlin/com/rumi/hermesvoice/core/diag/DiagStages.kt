@@ -5,6 +5,8 @@ import com.rumi.hermesvoice.core.HermesGatewayClosedException
 import com.rumi.hermesvoice.core.HermesHttpException
 import com.rumi.hermesvoice.core.HermesInactivityTimeoutException
 import com.rumi.hermesvoice.core.HermesException
+import com.rumi.hermesvoice.core.HermesQueuedAttributionException
+import com.rumi.hermesvoice.core.HermesReplyUnrecoverableException
 import com.rumi.hermesvoice.core.HermesRpcException
 import com.rumi.hermesvoice.core.HermesStreamEndedException
 import com.rumi.hermesvoice.core.HermesTurnFailedException
@@ -37,7 +39,13 @@ enum class DiagCause(val wire: String) {
     AUTH("auth"), REJECTED("rejected"), CANCELLED("cancelled"), LOCAL("local"), UNKNOWN("unknown"),
 
     /** The speech server reported itself temporarily unavailable, busy or too slow (a recoverable safe code), or kept doing so until recovery ran out. */
-    STT_UNAVAILABLE("stt_unavailable");
+    STT_UNAVAILABLE("stt_unavailable"),
+
+    /** The turn was accepted behind another running turn, so its reply cannot be attributed to it; the app refuses to guess (a queue-contract refusal, not a network failure). */
+    QUEUED_UNATTRIBUTABLE("queued_unattributable"),
+
+    /** The reply of an accepted turn cannot be told apart from another turn's (lost ordering or an earlier unproven queue), so the app stopped waiting for it. */
+    REPLY_UNRECOVERABLE("reply_unrecoverable");
 
     companion object {
         private val byWire = values().associateBy { it.wire }
@@ -99,6 +107,7 @@ object DiagClassify {
         DiagCause.REJECTED, DiagCause.LOCAL -> DiagFail.REFUSED
         DiagCause.UNKNOWN -> DiagFail.UNKNOWN
         DiagCause.STT_UNAVAILABLE -> DiagFail.BUSY
+        DiagCause.QUEUED_UNATTRIBUTABLE, DiagCause.REPLY_UNRECOVERABLE -> DiagFail.PROTOCOL
     }
 
     /** From a bare class simple name (all that the speech listener is given); never from a message. */
@@ -136,6 +145,8 @@ object DiagClassify {
             4403 -> DiagClassified(DiagFail.REFUSED, DiagCause.REJECTED, 4403)
             else -> DiagClassified(DiagFail.DISCONNECTED, DiagCause.DISCONNECT, clampStatus(error.closeCode))
         }
+        is HermesQueuedAttributionException -> DiagClassified(DiagFail.PROTOCOL, DiagCause.QUEUED_UNATTRIBUTABLE, null)
+        is HermesReplyUnrecoverableException -> DiagClassified(DiagFail.PROTOCOL, DiagCause.REPLY_UNRECOVERABLE, null)
         is HermesInactivityTimeoutException -> DiagClassified(DiagFail.TIMEOUT, DiagCause.TIMEOUT, null)
         is HermesStreamEndedException -> DiagClassified(DiagFail.DISCONNECTED, DiagCause.DISCONNECT, null)
         is HermesTurnFailedException -> DiagClassified(DiagFail.REFUSED, DiagCause.REJECTED, null)

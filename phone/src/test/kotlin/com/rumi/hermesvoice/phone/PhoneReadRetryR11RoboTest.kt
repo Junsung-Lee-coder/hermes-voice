@@ -99,7 +99,7 @@ class PhoneReadRetryR11RoboTest : PhoneNavRoboBase() {
         val alpha = titled("Synthetic alpha", "alpha")
         seed(alpha, 6, "m")
         val model = showWith(alpha)
-        openCard(model, alpha)
+        openSettled(model, alpha)
         waitFor("the latest page") { model.state.value.history.size == 6 }
         val before = arrivals("messages").size
         fake.readFault = { kind, _ -> if (kind == "messages") answer(503) else null }

@@ -163,7 +163,7 @@ class RecentBodies(
             }
             val returned = row.getInt("returned");require(returned in 0..MAX_RAW_ROWS)
             val rawIds = row.getJSONArray("raw_ids");require(rawIds.length() <= MAX_RAW_ROWS)
-            Saved(HistoryPage(id, body, returned, (0 until rawIds.length()).map { rawIds.getLong(it) }), row.getBoolean("has_older"))
+            Saved(HistoryPage(id, body.filterNot { it.silentControl }, returned, (0 until rawIds.length()).map { rawIds.getLong(it) }), row.getBoolean("has_older"))
         }
         Snapshot(ns, version, saved)
     }.getOrNull()

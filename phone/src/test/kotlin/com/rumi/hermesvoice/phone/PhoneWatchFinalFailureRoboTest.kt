@@ -124,8 +124,11 @@ class PhoneWatchFinalFailureRoboTest : PhoneRoboBase() {
     @Test fun F04_aWatchThatWasAwayGetsTheFailureWhenItAsksAndNotAgainOnceItAcknowledged() {
         reachable = false
         failFinally(400, SttCode.INPUT_REJECTED)
+        val begun = System.nanoTime()
         uploadFrom(origin, turnId(4))
-        assertTrue(await { storedText().contains(turnId(4)) })
+        assertTrue("the failure was recorded as owed [elapsedMs=${(System.nanoTime() - begun) / 1_000_000}; sent=${sent.size}; prompts=${fake.rawPrompts.size}; " +
+            "transcribeLog=${fake.timeline.toList().filter { it.startsWith("transcribe") }}; scriptedLeft=${fake.transcribeStatuses.size}; " +
+            "files=${java.io.File(app.dataDir, "shared_prefs").list().orEmpty().toList()}]", await { storedText().contains(turnId(4)) })
         assertTrue("nothing could be sent while away", sent.isEmpty())
 
         reachable = true

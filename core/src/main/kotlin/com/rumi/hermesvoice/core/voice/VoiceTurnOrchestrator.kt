@@ -966,6 +966,7 @@ class VoiceTurnOrchestrator(
         var finalComplete = false
         var replyMayArrive = false
         var finalHandedOver = false
+        var silentTerminal = false
         var finalRowId: Long? = null
         val privateSeen = java.util.concurrent.atomic.AtomicBoolean(false)
         activity?.begin(request.turnId, route.destination.storedSessionId)
@@ -979,7 +980,9 @@ class VoiceTurnOrchestrator(
                     is RecipientEvent.Interim -> com.rumi.hermesvoice.core.activity.ActivityLabels.interim(event.text)?.let { activity?.update(request.turnId, it) }
                     is RecipientEvent.Complete -> {
                         finalRowId = event.finalRowId
-                        if(event.finalRowId!=null && event.text.isNotBlank() && (event.status==null || event.status=="complete")) {
+                        val silent = (event.status == null || event.status == "complete") && com.rumi.hermesvoice.core.net.SilentControl.isWholeResponse(event.text)
+                        if (silent) silentTerminal = true
+                        if(!silent && event.finalRowId!=null && event.text.isNotBlank() && (event.status==null || event.status=="complete")) {
                             val target=playbackRoute.current()
                             val cancellation=FinalReply(ReplyAlert.identityOf(request.turnId,"cancel"),route.destination.storedSessionId,
                                 target?.device?:request.origin,false,true,FinalReplySource.OWN,target?.sink?:request.sink,
@@ -987,13 +990,14 @@ class VoiceTurnOrchestrator(
                             canonicalCancellations[request.turnId]=cancellation
                             if(request.turnId in stopRequested) hand(cancellation) {}
                         }
-                        activity?.end(request.turnId, event.text.isNotBlank() && (event.status == null || event.status == "complete"))
+                        activity?.end(request.turnId, !silent && event.text.isNotBlank() && (event.status == null || event.status == "complete"))
                     }
                 }
                 // A remote interrupted/errored completion is terminal non-delivery, not a
                 // successful answer to synthesize (and not cancellation of this client).
                 // Let the exact notice below settle it only after confirmed handoff.
                 if (event is RecipientEvent.Complete && !(event.status == null || event.status == "complete")) return@collect
+                if (event is RecipientEvent.Complete && silentTerminal) return@collect
                 val decision = tracker.onEvent(event) ?: return@collect
                 if (decision.role == SpokenRole.FINAL) {
                     finalDecision = decision
@@ -1035,7 +1039,8 @@ class VoiceTurnOrchestrator(
             emitFinalReply(request, ReplyAlert.identityOf(request.turnId, "final"), route.destination.storedSessionId, FinalReplySource.OWN, heard, false, final.text, quiet = privateSeen.get(),
                 handled = { if (!replyMayArrive) acceptedTurns?.settle(request.turnId) }, finalRowId=finalRowId)
         }
-        if (!replyMayArrive && !finalHandedOver && request.turnId !in stopRequested) {
+        if (silentTerminal && !finalHandedOver && !replyMayArrive) acceptedTurns?.settle(request.turnId)
+        if (!replyMayArrive && !finalHandedOver && !silentTerminal && request.turnId !in stopRequested) {
             // A notice is not an answer to synthesize, replay or follow. Use normal delivery,
             // retaining owed authority unless the exact identity's surface confirms handoff.
             val target = playbackRoute.current()
@@ -1099,7 +1104,7 @@ class VoiceTurnOrchestrator(
                     if (!optedIn && headset?.enabled != true) throw LaterStopped()
                     val text = event.text.trim()
                     // Use headset on, but no headset connected now and no opt-in: exactly as if neither were on (nothing is spoken or alerted).
-                    if (text.isNotEmpty() && (optedIn || forcedByHeadset)) {
+                    if (text.isNotEmpty() && !com.rumi.hermesvoice.core.net.SilentControl.isWholeResponse(text) && (optedIn || forcedByHeadset)) {
                         admit(arrived, LaterReply(request, storedSessionId, text, sequence++, monotonicMs() + laterDeferMaxMs, headsetOnly = forcedByHeadset, finalRowId = event.finalRowId))
                     }
                 }) {

@@ -405,10 +405,44 @@ class FakeHermesDashboard : AutoCloseable {
         storedFileRequests += "$path?path=$wanted" to request.getHeader("Authorization")
         storedFileStatus?.let { return json(it, JSONObject().put("detail", "refused")) }
         if (path == "/api/files/read") storedFileRedirect?.let { return MockResponse().setResponseCode(302).setHeader("Location", it) }
+        if (path == "/api/files/download") return downloadRoute(wanted)
         val (mime, bytes) = storedFiles[wanted] ?: return json(404, JSONObject().put("detail", "not found"))
         if (path == "/api/media" && !mime.startsWith("image/")) return json(415, JSONObject().put("detail", "not an image"))
+        if (path == "/api/media" && bytes.size > MEDIA_LIMIT) return json(413, JSONObject().put("detail", "Image too large"))
+        if (path == "/api/files/read" && bytes.size > MANAGED_LIMIT) return json(413, JSONObject().put("detail", "File is too large"))
+        if (bytes.size > 1024 * 1024) {
+            // Large documents are assembled without extra whole-file string copies: only the base64 text itself is held.
+            val prefix = "{\"name\":" + JSONObject.quote(wanted.substringAfterLast('/')) + ",\"size\":" + bytes.size +
+                ",\"mime_type\":" + JSONObject.quote(mime) + ",\"data_url\":\"data:$mime;base64,"
+            val buffer = okio.Buffer().writeUtf8(prefix)
+            Base64.getEncoder().wrap(buffer.outputStream()).use { it.write(bytes) }
+            buffer.writeUtf8("\"}")
+            return MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json").setBody(buffer)
+        }
         val dataUrl = "data:$mime;base64," + Base64.getEncoder().encodeToString(bytes)
         return json(200, JSONObject().put("name", wanted.substringAfterLast('/')).put("size", bytes.size).put("mime_type", mime).put("data_url", dataUrl))
+    }
+
+    /** When true, `/api/files/download` answers like a server that does not have the route (FastAPI's own `Not Found`). */
+    @Volatile var downloadRouteAbsent = false
+
+    /** When above zero, a download body is sent at most this many bytes per 100 ms (a test reaches the middle of a transfer). */
+    @Volatile var downloadThrottleBytes = 0L
+
+    /** Called with the request just before a download is answered (a test latches the transfer here). */
+    @Volatile var downloadHook: (() -> Unit)? = null
+
+    /** `GET /api/files/download`: the managed file as a plain attachment, streamed, with its own Content-Length; the managed 404/413 bodies. */
+    private fun downloadRoute(wanted: String): MockResponse {
+        if (downloadRouteAbsent) return json(404, JSONObject().put("detail", "Not Found"))
+        downloadHook?.invoke()
+        val (mime, bytes) = storedFiles[wanted] ?: return json(404, JSONObject().put("detail", "File not found"))
+        if (bytes.size.toLong() > MANAGED_LIMIT) return json(413, JSONObject().put("detail", "File is too large"))
+        val response = MockResponse().setResponseCode(200).setHeader("Content-Type", mime)
+            .setHeader("Content-Disposition", "attachment; filename=\"" + wanted.substringAfterLast('/') + "\"")
+            .setBody(okio.Buffer().write(bytes))
+        if (downloadThrottleBytes > 0) response.throttleBody(downloadThrottleBytes, 100, java.util.concurrent.TimeUnit.MILLISECONDS)
+        return response
     }
 
     fun decodeSpoken(audio: SpokenAudio): String = String(audio.bytes).removePrefix("AUDIO:")
@@ -431,7 +465,7 @@ class FakeHermesDashboard : AutoCloseable {
         val path = request.requestUrl!!.encodedPath
         val body = request.body.readUtf8().let { if (it.isBlank()) JSONObject() else JSONObject(it) }
         if (path.startsWith("/api/sessions")) return if (!authorized(request)) unauthorized() else sessionsRoute(request, path, body)
-        if (path == "/api/media" || path == "/api/files/read") return if (!authorized(request)) unauthorized() else storedFileRoute(request, path)
+        if (path == "/api/media" || path == "/api/files/read" || path == "/api/files/download") return if (!authorized(request)) unauthorized() else storedFileRoute(request, path)
         return when (path) {
             "/auth/native/token" ->
                 if (body.optString("code") == "gw-code" && PkcePair.challengeFor(body.optString("code_verifier")) == expectedChallenge) {
@@ -905,6 +939,10 @@ class FakeHermesDashboard : AutoCloseable {
     override fun close() = server.shutdown()
 
     companion object {
+        /** The dashboard's own caps: `/api/media` 25 MiB, the managed file routes 100 MiB. */
+        const val MEDIA_LIMIT = 25 * 1024 * 1024
+        const val MANAGED_LIMIT = 100 * 1024 * 1024
+
         fun complete(text: String, status: String = "complete"): Pair<String, JSONObject> =
             "message.complete" to JSONObject().put("text", text).put("status", status)
         fun interim(text: String): Pair<String, JSONObject> =

@@ -91,6 +91,8 @@ data class PhoneUiState(
     /** Stored ids whose archive or unarchive request is in flight; such a row ignores further gestures. */
     val archiving: Set<String> = emptySet(),
     val selected: OwnedSession? = null,
+    /** The selected conversation was opened but its newest page has not landed yet: nothing is baselined against its history, so a send waits. */
+    val opening: Boolean = false,
     val history: List<HistoryMessage> = emptyList(),
     /** Authority provenance of the displayed body, including cached rows; never a file grant. */
     val historyNamespace: String? = null,
@@ -419,8 +421,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
     private suspend fun mergeLatest(sessionId: String, generation: Long, page: HistoryPage, release: Boolean, origin: ActionOrigin): Boolean {
         if (!actionCurrent(origin)) return false
         if (selection.get() != generation || _state.value.selected?.storedSessionId != sessionId) return false
-        app.finalRecovery.observedNewest(page, app.bodyScope())
-        if (!actionCurrent(origin) || selection.get() != generation) return false
+        app.finalRecovery.observeNewestAsync(page, app.bodyScope())
         val scope = app.sessionListScope()
         app.recentBodies.remember(page, page.returned >= HISTORY_PAGE) {
             app.sessionListScope() == scope && selection.get() == generation && actionCurrent(origin)
@@ -434,7 +435,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
             // rows may have arrived in between, so the walk toward older rows starts again from the newest page.
             val shown = prior.mapTo(HashSet()) { it.rowId }
             val joined = merged.size > page.messages.size && page.messages.any { it.rowId in shown }
-            current.copy(history = merged, historyNamespace = origin.namespace,
+            current.copy(history = merged, historyNamespace = origin.namespace, opening = false,
                 pendingSends = PendingSends.reconcile(current.pendingSends, sessionId, merged),
                 activity = if (release) released.bubbles else current.activity,
                 hasOlder = if (joined) current.hasOlder else page.returned >= HISTORY_PAGE,
@@ -814,19 +815,29 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
     fun open(session: OwnedSession, afterShown: () -> Unit = {}) {
         val generation = selection.incrementAndGet()
         cancelOlder()
-        // Never replace a richer live reader/pagination cursor with its bounded saved newest page.
-        if (_state.value.selected?.storedSessionId != session.storedSessionId || _state.value.history.isEmpty()) app.recentBodies.load(session.storedSessionId)?.let { saved ->
+        val switching = _state.value.selected?.storedSessionId != session.storedSessionId
+        if (switching) {
+            // The screen is the target's from this moment: its own stashed draft, no history until its own page is known, no viewer of the old one.
+            if (_state.value.viewer != null) closeViewer()
             val current = _state.value
-            val (draft, attachments) = if (current.selected?.storedSessionId == session.storedSessionId) current.draft to current.attachments else {
-                current.selected?.let { drafts[it.storedSessionId] = current.draft to current.attachments }
-                drafts.remove(session.storedSessionId) ?: ("" to emptyList())
-            }
-            _state.update { it.copy(selected = session, history = saved.page.messages, historyNamespace = app.bodyScope(), hasOlder = saved.hasOlder,
-                rawLoaded = saved.page.returned, olderBound = saved.page.rawFloor() ?: Long.MAX_VALUE,
-                olderEpoch = it.olderEpoch + 1, draft = draft, attachments = attachments,
+            current.selected?.let { drafts[it.storedSessionId] = current.draft to current.attachments }
+            val (draft, attachments) = drafts.remove(session.storedSessionId) ?: ("" to emptyList())
+            _state.update { it.copy(selected = session, opening = true, history = emptyList(), historyNamespace = app.bodyScope(), hasOlder = false,
+                rawLoaded = 0, olderBound = Long.MAX_VALUE, olderEpoch = it.olderEpoch + 1, draft = draft, attachments = attachments,
                 olderLoading = false, olderError = false) }
         }
-        launchGuarded { wiring, origin -> showNewest(wiring, origin, session, generation, afterShown) }
+        launchGuarded { wiring, origin ->
+            // Never replace a richer live reader/pagination cursor with its bounded saved newest page.
+            if (_state.value.history.isEmpty()) withContext(Dispatchers.IO) { app.recentBodies.load(session.storedSessionId) }?.let { saved ->
+                if (actionCurrent(origin) && selection.get() == generation) _state.update {
+                    if (it.selected?.storedSessionId != session.storedSessionId || it.history.isNotEmpty()) it
+                    else it.copy(history = saved.page.messages, opening = false, historyNamespace = app.bodyScope(), hasOlder = saved.hasOlder,
+                        rawLoaded = saved.page.returned, olderBound = saved.page.rawFloor() ?: Long.MAX_VALUE,
+                        olderEpoch = it.olderEpoch + 1, olderLoading = false, olderError = false)
+                }
+            }
+            showNewest(wiring, origin, session, generation, afterShown)
+        }
     }
 
     /** Reads and shows [session]'s newest page; false when another conversation was selected meanwhile (nothing is shown then). */
@@ -844,8 +855,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
         }
         if (!actionCurrent(origin)) return false
         if (selection.get() != generation) return false
-        app.finalRecovery.observedNewest(page, app.bodyScope())
-        if (!actionCurrent(origin) || selection.get() != generation) return false
+        app.finalRecovery.observeNewestAsync(page, app.bodyScope())
         app.recentBodies.eligible(session.storedSessionId)
         app.recentBodies.remember(page, page.returned >= HISTORY_PAGE) { actionCurrent(origin) && selection.get() == generation }
         // On the main thread, like every draft edit: the stash is never touched inside a retried update.
@@ -856,7 +866,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
             drafts.remove(session.storedSessionId) ?: ("" to emptyList())
         }
         _state.update {
-            it.copy(selected = session, historyNamespace = origin.namespace, history = if (it.selected?.storedSessionId == session.storedSessionId && it.historyNamespace == origin.namespace) HistoryPages.refreshLatest(it.history, page.messages) else page.messages, hasOlder = page.returned >= HISTORY_PAGE,
+            it.copy(selected = session, opening = false, historyNamespace = origin.namespace, history = if (it.selected?.storedSessionId == session.storedSessionId && it.historyNamespace == origin.namespace) HistoryPages.refreshLatest(it.history, page.messages) else page.messages, hasOlder = page.returned >= HISTORY_PAGE,
                 pendingSends = PendingSends.reconcile(it.pendingSends, session.storedSessionId, page.messages),
                 rawLoaded = page.returned, olderEpoch = it.olderEpoch + 1,
                 olderBound = page.rawFloor() ?: Long.MAX_VALUE,
@@ -1070,6 +1080,10 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
                 _state.update { it.copy(status = "Sign in to Hermes first") }
                 return
             }
+            if (current.opening) {
+                _state.update { it.copy(status = "Opening this conversation…") }
+                return
+            }
             val admission = ComposerDispatch.admit(current.selected?.storedSessionId, ComposerDraft(current.draft, current.attachments), app.textSends.ids.incrementAndGet(), app.diagnostics.log)
             when (admission) {
                 is SendAdmission.Refused -> {
@@ -1101,7 +1115,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
         while (true) {
             val current = _state.value
             val failed = current.failedSends.firstOrNull { it.send.id == id } ?: return
-            if (current.selected?.storedSessionId != failed.send.sessionId) return
+            if (current.selected?.storedSessionId != failed.send.sessionId || current.opening) return
             val shown = PendingSend(failed.send, PendingSends.baseline(current.history))
             val admitted = current.copy(failedSends = current.failedSends.filterNot { f -> f.send.id == id },
                 pendingSends = PendingSends.add(current.pendingSends, shown), sendsInFlight = current.sendsInFlight + 1, status = "Sending…")
@@ -1215,9 +1229,43 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
             // Read authority (including eligible archived history), not send/delivery authority.
             wiring.core.sessions.history(sessionId, limit = 1)
             if (!app.asyncActionCurrent(origin)) throw CancellationException("Attachment origin changed")
-            val stored = wiring.dashboard.fetchStoredFile(ref)
+            receive(wiring.dashboard, origin, ref)
+        }
+    }
+
+    /**
+     * A file within the preview limit is read whole and shown (unchanged); a larger one, up to the dashboard's download limit,
+     * is streamed to the viewed folder and shown from there. A refusal at the download limit is reported as it is.
+     */
+    private suspend fun receive(dashboard: com.rumi.hermesvoice.core.net.HermesDashboardClient, origin: PhoneApp.AsyncActionOrigin, ref: AttachmentRef): ViewedAttachment {
+        val stored = try {
+            dashboard.fetchStoredFile(ref)
+        } catch (error: com.rumi.hermesvoice.core.net.StoredFileTooLargeException) {
+            if (error.limitBytes >= com.rumi.hermesvoice.core.net.StoredFileSource.MAX_DOWNLOAD_BYTES) throw error
             if (!app.asyncActionCurrent(origin)) throw CancellationException("Attachment origin changed")
-            materialize(ref.name.ifBlank { stored.name }, stored.mimeType, stored.bytes)
+            return download(dashboard, origin, ref)
+        }
+        if (!app.asyncActionCurrent(origin)) throw CancellationException("Attachment origin changed")
+        return materialize(ref.name.ifBlank { stored.name }, stored.mimeType, stored.bytes)
+    }
+
+    private suspend fun download(dashboard: com.rumi.hermesvoice.core.net.HermesDashboardClient, origin: PhoneApp.AsyncActionOrigin, ref: AttachmentRef): ViewedAttachment {
+        // Keep ownership outside the IO return: prompt cancellation can discard its result.
+        var owned: java.io.File? = null
+        try {
+            val target = ViewedFiles.reserve(app, ref.name).also { owned = it }
+            val done = dashboard.downloadStoredFile(ref, target)
+            if (!app.asyncActionCurrent(origin)) throw CancellationException("Attachment origin changed")
+            return withContext(Dispatchers.IO) {
+                val head = ViewedFiles.head(target)
+                val decision = FilePreview.classify(ref.name, done.mimeType, head)
+                val text = if (decision.kind == PreviewKind.TEXT) FilePreview.textPreview(head) else null
+                val kind = if (decision.kind == PreviewKind.TEXT && text == null) PreviewKind.OTHER else decision.kind
+                ViewedAttachment(ref.name, decision.mimeType, kind, done.size.toInt(), text, target, ByteArray(0))
+            }
+        } catch (error: Throwable) {
+            runCatching { owned?.delete() } // Only this load's file, even if a newer viewer has already opened.
+            throw error
         }
     }
 
@@ -1290,7 +1338,9 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
         val viewed = _state.value.viewer?.file ?: return done(false)
         viewModelScope.launch {
             val saved = withContext(Dispatchers.IO) {
-                runCatching { getApplication<Application>().contentResolver.openOutputStream(target)!!.use { it.write(viewed.bytes) } }.isSuccess
+                runCatching {
+                    getApplication<Application>().contentResolver.openOutputStream(target)!!.use { out -> viewed.file.inputStream().use { it.copyTo(out) } }
+                }.isSuccess
             }
             done(saved)
         }

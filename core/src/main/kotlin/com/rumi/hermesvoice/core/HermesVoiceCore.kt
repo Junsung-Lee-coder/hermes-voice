@@ -218,6 +218,11 @@ class ChatService(
                 }
             }
             reply?.let { received ->
+                if ((received.status == null || received.status == "complete") && com.rumi.hermesvoice.core.net.SilentControl.isWholeResponse(received.text)) {
+                    accepted?.settle(sendId)
+                    probe.completed()
+                    return@let ChatSendResult.Replied("", received.status)
+                }
                 if (received.text.isNotBlank() && (received.status == null || received.status == "complete")) {
                     replied = true
                     val identity = com.rumi.hermesvoice.core.notify.ReplyAlert.identityOf(sendId, "reply")

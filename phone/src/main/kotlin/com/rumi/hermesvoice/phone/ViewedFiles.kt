@@ -36,10 +36,16 @@ internal object ViewedFiles {
 
     fun dir(context: Context): File = File(context.cacheDir, SUBDIR)
 
-    fun write(context: Context, name: String, bytes: ByteArray): File {
+    /** A new unique path inside the viewed folder; nothing exists there yet. */
+    fun reserve(context: Context, name: String): File {
         val dir = dir(context).also { it.mkdirs() }
         val file = File(dir, "${counter.incrementAndGet()}-${FilePreview.safeStorageName(name)}")
         check(file.canonicalFile.parentFile == dir.canonicalFile) { "unsafe cache name" }
+        return file
+    }
+
+    fun write(context: Context, name: String, bytes: ByteArray): File {
+        val file = reserve(context, name)
         try {
             file.writeBytes(bytes)
             return file
@@ -48,6 +54,19 @@ internal object ViewedFiles {
             throw error
         }
     }
+
+    /** The first bytes of [file] that classification and the text preview look at: the same decision as for the whole file. */
+    fun head(file: File, limit: Int = FilePreview.MAX_TEXT_BYTES + 1): ByteArray =
+        file.inputStream().use { input ->
+            val buffer = ByteArray(limit)
+            var filled = 0
+            while (filled < limit) {
+                val n = input.read(buffer, filled, limit - filled)
+                if (n < 0) break
+                filled += n
+            }
+            if (filled == limit) buffer else buffer.copyOf(filled)
+        }
 
     fun clear(context: Context) {
         dir(context).listFiles()?.forEach { runCatching { it.delete() } }

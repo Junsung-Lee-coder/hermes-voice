@@ -91,6 +91,33 @@ open class PhoneNavRoboBase : PhoneRoboBase() {
         waitFor("$id opens") { model.state.value.selected?.storedSessionId == id && exists("chat_list") }
     }
 
+    private val presenceOpened = java.util.concurrent.atomic.AtomicInteger()
+    private val presenceConfirmed = java.util.concurrent.atomic.AtomicInteger()
+    private var presenceObserved = false
+
+    /**
+     * Counts, without altering them, the real presence transitions (ConversationPresence.onOpened, synchronous) and the confirmation
+     * reads they start (ReplyAlerts.confirmOpened, asynchronous: a second newest-page read after the visible open).
+     */
+    private fun observePresence() {
+        if (presenceObserved) return
+        presenceObserved = true
+        val innerOpened = app.presence.onOpened
+        app.presence.onOpened = { id -> presenceOpened.incrementAndGet(); innerOpened(id) }
+        val innerConfirm = app.replyAlerts.confirmOpened!!
+        app.replyAlerts.confirmOpened = { id -> try { innerConfirm(id) } finally { presenceConfirmed.incrementAndGet() } }
+    }
+
+    /** [openCard], then until the first page has landed and every confirmation read started by the visible open has finished. */
+    fun openSettled(model: PhoneViewModel, id: String) {
+        observePresence()
+        openCard(model, id)
+        waitFor("the first page landed for $id") { !model.state.value.opening }
+        waitFor("the visible-open confirmation read finished (opened=${presenceOpened.get()} confirmed=${presenceConfirmed.get()})") {
+            presenceOpened.get() == presenceConfirmed.get()
+        }
+    }
+
     fun systemBack() {
         controller!!.get().onBackPressedDispatcher.onBackPressed()
         settle()

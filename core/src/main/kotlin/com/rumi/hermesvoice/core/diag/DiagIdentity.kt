@@ -135,6 +135,8 @@ object DiagLabels {
         DiagCause.LOCAL -> "refused by the app"
         DiagCause.UNKNOWN -> "unknown cause"
         DiagCause.STT_UNAVAILABLE -> "speech server unavailable"
+        DiagCause.QUEUED_UNATTRIBUTABLE -> "queued behind another turn, reply not attributable"
+        DiagCause.REPLY_UNRECOVERABLE -> "reply could not be matched to this turn"
     }
 
     /** "category while stage" for a status line, or null when neither is known. Fixed words only. */

@@ -157,6 +157,7 @@ open class PhoneRoboBase {
         idle(300)
         val model = ViewModelProvider(controller!!.get())[PhoneViewModel::class.java]
         assertTrue("the conversation is selected", await { model.state.value.selected?.storedSessionId == session })
+        assertTrue("its newest page has landed", await { !model.state.value.opening })
         return model
     }
 
@@ -164,6 +165,7 @@ open class PhoneRoboBase {
         val owned = app.wiring().core.sessions.activeConversation(session)!!
         model.open(owned)
         assertTrue("selected", await { model.state.value.selected?.storedSessionId == session })
+        assertTrue("its newest page has landed", await { !model.state.value.opening })
     }
 
     fun prompts() = fake.rawPrompts.map { it.second }
