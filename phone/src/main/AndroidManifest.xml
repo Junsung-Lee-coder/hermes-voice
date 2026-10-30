@@ -73,6 +73,9 @@
             android:exported="false"
             android:foregroundServiceType="microphone|mediaPlayback" />
 
+        <!-- Ordinary Watch relay uses connectedDevice without Phone capture; verified Phone-headset input adds microphone only at explicit input admission. -->
+        <service android:name=".live.PhoneLiveVoiceService" android:exported="false" android:foregroundServiceType="connectedDevice|microphone|mediaPlayback" />
+
         <!-- On-demand exact manual capture lease; no idle playback or automatic restart. -->
         <service android:name=".PhoneManualService" android:exported="false" android:foregroundServiceType="microphone" />
 
@@ -98,8 +101,20 @@
             android:name=".PhoneWatchListenerService"
             android:exported="true">
             <intent-filter>
+                <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
+                <data android:scheme="wear" android:host="*" android:path="/hv/v1/live/control" />
+            </intent-filter>
+            <intent-filter>
                 <action android:name="com.google.android.gms.wearable.CHANNEL_EVENT" />
                 <data android:scheme="wear" android:host="*" android:pathPrefix="/hv/v1/turn/" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.CHANNEL_EVENT" />
+                <data android:scheme="wear" android:host="*" android:pathPrefix="/hv/v2/live/pcm/" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.CHANNEL_EVENT" />
+                <data android:scheme="wear" android:host="*" android:pathPrefix="/hv/v3/live/audio/" />
             </intent-filter>
             <intent-filter>
                 <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />

@@ -3,7 +3,10 @@ package com.rumi.hermesvoice.core.watchlink
 import com.rumi.hermesvoice.core.HermesAuthRequiredException
 import com.rumi.hermesvoice.core.HermesException
 import com.rumi.hermesvoice.core.SessionNotOwnedException
+import com.rumi.hermesvoice.core.net.HistoryPages
+import com.rumi.hermesvoice.core.net.SuppressedRow
 import com.rumi.hermesvoice.core.sessions.AppSessionRepository
+import com.rumi.hermesvoice.core.sessions.ConversationListing
 import com.rumi.hermesvoice.core.sessions.OwnedRole
 import com.rumi.hermesvoice.core.sessions.ReadRetryBudget
 import com.rumi.hermesvoice.core.sessions.withReadRetries
@@ -21,6 +24,7 @@ import org.json.JSONObject
  *
  * - `/hv/v1/reader/request`  message, Watch → Phone: [ReaderRequest]
  * - `/hv/v1/reader/response` message, Phone → Watch (the requesting node only): [ReaderResponse]
+ * - `/hv/v1/reader/accepted` message, Phone → Watch (the requesting node only): [ReaderAccepted]
  *
  * Reading is side-effect free: it never submits, archives, or moves the playback route.
  */
@@ -39,11 +43,23 @@ object WatchReaderLimits {
     const val MAX_MESSAGES_PER_SESSION = 200
     const val REQUEST_TIMEOUT_MS = 15_000L
 
+    /**
+     * A request the Phone app accepted ([ReaderAccepted]) inside [REQUEST_TIMEOUT_MS] may be answered until this long after its first try.
+     * The owner's Phone answered list reads 26-34 s after the Watch sent them; a request the Phone never accepted keeps the 15 s window.
+     */
+    const val ACCEPTED_REQUEST_TIMEOUT_MS = 45_000L
+
     /** A Phone-side retry of a Watch read may START only this long after the request arrived, so the Watch's own window still holds the answer. */
     const val PHONE_RETRY_START_WINDOW_MS = 9_000L
 
     /** Bound hidden/tool-only raw-page scanning per reader request. */
     const val MAX_HIDDEN_SCAN_PAGES = 8
+
+    /** Every identity in the existing bounded scan, including its newest pages; never a body. */
+    const val MAX_HIDDEN_ROWS = MAX_HIDDEN_SCAN_PAGES * MAX_PAGE_MESSAGES
+
+    /** List parts the Phone sends for one read while its dashboard scan is still running (one per unfinished page, at most this many). */
+    const val MAX_LIST_PARTS = 8
 }
 
 enum class ReaderKind(val wire: String) {
@@ -63,6 +79,9 @@ object ReaderError {
     const val TIMEOUT = "timeout"
     const val OFFLINE = "offline"
     const val HISTORY_SCAN_LIMIT = "history_scan_limit"
+
+    /** The Phone app accepted the read and was answering it, but the answer did not finish inside the bounded window. */
+    const val INCOMPLETE = "incomplete"
 }
 
 data class ReaderRequest(
@@ -73,10 +92,13 @@ data class ReaderRequest(
     val limit: Int = WatchReaderLimits.MAX_PAGE_MESSAGES,
     /** Automatic retries of this logical refresh the Watch has already spent; the Phone continues the same allowance. Absent from older Watches (0). */
     val retriesUsed: Int = 0,
+    /** The Watch applies list parts ([ReaderResponse.part]) sent while the scan is still running. Absent from older Watches (false). */
+    val progress: Boolean = false,
 ) {
     fun encode(): ByteArray = JSONObject().put("v", 1).put("req_id", reqId).put("kind", kind.wire)
         .apply { if (sessionId != null) put("session_id", sessionId) }
         .apply { if (retriesUsed > 0) put("retries_used", retriesUsed) }
+        .apply { if (progress) put("progress", true) }
         .put("offset", offset).put("limit", limit).toString().toByteArray(StandardCharsets.UTF_8)
 
     companion object {
@@ -95,7 +117,38 @@ data class ReaderRequest(
             if (retriesUsed !in 0..ReadRetryBudget.MAX_RETRIES) return null
             return ReaderRequest(reqId, kind, if (kind == ReaderKind.HISTORY) sessionId else null,
                 json.optInt("offset", 0).coerceAtLeast(0),
-                json.optInt("limit", WatchReaderLimits.MAX_PAGE_MESSAGES).coerceIn(1, WatchReaderLimits.MAX_PAGE_MESSAGES), retriesUsed)
+                json.optInt("limit", WatchReaderLimits.MAX_PAGE_MESSAGES).coerceIn(1, WatchReaderLimits.MAX_PAGE_MESSAGES), retriesUsed,
+                kind == ReaderKind.SESSIONS && json.opt("progress") == true)
+        }
+    }
+}
+
+/**
+ * Phone → Watch: the Phone app holds this exact request and is answering it. A Data Layer `sendMessage` Task that succeeded on the
+ * Watch says only that the message left the Watch (delivery is best effort, without retry), so the Watch cannot otherwise tell a
+ * Phone that is still answering from one that never got the request. Only an echo of the request: no content, account or endpoint,
+ * and no promise of when (or whether) the answer comes.
+ */
+data class ReaderAccepted(val reqId: String, val kind: ReaderKind, val sessionId: String?, val offset: Int) {
+    fun encode(): ByteArray = JSONObject().put("v", 1).put("req_id", reqId).put("kind", kind.wire).put("offset", offset)
+        .apply { if (sessionId != null) put("session_id", sessionId) }.toString().toByteArray(StandardCharsets.UTF_8)
+
+    /** Whether this echoes exactly [request]: the same id, kind, conversation and page. */
+    fun matches(request: ReaderRequest): Boolean =
+        reqId == request.reqId && kind == request.kind && sessionId == request.sessionId && offset == request.offset
+
+    companion object {
+        fun of(request: ReaderRequest) = ReaderAccepted(request.reqId, request.kind, request.sessionId, request.offset)
+
+        fun decode(bytes: ByteArray): ReaderAccepted? {
+            if (bytes.size > WatchReaderLimits.MAX_REQUEST_BYTES) return null
+            val json = runCatching { JSONObject(String(bytes, StandardCharsets.UTF_8)) }.getOrNull() ?: return null
+            if (json.optInt("v") != 1) return null
+            val reqId = json.optString("req_id").takeIf(WatchLinkPaths::isValidTurnId) ?: return null
+            val kind = ReaderKind.parse(json.optString("kind")) ?: return null
+            val offset = json.opt("offset") as? Int ?: return null
+            if (offset < 0) return null
+            return ReaderAccepted(reqId, kind, json.optString("session_id").takeIf { it.isNotEmpty() }, offset)
         }
     }
 }
@@ -170,6 +223,13 @@ data class ReaderResponse(
     val finals: List<JSONObject> = emptyList(),
     /** Private body/receive epoch; legacy display-title scope above remains stable. */
     val bodyScope: String? = null,
+    /** Rows the Phone's projection hid in the scanned pages: identities only, so the Watch can drop its stale copies. Old peers omit it. */
+    val hidden: List<SuppressedRow> = emptyList(),
+    /**
+     * 0: the answer that settles the read. N >= 1: the Nth list part, everything the still-running scan found so far, never complete;
+     * sent only to a Watch that asked for parts ([ReaderRequest.progress]).
+     */
+    val part: Int = 0,
 ) {
     fun encode(): ByteArray = JSONObject().put("v", 1).put("req_id", reqId).put("kind", kind.wire).put("ok", ok)
         .apply {
@@ -180,6 +240,8 @@ data class ReaderResponse(
             if (!sessionsComplete) put("sessions_complete", false)
             if (removedSessionIds.isNotEmpty()) put("removed_session_ids", JSONArray(removedSessionIds))
             if (finals.isNotEmpty()) put("finals", JSONArray(finals))
+            if (hidden.isNotEmpty()) put("hidden", JSONArray().apply { hidden.take(WatchReaderLimits.MAX_HIDDEN_ROWS).forEach { put(JSONObject().put("row_id", it.rowId).put("uid", it.uid)) } })
+            if (part > 0) put("part", part)
         }
         .put("sessions", JSONArray().apply { sessions.forEach { put(it.toJson()) } })
         .put("messages", JSONArray().apply { messages.forEach { put(it.toJson()) } })
@@ -206,6 +268,12 @@ data class ReaderResponse(
                 json.optJSONArray("removed_session_ids")?.let { ids -> (0 until minOf(ids.length(), WatchReaderLimits.MAX_SESSIONS)).mapNotNull { ids.optString(it).takeIf(String::isNotBlank) } }.orEmpty(),
                 json.optJSONArray("finals")?.let { rows -> (0 until minOf(rows.length(),100)).map { rows.getJSONObject(it) } }.orEmpty(),
                 json.optString("body_scope").takeIf { it.matches(Regex("[a-f0-9]{64}")) },
+                json.optJSONArray("hidden")?.let { rows ->
+                    (0 until minOf(rows.length(), WatchReaderLimits.MAX_HIDDEN_ROWS)).mapNotNull { i ->
+                        rows.optJSONObject(i)?.takeIf { it.has("row_id") }?.let { SuppressedRow(it.optLong("row_id"), it.optString("uid")) }
+                    }
+                }.orEmpty(),
+                (json.opt("part") as? Int)?.takeIf { it in 1..WatchReaderLimits.MAX_LIST_PARTS } ?: if (json.has("part")) return null else 0,
             )
         }.getOrNull()
     }
@@ -225,16 +293,18 @@ class PhoneReaderService(
     /**
      * The encoded response, or null for a request that cannot be decoded (it is ignored). The Phone continues the retry allowance the
      * request says is already spent ([carriedRetries] overrides it, for a duplicate whose earlier run spent more) and reports the
-     * total spent through [onRetriesSpent].
+     * total spent through [onRetriesSpent]. For a list read that asked for parts, [onPart] receives each unfinished page's list so far
+     * (encoded, at most [WatchReaderLimits.MAX_LIST_PARTS]) while the scan goes on; the returned answer is still the one that settles it.
      */
-    suspend fun handle(requestBytes: ByteArray, carriedRetries: Int? = null, onRetriesSpent: ((Int) -> Unit)? = null): ByteArray? {
+    suspend fun handle(requestBytes: ByteArray, carriedRetries: Int? = null, onPart: (suspend (ByteArray) -> Unit)? = null,
+                       onRetriesSpent: ((Int) -> Unit)? = null): ByteArray? {
         val request = ReaderRequest.decode(requestBytes) ?: return null
         val carried = carriedRetries ?: request.retriesUsed
         val response = try {
             withReadRetries(WatchReaderLimits.PHONE_RETRY_START_WINDOW_MS, readLog, stillCurrent = stillCurrent, carriedRetries = carried) {
                 try {
                     when (request.kind) {
-                        ReaderKind.SESSIONS -> sessionsResponse(request)
+                        ReaderKind.SESSIONS -> sessionsResponse(request, onPart)
                         ReaderKind.HISTORY -> historyResponse(request)
                     }
                 } finally {
@@ -256,8 +326,18 @@ class PhoneReaderService(
     private fun failure(request: ReaderRequest, error: String) =
         ReaderResponse(request.reqId, request.kind, ok = false, error = error, sessionId = request.sessionId)
 
-    private suspend fun sessionsResponse(request: ReaderRequest): ReaderResponse {
-        val listing = sessions.listConversations(archived = false, adoptMarked = false)
+    private suspend fun sessionsResponse(request: ReaderRequest, onPart: (suspend (ByteArray) -> Unit)?): ReaderResponse {
+        var parts = 0
+        val progress: (suspend (ConversationListing) -> Unit)? = if (onPart == null || !request.progress) null else { found ->
+            if (parts < WatchReaderLimits.MAX_LIST_PARTS) {
+                parts += 1
+                onPart(fit(listResponse(request, found).copy(part = parts)))
+            }
+        }
+        return listResponse(request, sessions.listConversations(archived = false, adoptMarked = false, onProgress = progress))
+    }
+
+    private fun listResponse(request: ReaderRequest, listing: ConversationListing): ReaderResponse {
         val rows = listing
             .filter { !it.owned.archived && !it.stored.archived }
             .sortedByDescending { it.stored.lastActive }
@@ -281,16 +361,19 @@ class PhoneReaderService(
         // "Load older" landing page. Find the nearest displayable page, latest first, without
         // changing request identity, resubmitting a turn or losing the exact raw cursor.
         var offset = request.offset
+        val hidden = ArrayList<SuppressedRow>()
         repeat(WatchReaderLimits.MAX_HIDDEN_SCAN_PAGES) {
             val page = sessions.history(sessionId, request.limit, offset)
             if (page.sessionId != sessionId || page.returned < 0 || page.returned > request.limit ||
                 offset > Int.MAX_VALUE - page.returned) return failure(request, ReaderError.UNAVAILABLE)
             val nextOffset = offset + page.returned
             val hasOlder = page.returned >= request.limit
+            hidden += page.suppressed
             if (page.messages.isNotEmpty() || !hasOlder) {
                 val messages = page.messages.sortedBy { it.rowId }.map { ReaderMessageRow(it.rowId, it.role, it.text, truncated = false, messageUid = it.messageUid, timestamp = it.timestamp, received = it.received) }
                 return ReaderResponse(request.reqId, request.kind, ok = true, sessionId = sessionId, messages = messages,
-                    offset = request.offset, nextOffset = nextOffset, hasOlder = hasOlder)
+                    offset = request.offset, nextOffset = nextOffset, hasOlder = hasOlder,
+                    hidden = hidden)
             }
             offset = nextOffset
         }
@@ -314,7 +397,11 @@ class PhoneReaderService(
                 },
             )
             val bytes = clipped.encode()
-            if (bytes.size <= WatchReaderLimits.MAX_RESPONSE_BYTES || limit <= MIN_FIT_CHARS) return bytes
+            if (bytes.size <= WatchReaderLimits.MAX_RESPONSE_BYTES) return bytes
+            // Identity metadata cannot be shortened or silently dropped: refuse the read if
+            // even minimum text cannot fit it, rather than send an oversized/incomplete page.
+            if (limit <= MIN_FIT_CHARS) return ReaderResponse(response.reqId, response.kind, false,
+                error = ReaderError.UNAVAILABLE, sessionId = response.sessionId).encode()
             limit /= 2
             step++
         }
@@ -346,6 +433,8 @@ data class ReaderSessionsState(
     /** List-level cache/partial/save notice; never a per-row annotation. */
     val notice: String? = null,
     val alertNotice: String? = null,
+    /** The highest list part of [pendingReqId] shown so far; an older or repeated part changes nothing. */
+    val partsSeen: Int = 0,
 )
 
 /** Cached history of one conversation, oldest first, de-duplicated by row id. */
@@ -386,7 +475,7 @@ data class WatchReaderState(
     fun showSurface(target: ReaderSurface): WatchReaderState = copy(surface = target)
 
     fun requestSessions(reqId: String): WatchReaderState =
-        copy(sessions = sessions.copy(status = LoadStatus.LOADING, error = null, pendingReqId = reqId, stale = false))
+        copy(sessions = sessions.copy(status = LoadStatus.LOADING, error = null, pendingReqId = reqId, stale = false, partsSeen = 0))
 
     /** Opens [sessionId] in chat and asks for its latest page. */
     fun select(sessionId: String, reqId: String): WatchReaderState {
@@ -439,9 +528,22 @@ data class WatchReaderState(
         }
     }
 
+    /**
+     * A list part of the pending read: shown at once (merged before the rows already shown, a positively removed row dropped) while the
+     * read stays open. It never settles the read, never revokes a row it does not hold, never touches the selection or the histories.
+     */
+    fun onPart(response: ReaderResponse): WatchReaderState {
+        if (response.kind != ReaderKind.SESSIONS || !response.ok || response.part <= sessions.partsSeen || response.reqId != sessions.pendingReqId) return this
+        val rows = (response.sessions + sessions.rows.filterNot { it.id in response.removedSessionIds }).distinctBy { it.id }
+        return copy(sessions = sessions.copy(rows = rows.take(WatchReaderLimits.MAX_SESSIONS), partsSeen = response.part))
+    }
+
     fun onSendFailed(reqId: String): WatchReaderState = settleFailure(reqId, LoadStatus.OFFLINE, ReaderError.OFFLINE)
 
     fun onTimeout(reqId: String): WatchReaderState = settleFailure(reqId, LoadStatus.ERROR, ReaderError.TIMEOUT)
+
+    /** The Phone app accepted [reqId] but its answer did not finish inside the bounded window; whatever arrived stays shown. */
+    fun onIncomplete(reqId: String): WatchReaderState = settleFailure(reqId, LoadStatus.ERROR, ReaderError.INCOMPLETE)
 
     private fun settleFailure(reqId: String, status: LoadStatus, error: String): WatchReaderState {
         if (sessions.pendingReqId == reqId) return copy(sessions = sessions.copy(status = status, error = error, pendingReqId = null))
@@ -451,17 +553,19 @@ data class WatchReaderState(
 
     private fun merge(history: ReaderHistory, page: ReaderResponse): ReaderHistory {
         val settled = history.copy(status = LoadStatus.READY, error = null, pendingReqId = null, loadingOlder = false)
-        val known = history.messages.map { it.rowId }.toHashSet()
+        val shownNow = if (history.loadingOlder) emptyList() else page.messages.map { SuppressedRow(it.rowId, it.messageUid) }
+        val cached = HistoryPages.withoutStale(history.messages, page.hidden, shownNow, { it.rowId }, { it.messageUid })
+        val known = cached.map { it.rowId }.toHashSet()
         if (history.loadingOlder) {
             val older = page.messages.filter { it.rowId !in known }
-            return settled.copy(messages = (older + history.messages).sortedBy { it.rowId }, nextOlderOffset = page.nextOffset,
+            return settled.copy(messages = (older + cached).sortedBy { it.rowId }, nextOlderOffset = page.nextOffset,
                 hasOlder = page.hasOlder)
         }
         // Latest page. A full page that shares no row with the cache may hide a gap: start over from it.
-        val overlaps = page.messages.any { it.rowId in known }
+        val overlaps = page.messages.any { m -> history.messages.any { it.rowId == m.rowId } }
         // Canonical same-id rows may grow from partial to final. Latest page wins by identity,
         // not text; older cached rows and empty transient reads remain intact.
-        val merged = (history.messages + page.messages).associateBy { it.rowId }.values.sortedBy { it.rowId }
+        val merged = (cached + page.messages).associateBy { it.rowId }.values.sortedBy { it.rowId }
         val fresh = history.messages.isEmpty() || (page.messages.isNotEmpty() && !overlaps && page.hasOlder)
         return if (fresh || merged.size > WatchReaderLimits.MAX_MESSAGES_PER_SESSION) {
             settled.copy(messages = page.messages.sortedBy { it.rowId }, nextOlderOffset = page.nextOffset, hasOlder = page.hasOlder)
@@ -491,8 +595,9 @@ enum class ReaderAction { TOGGLE_SURFACE, BACKGROUND_APP }
 
 /**
  * Horizontal swipe → reader action, as confirmed by the product owner: right-to-left (dx < 0)
- * toggles the session browser and the conversation; left-to-right (dx > 0) sends the app to the
- * background (the task and its state stay alive). Vertical movement always scrolls.
+ * toggles the session browser and the conversation; left-to-right (dx > 0) is Back: from a
+ * conversation to the browser, and from the browser the app goes to the background (the task and
+ * its state stay alive). Vertical movement always scrolls.
  */
 object ReaderGestureMapping {
     const val STATUS = "CONFIRMED"

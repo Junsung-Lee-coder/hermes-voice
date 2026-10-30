@@ -159,10 +159,17 @@ data class WatchSettings(
     /** Independent charging-only continuous wake requests; Phone-owned and OFF on migration. */
     val phoneWakeWhileCharging: Boolean = false,
     val watchWakeWhileCharging: Boolean = false,
+    val phoneLiveEnabled: Boolean = false,
+    val watchLiveEnabled: Boolean = false,
+    val liveIdleSeconds: Int = 10,
 ) {
     init {
+        require(liveIdleSeconds in 1..60) { "Live idle grace must be 1–60 seconds" }
         require(VadSilence.validOrNull(vadSilenceSeconds) == vadSilenceSeconds) { "invalid trailing silence" }
     }
+
+    /** Engine is selected by the ORIGIN, never the networking owner. Reading it never opens a microphone. */
+    fun liveEnabled(device: VoiceOrigin): Boolean = if (device == VoiceOrigin.PHONE) phoneLiveEnabled else watchLiveEnabled
 
     /** Whether [device] has its background standby switched on. */
     fun backgroundWakeEnabled(device: VoiceOrigin): Boolean = when (device) {
@@ -227,6 +234,9 @@ data class WatchSettings(
         .put("private_audio", privateAudio)
         .put("phone_wake_while_charging", phoneWakeWhileCharging)
         .put("watch_wake_while_charging", watchWakeWhileCharging)
+        .put("phone_live_enabled", phoneLiveEnabled)
+        .put("watch_live_enabled", watchLiveEnabled)
+        .put("live_idle_seconds", liveIdleSeconds)
         .toString()
 
     companion object {
@@ -307,8 +317,11 @@ data class WatchSettings(
                 is Boolean -> value
                 else -> return null
             }
+            val phoneLive = when (val value = json.opt("phone_live_enabled")) { null -> false; is Boolean -> value; else -> return null }
+            val watchLive = when (val value = json.opt("watch_live_enabled")) { null -> false; is Boolean -> value; else -> return null }
+            val idle = when (val value = json.opt("live_idle_seconds")) { null -> 10; is Int, is Long -> (value as Number).toLong().takeIf { it in 1L..60L }?.toInt() ?: return null; else -> return null }
             return WatchSettings(location, patterns, haptics, silence, revision, phoneStandby, watchStandby,
-                phoneScreenOff, watchScreenOff, watchNavigate, privateAudio, phoneCharging, watchCharging)
+                phoneScreenOff, watchScreenOff, watchNavigate, privateAudio, phoneCharging, watchCharging, phoneLive, watchLive, idle)
         }
 
         /** The Watch's own stored copy; a missing or unreadable one is the safe default (wake OFF). */
@@ -455,6 +468,9 @@ class AppSettings(private val store: KeyValueStore) {
                 privateAudio = privateAudio,
                 phoneWakeWhileCharging = settings.phoneWakeWhileCharging,
                 watchWakeWhileCharging = settings.watchWakeWhileCharging,
+                phoneLiveEnabled = settings.phoneLiveEnabled,
+                watchLiveEnabled = settings.watchLiveEnabled,
+                liveIdleSeconds = settings.liveIdleSeconds,
             ).toJson(),
         )
         store.putString(KEY_WATCH_REVISION, revision.toString())
@@ -534,6 +550,9 @@ class AppSettings(private val store: KeyValueStore) {
             record?.privateAudio ?: false,
             record?.phoneWakeWhileCharging ?: false,
             record?.watchWakeWhileCharging ?: false,
+            record?.phoneLiveEnabled ?: false,
+            record?.watchLiveEnabled ?: false,
+            record?.liveIdleSeconds ?: 10,
         )
     }
 

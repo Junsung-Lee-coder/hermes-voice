@@ -38,6 +38,9 @@ import org.json.JSONObject
  *                                ([com.rumi.hermesvoice.core.wake.WakeAdmission])
  */
 object WatchLinkPaths {
+    /** Exact-node Live controls/status; never raw PCM or a playback receipt. */
+    const val LIVE_CONTROL = "/hv/v1/live/control"
+    const val LIVE_STATUS = "/hv/v1/live/status"
     const val TURN_PREFIX = "/hv/v1/turn/"
     const val STATE = "/hv/v1/state"
 
@@ -71,6 +74,7 @@ object WatchLinkPaths {
     const val SETTINGS = "/hv/v1/settings"
     const val READER_REQUEST = "/hv/v1/reader/request"
     const val READER_RESPONSE = "/hv/v1/reader/response"
+    const val READER_ACCEPTED = "/hv/v1/reader/accepted"
 
     /** Watch → Phone: claim, renew or release the wake episode ("Both"); Phone → that Watch: the verdict. */
     const val WAKE_CLAIM = "/hv/v1/wake/claim"

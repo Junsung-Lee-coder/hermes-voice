@@ -2,6 +2,7 @@ package com.rumi.hermesvoice.core.sessions
 
 import com.rumi.hermesvoice.core.KeyValueStore
 import com.rumi.hermesvoice.core.net.HistoryMessage
+import com.rumi.hermesvoice.core.net.SuppressedRow
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
@@ -11,6 +12,47 @@ import java.security.MessageDigest
  * a newer in-memory checkpoint. Calls run on IO; no network or OS operation holds this monitor.
  */
 class ReceivedConversations(private val store: KeyValueStore, private val namespace: () -> String?) {
+    private data class Projection(val sequence:Long,val scope:String,val session:String,
+        val hidden:List<SuppressedRow>,val shown:List<SuppressedRow>)
+    private class Projections {
+        val sequence=java.util.concurrent.atomic.AtomicLong()
+        val pending=java.util.concurrent.ConcurrentHashMap<Long,Projection>()
+    }
+    private var projections=Projections()
+
+    private fun matches(row:JSONObject,witness:SuppressedRow):Boolean {
+        val uid=row.optString("uid")
+        return (uid.isNotEmpty() && witness.uid==uid) ||
+            (row.optLong("row_id",-1)==witness.rowId && (uid.isEmpty() || witness.uid.isEmpty() || uid==witness.uid))
+    }
+    /** A positive display decision may publish before its serialized IO transaction. This is
+     * identity-only presentation state, never a read, receive cursor or device receipt. */
+    fun projectVisibility(ns:String,id:String,hidden:List<SuppressedRow>,shown:List<HistoryMessage>):Long? {
+        if(namespace()!=ns || (hidden.isEmpty() && shown.isEmpty())) return null
+        val sequence=projections.sequence.incrementAndGet()
+        projections.pending[sequence]=Projection(sequence,ns,id,hidden.toList(),shown.map { SuppressedRow(it.rowId,it.messageUid) })
+        return sequence
+    }
+    fun visibilitySettled(sequence:Long?) { if(sequence!=null) projections.pending.remove(sequence) }
+    private fun displayHidden(ns:String,id:String,row:JSONObject):Boolean {
+        val pending=projections.pending.values.filter { it.scope==ns && it.session==id }.sortedByDescending { it.sequence }
+        for(p in pending) {
+            if(p.hidden.any { matches(row,it) }) return true
+            if(p.shown.any { matches(row,it) }) return false
+        }
+        return row.optBoolean("display_hidden")
+    }
+    /** Persist only positively matched visibility; all receive/read/ack authority stays intact. */
+    @Synchronized fun reclassify(id:String,hidden:List<SuppressedRow>,shown:List<HistoryMessage>):Boolean {
+        val ns=namespace()?:return false;val r=root(ns)
+        val rows=r.getJSONObject("sessions").optJSONObject(id)?.optJSONObject("rows")?:return true
+        for(k in rows.keys()) {
+            val row=rows.getJSONObject(k)
+            if(hidden.any { matches(row,it) }) row.put("display_hidden",true)
+            else if(shown.any { matches(row,SuppressedRow(it.rowId,it.messageUid)) }) row.remove("display_hidden")
+        }
+        return commit(ns,r)
+    }
     private val published=java.util.concurrent.atomic.AtomicReference<JSONObject?>()
     private var hint:JSONObject?
         get()=published.get()
@@ -23,6 +65,7 @@ class ReceivedConversations(private val store: KeyValueStore, private val namesp
         val provider=namespace
         if(provider()!=ns) return null
         val child=ReceivedConversations(store) { provider()?.takeIf { it==ns } }
+        child.projections=projections
         child.hint=hint
         return try { val result=child.block();if(provider()==ns) result else null }
             finally { hint=if(provider()==ns) child.hint else null }
@@ -82,23 +125,37 @@ class ReceivedConversations(private val store: KeyValueStore, private val namesp
     fun unread(id:String):Boolean {
         val ns=namespace()?:return false
         val rows=view(ns).getJSONObject("sessions").optJSONObject(id)?.optJSONObject("rows")?:return false
-        return rows.keys().asSequence().any { rows.getJSONObject(it).let { row -> !row.optBoolean("read") && !row.optBoolean("baseline") } }
+        return rows.keys().asSequence().any { rows.getJSONObject(it).let { row -> !row.optBoolean("read") && !row.optBoolean("baseline") && !displayHidden(ns,id,row) } }
     }
-    @Synchronized fun expect(id:String,rowId:Long,watchNode:String?=null,quiet:Boolean?=null):Boolean {
-        val ns=namespace()?:return false;val r=root(ns);val s=session(r,id)
-        val targets=s.optJSONObject("expected_nodes")?:JSONObject().also { s.put("expected_nodes",it) }
-        val policies=s.optJSONObject("origin_quiet")?:JSONObject().also { s.put("origin_quiet",it) }
-        if(quiet!=null) policies.put(rowId.toString(),policies.optBoolean(rowId.toString()) || quiet)
-        val privateOrigin=policies.optBoolean(rowId.toString())
-        targets.put(rowId.toString(),if(privateOrigin) "" else watchNode.orEmpty())
-        // A canonical policy can arrive after history. It may tighten but never relax a row.
-        for(k in s.getJSONObject("rows").keys()) {
-            val row=s.getJSONObject("rows").getJSONObject(k)
-            if(row.optLong("row_id",-1)==rowId && privateOrigin)
-                row.put("quiet",true).put("private_origin",true).put("watch",false).put("watch_done",true).put("node","")
+    /** Exact canonical-origin metadata may arrive after a generic history observation/Phone post.
+     * Live Watch custody outranks an inferred legacy route, but never another proven original node. */
+    @Synchronized fun expect(id:String,rowId:Long,watchNode:String?=null,quiet:Boolean?=null,watchReceipt:Boolean=false):Boolean {
+        val ns=namespace()?:return false;val r=root(ns);val s=session(r,id);val key=rowId.toString()
+        val targets=s.optJSONObject("expected_nodes")?:JSONObject().also{s.put("expected_nodes",it)}
+        val policies=s.optJSONObject("origin_quiet")?:JSONObject().also{s.put("origin_quiet",it)}
+        val live=s.optJSONObject("live_watch_nodes")?:JSONObject().also{s.put("live_watch_nodes",it)}
+        if(watchReceipt && !watchNode.isNullOrBlank()){
+            val previous=live.optString(key)
+            check(previous.isBlank()||previous==watchNode){"Conflicting original Watch custody"}
+            live.put(key,watchNode)
         }
-        val old=s.getJSONArray("expected");val ids=(0 until old.length()).map { old.getLong(it) }
-        if(rowId !in ids) { check(ids.size<256);old.put(rowId) }
+        val original=live.optString(key).takeIf{it.isNotBlank()}
+        if(quiet!=null)policies.put(key,policies.optBoolean(key)||quiet)
+        val privateOrigin=policies.optBoolean(key)&&original==null
+        targets.put(key,original?:if(privateOrigin) "" else watchNode.orEmpty())
+        val rows=s.getJSONObject("rows")
+        for(k in rows.keys()){
+            val row=rows.getJSONObject(k);if(row.optLong("row_id",-1)!=rowId)continue
+            if(original!=null){
+                val wasOriginal=row.optBoolean("live_watch")
+                check(!wasOriginal||row.optString("node")==original){"Conflicting original Watch custody"}
+                row.put("live_watch",true).put("node",original).put("watch",true).put("private_origin",false)
+                if(!wasOriginal)row.put("watch_done",false)
+                if(policies.optBoolean(key))row.put("quiet",true)
+            }else if(privateOrigin&&!row.optBoolean("live_watch"))row.put("quiet",true).put("private_origin",true).put("watch",false).put("watch_done",true).put("node","")
+        }
+        val expected=s.getJSONArray("expected")
+        if((0 until expected.length()).none{expected.getLong(it)==rowId}){check(expected.length()<256);expected.put(rowId)}
         return commit(ns,r)
     }
     @Synchronized fun expected(id:String):Set<Long> {
@@ -116,15 +173,23 @@ class ReceivedConversations(private val store: KeyValueStore, private val namesp
             val legacy=rows.keys().asSequence().firstOrNull { k -> rows.getJSONObject(k).let { it.optLong("row_id",-1)==m.rowId && it.optString("uid").isBlank() } }
             val old=rows.optJSONObject(key)?:legacy?.let { rows.remove(it) as JSONObject }.also { if(it!=null) { it.put("identity",key).put("uid",m.messageUid);rows.put(key,it) } }
             val targets=s.optJSONObject("expected_nodes")
-            val node=if(targets?.has(m.rowId.toString())==true) targets.optString(m.rowId.toString()) else watchNode.orEmpty()
-            val toWatch=if(targets?.has(m.rowId.toString())==true) node.isNotBlank() else watch && node.isNotBlank()
+            val original=s.optJSONObject("live_watch_nodes")?.optString(m.rowId.toString())?.takeIf{it.isNotBlank()}
+                ?:old?.takeIf{it.optBoolean("live_watch")}?.optString("node")?.takeIf{it.isNotBlank()}
+            val node=original?:if(targets?.has(m.rowId.toString())==true) targets.optString(m.rowId.toString()) else watchNode.orEmpty()
+            val toWatch=original!=null || if(targets?.has(m.rowId.toString())==true) node.isNotBlank() else watch && node.isNotBlank()
             val final=m.final || m.rowId in expected
             val policies=s.optJSONObject("origin_quiet")
             val policy=if(policies?.has(m.rowId.toString())==true) policies.optBoolean(m.rowId.toString()) else null
 
             if(m.timestamp.isFinite() && m.timestamp>0) s.put("received",maxOf(s.optDouble("received",0.0),m.timestamp))
+            val privateOrigin=policy==true && original==null
             if(old!=null) {
-                if(policy==true) old.put("quiet",true).put("private_origin",true).put("watch",false).put("watch_done",true).put("node","")
+                if(privateOrigin) old.put("quiet",true).put("private_origin",true).put("watch",false).put("watch_done",true).put("node","")
+                if(original!=null){
+                    old.put("live_watch",true).put("private_origin",false)
+                    // A Phone post may already have retired the body before original-Watch metadata arrived.
+                    if(final&&!old.optBoolean("watch_done")&&old.optString("text").isBlank())old.put("text",m.text.take(3000))
+                }
                 val freshFinal = final && ((!old.optBoolean("final") && !old.optBoolean("baseline")) || (old.optBoolean("baseline") && m.rowId in expected))
                 if(final) old.put("final",true)
                 if(freshFinal) old.put("phone",false).put("watch",toWatch && !old.optBoolean("private_origin")).put("node",if(old.optBoolean("private_origin")) "" else node).put("watch_done",!toWatch || old.optBoolean("private_origin")).put("text",m.text.take(3000)).put("baseline",false)
@@ -133,13 +198,14 @@ class ReceivedConversations(private val store: KeyValueStore, private val namesp
             // Never evict unread content or a pending device obligation to make room.
             if(rows.length()>=MAX_ROWS) {
                 val disposable=rows.keys().asSequence().firstOrNull { k -> rows.getJSONObject(k).let { (it.optBoolean("read")||it.optBoolean("baseline"))&&it.optBoolean("phone")&&it.optBoolean("watch_done") } }
+                    ?:retirableHidden(ns,id,rows)
                 check(disposable!=null) { "Read messages to continue recovery" };rows.remove(disposable)
             }
             val after=s.optDouble("tracking_after",0.0)
             val historic=((baseline && (after<=0 || !m.timestamp.isFinite() || m.timestamp<=after)) || m.rowId<=cursor) && m.rowId !in expected
             rows.put(key,JSONObject().put("identity",key).put("session_id",id).put("row_id",m.rowId).put("uid",m.messageUid)
                 .put("timestamp",m.timestamp.takeIf { it.isFinite() }?:0.0).put("final",final).put("read",false).put("baseline",historic)
-                .put("quiet",policy!=false).put("private_origin",policy==true)
+                .put("quiet",policy!=false).put("private_origin",privateOrigin).put("live_watch",original!=null)
                 .put("phone",historic || !final).put("watch",toWatch && !historic && final).put("node",node).put("watch_done",!toWatch || historic || !final)
                 .put("text",if(final && !historic) m.text.take(3000) else ""))
         }
@@ -149,16 +215,26 @@ class ReceivedConversations(private val store: KeyValueStore, private val namesp
         s.put("expected",JSONArray(expected.filter { it !in consumed }));consumed.forEach {
             s.optJSONObject("expected_nodes")?.remove(it.toString())
             s.optJSONObject("origin_quiet")?.remove(it.toString())
+            s.optJSONObject("live_watch_nodes")?.remove(it.toString())
         }
         return commit(ns,r)
     }
+    /** Capacity only. A positively hidden row can never be read, and it is never pending, so the disposal rule above
+     * cannot free it. When nothing else is disposable the oldest one is dropped, unchanged, to make room. A row the
+     * current page shows, or any row that was never named hidden, is not a candidate. Neither is a row whose Watch
+     * obligation is still outstanding: the Watch's delayed posted receipt needs it (see [watchReceiptAllowed]). */
+    private fun retirableHidden(ns:String,id:String,rows:JSONObject):String? =
+        rows.keys().asSequence().filter { k -> rows.getJSONObject(k).let { it.optBoolean("display_hidden") && !(it.optBoolean("watch") && !it.optBoolean("watch_done")) && displayHidden(ns,id,it) } }
+            .minWithOrNull(compareBy<String>({ rows.getJSONObject(it).optLong("row_id",-1) },{ it }))
     /** Latch stricter current private-output policy before any external post/relay effect. */
     @Synchronized fun restrictQuiet(identity:String):Boolean {
         val ns=namespace()?:return false;val r=root(ns)
         val sessions=r.getJSONObject("sessions")
         for(id in sessions.keys()) {
             val row=sessions.getJSONObject(id).getJSONObject("rows").optJSONObject(identity)?:continue
-            row.put("quiet",true).put("private_origin",true).put("watch",false).put("watch_done",true).put("node","")
+            row.put("quiet",true)
+            // A known original Watch still owes its own posted receipt. Quiet is audibility, not delivery.
+            if(!row.optBoolean("live_watch")) row.put("private_origin",true).put("watch",false).put("watch_done",true).put("node","")
             return commit(ns,r)
         }
         return false
@@ -185,7 +261,7 @@ class ReceivedConversations(private val store: KeyValueStore, private val namesp
     @Synchronized fun pending(watch:Boolean=false):List<JSONObject> {
         val ns=namespace()?:return emptyList();val sessions=root(ns).getJSONObject("sessions")
         return sessions.keys().asSequence().flatMap { id -> val rows=sessions.getJSONObject(id).getJSONObject("rows");rows.keys().asSequence().map { rows.getJSONObject(it) } }
-            .filter { it.optBoolean("final") && !(it.optBoolean(if(watch) "watch_done" else "phone")) }.map { JSONObject(it.toString()) }.toList()
+            .filter { it.optBoolean("final") && !(it.optBoolean(if(watch) "watch_done" else "phone")) && !displayHidden(ns,it.getString("session_id"),it) }.map { JSONObject(it.toString()) }.toList()
     }
     @Synchronized fun watchReceiptAllowed(identity:String,node:String):Boolean {
         val ns=namespace()?:return false;val sessions=root(ns).getJSONObject("sessions")
@@ -210,7 +286,7 @@ class ReceivedConversations(private val store: KeyValueStore, private val namesp
     @Synchronized fun remove(ids:Set<String>):Boolean {
         val ns=namespace()?:return false;val r=root(ns);ids.forEach { r.getJSONObject("sessions").remove(it) };return commit(ns,r)
     }
-    fun invalidate() { hint=null }
+    fun invalidate() { hint=null;projections.pending.clear() }
     companion object {
         const val KEY="received_conversations_v1"
         const val MAX_ROWS=256

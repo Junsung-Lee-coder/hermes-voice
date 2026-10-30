@@ -102,7 +102,8 @@ class WatchCacheClosureR9dRoboTest {
         val pending=requests.single { it.kind==ReaderKind.SESSIONS }
         assertEquals(LoadStatus.LOADING,app.reader.value.sessions.status)
         assertEquals(if(populated) listOf(id) else emptyList<String>(),app.reader.value.sessions.rows.map { it.id })
-        assertEquals(ReaderSurface.CHAT,app.reader.value.surface)
+        // Owner's UI contract of 2026-10-27: the Watch starts on its conversation list (there is no home screen).
+        assertEquals(ReaderSurface.SESSIONS,app.reader.value.surface)
         // Resume again with the response still withheld: one request retains its custody.
         controller!!.pause().resume();idle()
         assertEquals(1,requests.count { it.kind==ReaderKind.SESSIONS })

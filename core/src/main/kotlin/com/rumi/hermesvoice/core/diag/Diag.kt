@@ -10,7 +10,7 @@ enum class DiagOrigin(val wire: String) { PHONE("phone"), WATCH("watch") }
 
 enum class DiagCategory(val wire: String) {
     REQUEST("request"), RESPONSE("response"), SPEECH("speech"), PLAYBACK("playback"), STOP("stop"),
-    QUEUE("queue"), WATCH_LINK("watch_link"), LATER("later_reply"), WATCH_DEVICE("watch_device"), STT("stt"),
+    QUEUE("queue"), WATCH_LINK("watch_link"), LATER("later_reply"), WATCH_DEVICE("watch_device"), STT("stt"), LIVE("live"),
 }
 
 /**
@@ -59,7 +59,53 @@ enum class DiagCode(val wire: String, val category: DiagCategory, val legacy: Bo
     WATCH_RECORDING("watch_recording", DiagCategory.WATCH_DEVICE),
     WATCH_SENT("watch_sent", DiagCategory.WATCH_DEVICE),
     WATCH_PLAY_RECEIVED("watch_play_received", DiagCategory.WATCH_DEVICE),
-    WATCH_STOPPED("watch_stopped", DiagCategory.WATCH_DEVICE);
+    WATCH_STOPPED("watch_stopped", DiagCategory.WATCH_DEVICE),
+
+    /** A Live call stopped during setup: the fixed setup stage, origin, failure class and any typed HTTP status only. Never proof of the provider's state. */
+    LIVE_SETUP_FAILED("live_setup_failed", DiagCategory.LIVE, legacy = false, v3 = true),
+
+    /**
+     * One Live call's own observations, recorded by the Phone once per call: fixed numbers and words only, never a transcript, audio,
+     * stats map, SDP, session/node/account id or message. App-side observations, not provider receipts. [ms] of [LIVE_STARTED] is
+     * Talk to the provider's `session.started`; [LIVE_ENDED] carries Talk to end in [ms], the end kind in [n] (0 an end the app was
+     * asked for or made itself: Talk/End, the notification's or the Watch's End, Live OFF, sign-out, a wake request that no longer
+     * owns its admission; 1 idle, 2 the provider's close, 3 failure: the call broke
+     * off by itself, 4 account or connection scope, 5 resume fence, 6 headset privacy, 7 cost cap, 8 other), the furthest setup stage
+     * reached and, for an end the call came to by itself, fail "unknown". [LIVE_HEARD]/[LIVE_SPOKE]
+     * count the provider's input/output transcript deltas after its start; [LIVE_INPUT_AUDIO]/[LIVE_PLAYBACK] count the nonzero
+     * PCM frames handed to WebRTC / played out while started ([n]) and their time at speech energy ([ms]); [LIVE_RTP_SENT]/
+     * [LIVE_RTP_RECEIVED] are the media's own audio RTP packet counts when its stats expose them.
+     */
+    LIVE_STARTED("live_started", DiagCategory.LIVE, legacy = false, v3 = true),
+    LIVE_ENDED("live_ended", DiagCategory.LIVE, legacy = false, v3 = true),
+    LIVE_HEARD("live_heard", DiagCategory.LIVE, legacy = false, v3 = true),
+    LIVE_SPOKE("live_spoke", DiagCategory.LIVE, legacy = false, v3 = true),
+    LIVE_INPUT_AUDIO("live_input_audio", DiagCategory.LIVE, legacy = false, v3 = true),
+    LIVE_PLAYBACK("live_playback", DiagCategory.LIVE, legacy = false, v3 = true),
+    LIVE_RTP_SENT("live_rtp_sent", DiagCategory.LIVE, legacy = false, v3 = true),
+    LIVE_RTP_RECEIVED("live_rtp_received", DiagCategory.LIVE, legacy = false, v3 = true),
+
+    /** The explicit fresh call's one ready-greeting request: [n] 1 the request was sent on the data channel, 2 the provider acknowledged
+     *  it; [ms] Talk to that moment. Never evidence that a greeting was generated, spoken or played (see [LIVE_SPOKE]/[LIVE_PLAYBACK]). */
+    LIVE_GREETING("live_greeting", DiagCategory.LIVE, legacy = false, v3 = true),
+
+    /**
+     * R41: the Watch relay of one started Watch-origin call, recorded once when that media ends, by whichever app stops it or is told
+     * to: fixed numbers only, never audio, a transcript, an id or a message. Phone: [LIVE_RELAY_END] [n] the relay boundary that ended
+     * the call (0 none of them; 1 no Watch audio for over a second; 2 the native input buffer format was refused; 3 a Watch packet was
+     * refused: format, identity, order or bound; 4 the Watch stream ended or failed; 5 the Watch output queue was full; 6 the Watch
+     * output stream failed; 7 the Watch ended or refused the call; 8 the media scope ended; 9 the control path failed), [ms] Started to
+     * that end; [LIVE_RELAY_UP] [n] Watch packets received after Started, [ms] the longest wait for one; [LIVE_RELAY_DOWN] [n] packets
+     * written to the Watch after Started, [ms] the longest single write. Watch: [LIVE_RELAY_CAPTURE] [n] packets captured, [ms] the
+     * longest wait for one from the recorder; [LIVE_RELAY_NONZERO] [n] of them holding a nonzero sample, [ms] their time at speech
+     * energy; [LIVE_RELAY_SENT] [n] packets written to the Phone, [ms] the longest single write. App-side counts, not link measurements.
+     */
+    LIVE_RELAY_END("live_relay_end", DiagCategory.LIVE, legacy = false, v3 = true),
+    LIVE_RELAY_UP("live_relay_up", DiagCategory.LIVE, legacy = false, v3 = true),
+    LIVE_RELAY_DOWN("live_relay_down", DiagCategory.LIVE, legacy = false, v3 = true),
+    LIVE_RELAY_CAPTURE("live_relay_capture", DiagCategory.LIVE, legacy = false, v3 = true),
+    LIVE_RELAY_NONZERO("live_relay_nonzero", DiagCategory.LIVE, legacy = false, v3 = true),
+    LIVE_RELAY_SENT("live_relay_sent", DiagCategory.LIVE, legacy = false, v3 = true);
 
     /**
      * Frequent progress records: first to be evicted when the ring is full, and never a reason to write the journal on their own

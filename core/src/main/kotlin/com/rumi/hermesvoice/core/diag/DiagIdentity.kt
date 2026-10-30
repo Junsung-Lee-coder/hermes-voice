@@ -120,6 +120,14 @@ object DiagLabels {
         DiagStage.TTS -> "speech synthesis"
         DiagStage.TRANSFER -> "Phone and Watch transfer"
         DiagStage.PLAYBACK -> "playback"
+        DiagStage.LIVE_ROUTE -> "opening the Live audio route"
+        DiagStage.LIVE_CATALOG -> "checking the conversation list"
+        DiagStage.LIVE_INPUT -> "opening the microphone"
+        DiagStage.LIVE_MEDIA -> "preparing Live audio"
+        DiagStage.LIVE_SESSION -> "requesting the Live session"
+        DiagStage.LIVE_ANSWER -> "applying the Live session answer"
+        DiagStage.LIVE_RELAY -> "setting up the Watch relay"
+        DiagStage.LIVE_START -> "waiting for Live to start"
     }
 
     fun cause(cause: DiagCause): String = when (cause) {

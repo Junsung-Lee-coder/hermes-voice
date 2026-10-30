@@ -62,6 +62,8 @@ data class StoredSession(
     val lineageRootId: String? = null,
     val lineageIds: List<String> = emptyList(),
     val continuationKind: String? = null,
+    /** `sessions.pinned`. The list back-fills every pinned row a page window missed, archived or not, after that window. */
+    val pinned: Boolean = false,
 ) {
     companion object {
         private fun text(json: JSONObject, key: String): String? =
@@ -83,6 +85,7 @@ data class StoredSession(
             lineageRootId = text(json, "_lineage_root_id"),
             lineageIds = json.optJSONArray("_lineage_ids")?.let { ids -> (0 until ids.length()).mapNotNull { ids.optString(it).takeIf(String::isNotEmpty) } }.orEmpty(),
             continuationKind = text(json, "continuation_kind"),
+            pinned = json.optBoolean("pinned", false),
         )
     }
 }
@@ -103,33 +106,53 @@ data class HistoryMessage(val rowId: Long, val role: String, val text: String, v
         (finishReason == null || finishReason == "stop" || finishReason == "length")
 }
 
-/** [rawIds] are the ids of every row the server returned, shown or not, in the server's order; [messages] keeps the shown ones only. */
-data class HistoryPage(val sessionId: String, val messages: List<HistoryMessage>, val returned: Int, val rawIds: List<Long> = emptyList()) {
+/** A returned row the projection decided not to show. Identity only (never a body): it names the stale copies a newer page makes obsolete. */
+data class SuppressedRow(val rowId: Long, val uid: String)
+
+/**
+ * [rawIds] are the ids of every row the server returned, shown or not, in the server's order; [messages] keeps the shown ones only.
+ * [suppressed] names the returned rows that were hidden by an internal kind or as a whole-response silent control.
+ */
+data class HistoryPage(val sessionId: String, val messages: List<HistoryMessage>, val returned: Int, val rawIds: List<Long> = emptyList(),
+    val suppressed: List<SuppressedRow> = emptyList()) {
     companion object {
         private val VISIBLE_ROLES = setOf("user", "assistant")
 
         /** Rows the server stamps as its own synthetic input or delivery (background-process completions, delegation deliveries): the model reads them, the transcript does not show them. */
         private val INTERNAL_DISPLAY_KINDS = setOf("hidden", "internal_notification", "async_delegation_complete", "process_complete")
 
+        /** An absent or JSON-null kind is untyped; Android reads a JSON null as the string "null", so only a real string is a named kind. */
+        private fun kindOf(row: JSONObject): String = if (row.isNull("display_kind")) "" else row.optString("display_kind")
+
         /** `GET /api/sessions/{id}/messages`: `display_content` (desktop projection) wins over raw `content`. */
         fun parse(json: JSONObject): HistoryPage {
             val rows = json.optJSONArray("messages") ?: JSONArray()
+            val suppressed = ArrayList<SuppressedRow>()
             val messages = (0 until rows.length()).mapNotNull { index ->
                 val row = rows.optJSONObject(index) ?: return@mapNotNull null
                 val role = row.optString("role")
-                if (role !in VISIBLE_ROLES || row.optString("display_kind") in INTERNAL_DISPLAY_KINDS) return@mapNotNull null
+                if (role !in VISIBLE_ROLES) return@mapNotNull null
+                val kind = kindOf(row)
+                val uid = if (row.isNull("message_uid")) "" else row.optString("message_uid").takeUnless { it == "null" }.orEmpty()
+                if (kind in INTERNAL_DISPLAY_KINDS) {
+                    if (row.has("id")) suppressed += SuppressedRow(row.optLong("id"), uid)
+                    return@mapNotNull null
+                }
                 val text = contentText(if (row.has("display_content")) row.opt("display_content") else row.opt("content")).trim()
                 if (text.isEmpty()) return@mapNotNull null
-                if (role == "assistant" && row.optString("display_kind").isEmpty() && row.optJSONArray("tool_calls").let { it == null || it.length() == 0 } &&
-                    SilentControl.isWholeResponse(text)) return@mapNotNull null
+                if (role == "assistant" && kind.isEmpty() && row.optJSONArray("tool_calls").let { it == null || it.length() == 0 } &&
+                    SilentControl.isWholeResponse(text)) {
+                    if (row.has("id")) suppressed += SuppressedRow(row.optLong("id"), uid)
+                    return@mapNotNull null
+                }
                 HistoryMessage(row.optLong("id", -1), role, text, row.optDouble("timestamp", 0.0).takeIf { it.isFinite() } ?: 0.0,
-                    messageUid = row.optString("message_uid").takeUnless { it == "null" }.orEmpty(),
+                    messageUid = uid,
                     finishReason = row.optString("finish_reason").takeUnless { it.isBlank() || it == "null" },
                     hasToolCalls = row.optJSONArray("tool_calls")?.length()?.let { it > 0 } == true)
             }
             val pagination = json.optJSONObject("pagination")
             val rawIds = (0 until rows.length()).mapNotNull { index -> rows.optJSONObject(index)?.takeIf { it.has("id") }?.optLong("id") }
-            return HistoryPage(json.optString("session_id"), messages, pagination?.optInt("returned", rows.length()) ?: rows.length(), rawIds)
+            return HistoryPage(json.optString("session_id"), messages, pagination?.optInt("returned", rows.length()) ?: rows.length(), rawIds, suppressed)
         }
 
         /** Content is a string or an OpenAI-style parts list; only text parts are shown. */
@@ -184,6 +207,20 @@ class HermesDashboardClient(
         return json.optString("ticket").ifBlank { throw HermesProtocolException("ws-ticket response has no ticket") }
     }
 
+    /** Existing host-owned credential boundary; no project key or model override is accepted by the app. */
+    suspend fun createLiveSession(sdp: String, history: JSONArray = JSONArray()): Pair<String, String> {
+        com.rumi.hermesvoice.core.diag.diagMark(com.rumi.hermesvoice.core.diag.DiagStage.LIVE_SESSION)
+        require(sdp.isNotBlank() && sdp.length <= 262144)
+        val json = authorized(endpoint.route("api/audio/voice-live/session"), "POST",
+            JSONObject().put("sdp", sdp).put("history", history), maxBytes = 1024 * 1024)
+        val id = json.optJSONObject("session")?.optString("id").orEmpty()
+        val transport = json.optJSONObject("transport")
+        val answer = transport?.optString("sdp").orEmpty()
+        if (!json.optBoolean("ok") || id.isBlank() || transport?.optString("type") != "webrtc" || answer.isBlank())
+            throw HermesProtocolException("Live session response is incomplete; no automatic reconnect")
+        return id to answer // SDP bytes, including final CRLF, are not trimmed.
+    }
+
     override suspend fun transcribe(audio: ByteArray, mimeType: String): String {
         require(audio.isNotEmpty()) { "audio is empty" }
         require(audio.size <= MAX_TRANSCRIBE_BYTES) { "audio exceeds the dashboard's 25 MiB transcription limit" }
@@ -217,7 +254,14 @@ class HermesDashboardClient(
     }
 
     /** `GET /api/sessions`, optionally with the server's `source` / `exclude_sources` filters; `source` is a routing label, not access control. */
-    override suspend fun listSessions(source: String?, archived: ArchivedFilter, limit: Int, offset: Int, excludeSources: List<String>): StoredSessionPage {
+    override suspend fun listSessions(source: String?, archived: ArchivedFilter, limit: Int, offset: Int, excludeSources: List<String>): StoredSessionPage =
+        sessionsPage(source, archived, limit, offset, excludeSources, "recent")
+
+    /** `GET /api/sessions` with `order=created` (hermes_cli/web_routers/sessions.py: same filters and rows, newest started first). */
+    override suspend fun listSessionsByCreation(archived: ArchivedFilter, limit: Int, offset: Int): StoredSessionPage =
+        sessionsPage(null, archived, limit, offset, emptyList(), "created")
+
+    private suspend fun sessionsPage(source: String?, archived: ArchivedFilter, limit: Int, offset: Int, excludeSources: List<String>, order: String): StoredSessionPage {
         require(source == null || source.isNotBlank()) { "source filter must not be blank" }
         val url = endpoint.route("api/sessions").newBuilder()
             .apply {
@@ -225,7 +269,7 @@ class HermesDashboardClient(
                 if (excludeSources.isNotEmpty()) addQueryParameter("exclude_sources", excludeSources.joinToString(","))
             }
             .addQueryParameter("archived", archived.wire)
-            .addQueryParameter("order", "recent")
+            .addQueryParameter("order", order)
             .addQueryParameter("limit", limit.coerceIn(1, 100).toString())
             .addQueryParameter("offset", offset.coerceAtLeast(0).toString())
             .build()

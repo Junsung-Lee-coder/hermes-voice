@@ -42,7 +42,7 @@ class FencedKeyValueStore(private val source: () -> KeyValueStore, private val b
  * The prefs file is excluded from backup and device transfer (res/xml backup rules): a restored
  * copy could not be decrypted anyway, and a session must never migrate to another device.
  */
-class KeystoreTokenStore(context: Context) : HermesTokenStore {
+class KeystoreTokenStore(context: Context, private val onAuthorityChanged: () -> Unit = {}) : HermesTokenStore {
     private val prefs = context.applicationContext.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
 
     @Synchronized
@@ -55,6 +55,7 @@ class KeystoreTokenStore(context: Context) : HermesTokenStore {
             HermesBearerSession.fromJson(String(cipher.doFinal(raw, IV_BYTES, raw.size - IV_BYTES), Charsets.UTF_8))
         } catch (_: Exception) {
             // Undecryptable (key invalidated, restored file, corruption): fail closed to "signed out".
+            onAuthorityChanged()
             prefs.edit().remove(KEY_SESSION).commit()
             null
         }
@@ -76,6 +77,7 @@ class KeystoreTokenStore(context: Context) : HermesTokenStore {
         val epoch = if (!freshLogin && old?.provider == session.provider && old.userId == session.userId)
             prefs.getString("display_generation_v1", null) ?: "legacy"
             else java.util.UUID.randomUUID().toString()
+        if (epoch != prefs.getString("display_generation_v1", "legacy")) onAuthorityChanged()
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, key())
         val sealed = cipher.iv + cipher.doFinal(session.toJson().toByteArray(Charsets.UTF_8))
@@ -87,10 +89,15 @@ class KeystoreTokenStore(context: Context) : HermesTokenStore {
     @Synchronized
     override fun clear() {
         // Same-user re-login is a new display namespace even if deleting body snapshots failed.
+        onAuthorityChanged()
         prefs.edit().remove(KEY_SESSION).putString("display_generation_v1", java.util.UUID.randomUUID().toString()).commit()
     }
 
     @Synchronized fun displayGeneration(): String = prefs.getString("display_generation_v1", "legacy") ?: "legacy"
+
+    /** R33: the sealed session and its display generation exactly as stored, without a decrypt or this store's monitor: a change test
+     *  for real-time callers (see [com.rumi.hermesvoice.phone.PhoneApp.liveBodyScope]). */
+    fun sealedState(): List<String?> = listOf(prefs.getString(KEY_SESSION, null), prefs.getString("display_generation_v1", "legacy"))
 
     private fun key(): SecretKey {
         val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }

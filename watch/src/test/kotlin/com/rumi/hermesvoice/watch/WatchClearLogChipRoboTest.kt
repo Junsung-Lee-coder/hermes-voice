@@ -2,14 +2,16 @@ package com.rumi.hermesvoice.watch
 
 import android.os.Looper
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.test.assertTextContains
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
-import androidx.compose.ui.test.performClick
 import com.rumi.hermesvoice.core.watchlink.ReaderSessionsState
-import java.util.concurrent.atomic.AtomicInteger
+import com.rumi.hermesvoice.core.watchlink.LoadStatus
+import com.rumi.hermesvoice.core.watchlink.ReaderSessionRow
+import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -20,9 +22,9 @@ import org.robolectric.annotation.GraphicsMode
 import org.robolectric.annotation.LooperMode
 
 /**
- * SCRATCH HARNESS (never packaged). The production Conversations list on the Watch with its "clear this watch's log" chip:
- * the first tap only asks for confirmation, the second runs the supplied clear exactly once and says the result.
- * No watch screen, finger or rotary input.
+ * SCRATCH HARNESS (never packaged). The production Conversations list on the Watch. Since the owner's UI contract of 2026-10-27 the
+ * Watch has only its conversation list and the history: the "clear this watch's log" chip is gone from the list, and clearing the log
+ * remains an app function (no control on the watch screen). No watch screen, finger or rotary input.
  */
 @RunWith(RobolectricTestRunner::class)
 @LooperMode(LooperMode.Mode.PAUSED)
@@ -53,36 +55,33 @@ class WatchClearLogChipRoboTest {
         }
     }
 
-    private fun show(clear: (suspend () -> Boolean)?) = rule.setContent {
+    private fun show(sessions: ReaderSessionsState = ReaderSessionsState()) = rule.setContent {
         androidx.wear.compose.material.MaterialTheme {
-            SessionsSurface(ReaderSessionsState(), null, FocusRequester(), {}, {}, {}, onClearLog = clear)
+            SessionsSurface(sessions, null, FocusRequester(), {}, {}, {})
         }
     }
 
-    @Test fun theFirstTapAsksAndOnlyTheSecondTapClears() {
-        val calls = AtomicInteger()
-        show { calls.incrementAndGet(); true }
-        rule.onNodeWithTag("clear_watch_diagnostics").assertTextContains("Clear this watch's log")
-        rule.onNodeWithTag("clear_watch_diagnostics").performClick()
-        rule.waitForIdle()
-        assertEquals(0, calls.get())
-        rule.onNodeWithTag("clear_watch_diagnostics").assertTextContains("Tap again to clear")
-        rule.onNodeWithTag("clear_watch_diagnostics").performClick()
-        rule.waitUntil(5_000) { calls.get() == 1 }
-        rule.waitForIdle()
-        rule.onNodeWithTag("clear_watch_diagnostics").assertTextContains("This watch's log was cleared")
-        assertEquals(1, calls.get())
+    private fun noChip() {
+        rule.onNodeWithTag("session_list").assertExists()
+        rule.onAllNodesWithTagCount("clear_watch_diagnostics", 0)
+        assertEquals(0, rule.onAllNodesWithText("Clear this watch's log", substring = true).fetchSemanticsNodes().size)
     }
 
-    @Test fun aFailedClearIsSaidSo() {
-        show { false }
-        rule.onNodeWithTag("clear_watch_diagnostics").performClick()
-        rule.onNodeWithTag("clear_watch_diagnostics").performClick()
-        rule.waitUntil(5_000) { runCatching { rule.onNodeWithTag("clear_watch_diagnostics").assertTextContains("Couldn't clear this watch's log") }.isSuccess }
+    @Test fun theListOffersNoLogChipAndTheAppStillClearsTheLog() {
+        show()
+        noChip()
+        val app = org.robolectric.RuntimeEnvironment.getApplication() as WatchApp
+        assertTrue("clearing this watch's log is still the app's own function", runBlocking { app.clearLocalLog() })
+    }
+
+    @Test fun aListWithConversationsOffersNoLogChipEither() {
+        show(ReaderSessionsState(rows = listOf(ReaderSessionRow("qa-fixture-1", "QA fixture 1", "qa1", "", 0.0)), status = LoadStatus.READY))
+        rule.onNodeWithTag("session_qa1").assertExists()
+        noChip()
     }
 
     @Test fun withoutAClearActionThereIsNoChip() {
-        show(null)
+        show()
         rule.onNodeWithTag("session_list").assertExists()
         rule.onAllNodesWithTagCount("clear_watch_diagnostics", 0)
     }

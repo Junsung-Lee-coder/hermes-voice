@@ -164,6 +164,25 @@ class WakeDeviceController(
     /** A handoff waiting for the Phone's answer to the claim. */
     private var heldHandoff: Pair<Long, WakeOutcome.Handoff>? = null
     private var capturing = false
+    private var captureOwner: Any? = null
+
+    /**
+     * A Live replacement has no recorder completion. Its owner calls this settlement only after
+     * that Live microphone has stopped, before publishing idle. This is local handoff custody,
+     * NOT proof of request acceptance: Live retains all claim consumption/refusal/uncertainty
+     * authority. A stale completion can never settle a later capture or return a claim.
+     */
+    fun liveCaptureSettlement(): () -> Unit {
+        val owner = captureOwner
+        return { step {
+            if (owner != null && captureOwner === owner && capturing) {
+                capturing = false
+                captureOwner = null
+                acceptedWithCharging = false
+                forgetClaim()
+            }
+        } }
+    }
 
     /** The device positively accepted a wake request ([WakeDevicePort.wakeAccepted]): the microphone handoff is pending or the recording runs. */
     private val accepted: Boolean get() = capturing || handoffGate.pending
@@ -517,8 +536,14 @@ class WakeDeviceController(
         // Marked before the recorder starts: starting it reports "busy", which must not give the claim back.
         // The recording takes the episode's microphone hold over (WakeDevicePort.holdMicrophone).
         capturing = true
-        capturing = port.startRequestCapture(VadSilence.millis(settings.vadSilenceSeconds), claim?.id)
-        if (!capturing) releaseClaim()
+        val owner = Any()
+        captureOwner = owner
+        val started = port.startRequestCapture(VadSilence.millis(settings.vadSilenceSeconds), claim?.id)
+        // A synchronous Live refusal/end may already have settled this exact ownership.
+        if (captureOwner === owner) {
+            capturing = started
+            if (!capturing) { captureOwner = null; releaseClaim() }
+        }
         capturing
     }
 

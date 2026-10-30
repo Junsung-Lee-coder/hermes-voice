@@ -52,7 +52,7 @@ class PrivateAudioWiringContractTest {
         val hub = source("$phone/PrivateAudioHub.kt")
         assertTrue(hub.contains("PrivateAudioMonitor("))
         assertFalse(hub.contains("Thread.sleep") || hub.contains("while (true)") || hub.contains("delay("))
-        assertEquals("private routing stays separate from the new manual microphone service", 4, Regex("<service\\s").findAll(source("phone/src/main/AndroidManifest.xml")).count())
+        assertApprovedPhoneServiceCohort(source("phone/src/main/AndroidManifest.xml"))
     }
 
     @Test

@@ -98,30 +98,31 @@ class WatchActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         // Only a fresh launcher entry grants open authority; restored tasks continue their old open.
         openPending = savedInstanceState == null && isUserOpen(intent)
+        // A fresh launcher entry opens the conversation list, whatever is selected; a recreation keeps the screen it had.
+        if (openPending) app.openSelector()
         savedInstanceState?.let {
             promptShowing = it.getBoolean(STATE_PROMPT)
             askedMicrophone = it.getBoolean(STATE_ASKED_MIC)
             askedNotifications = it.getBoolean(STATE_ASKED_NOTIFICATIONS)
         }
-        // Back sends the app to the background like the right swipe; it never finishes it.
+        // Back, like the right swipe, leaves a conversation for the list; from the list it sends the app to the background. It never finishes it.
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
-            override fun handleOnBackPressed() = toBackground("back")
+            override fun handleOnBackPressed() { if (!backToSelector()) toBackground("back") }
         })
         setContent {
             val talk by app.talk.collectAsStateWithLifecycle()
-            val settings by app.settings.collectAsStateWithLifecycle()
-            val phone by app.phoneReachable.collectAsStateWithLifecycle()
             val reader by app.reader.collectAsStateWithLifecycle()
             val listening by voice.wakeListening.collectAsStateWithLifecycle()
-            val unavailable by voice.wakeUnavailable.collectAsStateWithLifecycle()
             val owed by app.owedFailure.collectAsStateWithLifecycle()
             val chatFocus = remember { FocusRequester() }
             val sessionsFocus = remember { FocusRequester() }
             val onScrollStep = { app.haptic(HapticEvent.SCROLL_STEP) }
             MaterialTheme(colors = WatchColors) {
                 val history = reader.selectedHistory
-                // A "not sent" state is on screen only where the status text is drawn and while it is not replaced by the recording line.
-                val failureOnScreen = owed != null && reader.surface != ReaderSurface.SESSIONS && talk.phase != WatchPhase.RECORDING
+                // Two screens only: the selected conversation's history, otherwise the conversation list.
+                val inChat = reader.surface == ReaderSurface.CHAT && history != null
+                // A "not sent" state is on screen on either screen's status line while it is not replaced by the recording line.
+                val failureOnScreen = owed != null && talk.phase != WatchPhase.RECORDING
                 LaunchedEffect(owed?.turnId, failureOnScreen) {
                     val id = owed?.turnId
                     if (id != null && failureOnScreen) repeatOnLifecycle(Lifecycle.State.RESUMED) { app.onFailureDisplayed(id) }
@@ -134,26 +135,18 @@ class WatchActivity : ComponentActivity() {
                     enabled = { lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) && app.talk.value.phase != WatchPhase.SENDING },
                     onHoldToggle = ::onTalkPressed,
                 ) {
-                    when {
-                        reader.surface == ReaderSurface.SESSIONS -> SessionsSurface(reader.sessions, reader.selectedSessionId, sessionsFocus,
-                            onSelect = app::selectSession, onRefresh = app::loadSessions, onScrollStep = onScrollStep,
-                            onClearLog = app::clearLocalLog)
-                        history != null -> ReceivedChatSurface(
-                            title = reader.sessions.rows.firstOrNull { it.id == history.sessionId }?.title ?: "Conversation",
-                            history = history, focusRequester = chatFocus, onOlder = app::loadOlder, onRetry = app::refreshSelected,
-                            onScrollStep = onScrollStep,
-                            onDisplayed = { app.contentDisplayed(history.sessionId, it) },
-                        ) { TalkStatusLine(talk, listening, onReplay = app::replayReply, failure = owed?.detail ?: reader.sessions.alertNotice) }
-                        else -> TalkHome(phone, talk, settings.watchWakeEnabled, listening, unavailable, onReplay = app::replayReply, failure = owed?.detail)
-                    }
+                    if (inChat && history != null) ReceivedChatSurface(
+                        title = reader.sessions.rows.firstOrNull { it.id == history.sessionId }?.title ?: "Conversation",
+                        history = history, focusRequester = chatFocus, onOlder = app::loadOlder, onRetry = app::refreshSelected,
+                        onScrollStep = onScrollStep,
+                        onDisplayed = { app.contentDisplayed(history.sessionId, it) },
+                    ) { TalkStatusLine(talk, listening, onReplay = app::replayReply, failure = owed?.detail ?: reader.sessions.alertNotice) }
+                    else SessionsSurface(reader.sessions, reader.selectedSessionId, sessionsFocus,
+                        onSelect = app::selectSession, onRefresh = app::loadSessions, onScrollStep = onScrollStep,
+                    ) { TalkStatusLine(talk, listening, onReplay = app::replayReply, failure = owed?.detail) }
                     // Bezel input goes to the list on screen; focus follows the surface.
-                    LaunchedEffect(reader.surface, history != null) {
-                        runCatching {
-                            when {
-                                reader.surface == ReaderSurface.SESSIONS -> sessionsFocus.requestFocus()
-                                history != null -> chatFocus.requestFocus()
-                            }
-                        }
+                    LaunchedEffect(inChat) {
+                        runCatching { if (inChat) chatFocus.requestFocus() else sessionsFocus.requestFocus() }
                     }
                 }
             }
@@ -173,6 +166,7 @@ class WatchActivity : ComponentActivity() {
         setIntent(intent)
         if (isUserOpen(intent)) {
             openPending = true
+            app.openSelector()
             askedMicrophone = false
             askedNotifications = false
         }
@@ -272,7 +266,7 @@ class WatchActivity : ComponentActivity() {
     }
 
     /**
-     * Right swipe or Back: the app goes to the background, always: never finished, and the session
+     * Right swipe or Back on the list: the app goes to the background, always: never finished, and the session
      * is never stopped here. Background operation is made sure of first (it is normally already
      * running from this open); hiding never waits for the service or a permission.
      */
@@ -283,6 +277,15 @@ class WatchActivity : ComponentActivity() {
         moveTaskToBack(true)
     }
 
+    /** Back from a conversation's history: the list (nothing is cancelled, the selection stays). False on the list. */
+    private fun backToSelector(): Boolean {
+        val reader = app.reader.value
+        if (reader.surface != ReaderSurface.CHAT || reader.selectedHistory == null) return false
+        app.toggleReaderSurface()
+        Log.i(TAG, "back to the conversation list")
+        return true
+    }
+
     private fun onSwipe(direction: SwipeDirection) {
         when (ReaderGestureMapping.action(direction)) {
             ReaderAction.TOGGLE_SURFACE -> {
@@ -290,7 +293,7 @@ class WatchActivity : ComponentActivity() {
                 Log.i(TAG, "gesture swipe=$direction action=toggle surface=${app.reader.value.surface}")
             }
             // The task (and its reader state) stays alive; this is not process termination.
-            ReaderAction.BACKGROUND_APP -> toBackground("swipe")
+            ReaderAction.BACKGROUND_APP -> if (!backToSelector()) toBackground("swipe")
         }
     }
 

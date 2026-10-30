@@ -233,6 +233,11 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
     val listening: Boolean get() = background.owning && background.wake.listening
 
     private fun startCapture(silenceMs: Long, claimId: String?, held: MicrophoneClaim?): Boolean {
+        if (app.settings.watchSettings().phoneLiveEnabled) {
+            held?.release()
+            return app.live.start(wakeTurn = true, wakeClaimId = claimId,
+                captureEnded = background.wake.liveCaptureSettlement())
+        }
         if (capturing || app.phoneTurns.value > 0) {
             held?.release()
             return false
@@ -402,8 +407,13 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
         override fun sendRecognized(request: String) = sendRecognized(request, null)
 
         override fun sendRecognized(request: String, claimId: String?) {
+            val held = episodeMicrophone.take()
+            if (app.settings.watchSettings().phoneLiveEnabled) {
+                held?.release()
+                app.live.start(recognizedText = request, wakeTurn = true, wakeClaimId = claimId); return
+            }
             recognizedClaimId = claimId
-            recognizedMicrophone = episodeMicrophone.take()
+            recognizedMicrophone = held
             captures.sendRecognized(UUID.randomUUID().toString(), request)
         }
 
@@ -540,8 +550,8 @@ class PhoneBackgroundRuntime(private val app: PhoneApp) {
         // A Phone request in flight owns the microphone and speaker; a later reply holding this Phone's
         // speaker closes an open window only (an episode under way owns the microphone and goes on).
         app.appScope.launch {
-            combine(app.phoneTurns, app.speakingLater, app.manualCapture.state) { turns, later, capture ->
-                if (turns > 0 || capture.phase in setOf(ManualPhase.PENDING, ManualPhase.ADMITTED, ManualPhase.RECORDING)) BUSY else if (later) SPEAKER else IDLE }
+            combine(app.phoneTurns, app.speakingLater, app.manualCapture.state, app.live.state) { turns, later, capture, live ->
+                if (live.active || turns > 0 || capture.phase in setOf(ManualPhase.PENDING, ManualPhase.ADMITTED, ManualPhase.RECORDING)) BUSY else if (later) SPEAKER else IDLE }
                 .distinctUntilChanged().collect { state ->
                     handler.post {
                         when (state) {

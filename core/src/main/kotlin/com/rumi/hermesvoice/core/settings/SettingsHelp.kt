@@ -40,8 +40,23 @@ object SettingsHelp {
     val topicIds: List<String> = listOf(SPOKEN_REPLIES, LATER_REPLIES, USE_HEADSET, ROUTING, PHONE_NAVIGATION, WATCH_NAVIGATION, WATCH, BACKGROUND_RELAY,
         WAKE_PHRASE, WAKE_PATTERNS, STANDBY, VAD, WAITING, DIAGNOSTICS, PHONE_CHARGING, WATCH_CHARGING, SESSION_MARKER)
 
+    fun liveIdle() = HelpTopic("live_idle", "Live idle grace", listOf(
+        "Choose every whole second from 1 through 60; default 10 seconds. Phone owns the saved setting and syncs it to Watch. Changing or restoring it never starts a call.",
+        "Genuine user speech and Live output keep dialogue active. Silent Hermes work, polling and keepalives do not. Each call also has a five-minute absolute cap.",
+        "After automatic idle suspension, an authorized late answer can start Live and the originating device microphone automatically so you can answer immediately. Explicit End, Stop following, OFF, sign-out, target/account changes or lost private output revoke this permission. Permission/background refusal keeps the answer in chat with an actionable status, not TTS.",
+        "Automatic microphone continuation belongs to the running app processes and validated conversation/follow window. It reopens the originating device microphone only after its permission, foreground and audio-route admission. A Watch reply never opens the Phone microphone."
+    ))
+
+    fun live(device: String) = HelpTopic("${device.lowercase()}_live_enabled", "$device Live", listOf(
+        "OFF keeps recording, transcription, Hermes and reply speech unchanged. ON makes this device’s Talk and enabled microphone entrypoints use Live. Changing the setting never starts the microphone. Phone and Watch modes are independent.",
+        "Live sends audio to OpenAI and is billed while connected, including silence and mute. The host keeps the API key. End stops Live audio, not an already submitted Hermes task. Connections are not retried automatically.",
+        "Live discusses which eligible conversation you mean instead of using the hidden Hermes router. Say the conversation’s title or alias; the app checks it and sends the request once, without a Phone tap. Only its visible recent messages and arriving replies go to Live; canonical history, alerts and unread remain separate. Live uses no separate TTS. End explicitly revokes automatic late-answer microphone continuation.",
+        if (device == "Watch") "Watch Live uses real Watch microphone/speaker audio through the paired Wear channel. The Phone owns provider media/network using Phone Wi-Fi or cellular; Watch does not need its own internet. Phone Live mode may be OFF, and this relay never uses the Phone microphone or input permission. No backend key is stored on Watch. A private Phone headset has exclusive output priority: Watch microphone and work continue, while provider audio plays only on that Phone headset. Output admission failure retains input/text and never enables a public speaker. Phone/relay loss stops Live without direct-Watch, Phone-mic or TTS fallback. Say the conversation for a request; Phone checks it and sends it." else "Private headset output needs a positively confirmed Android communication route. If unavailable or disconnected, Live stops without a speaker fallback."
+    ))
+
     fun spokenReplies() = HelpTopic(SPOKEN_REPLIES, "Spoken replies", listOf(
-        "The routing acknowledgement and the final reply always play. They play on whichever device, this phone or the Watch, " +
+        "Live ON uses Live output audio for conversation messages and replies, never separate synthesis. These recording/STT/reply-speech options apply to operations admitted with Live OFF.",
+        "With Live OFF, the routing acknowledgement and the final reply always play. They play on whichever device, this phone or the Watch, " +
             "sent the most recent voice request; text messages don't change that.",
         "\"Play first response\" and \"Play middle responses\" choose whether those earlier replies are spoken as well. " +
             "Both are saved on this phone.",

@@ -24,7 +24,7 @@ class HeadsetWiringContractTest {
         val manifest = source("phone/src/main/AndroidManifest.xml")
         assertTrue(manifest.contains("android.permission.MODIFY_AUDIO_SETTINGS"))
         assertTrue(manifest.contains("android.permission.BLUETOOTH_CONNECT"))
-        assertEquals("one on-demand manual microphone service above the baseline three", 4, Regex("<service\\s").findAll(manifest).count())
+        assertApprovedPhoneServiceCohort(manifest)
         assertFalse(manifest.contains("BLUETOOTH_SCAN"))
     }
 

@@ -29,10 +29,10 @@ data class TurnAcceptance(val runtimeId: String, val anchorSeq: Long, val epoch:
     /** Local admission provenance, not a server id. Missing/legacy metadata NEVER grants attribution. */
     val admission: String = "")
 
-enum class AcceptedKind { TEXT, VOICE }
+enum class AcceptedKind { TEXT, VOICE, LIVE }
 
 /** One accepted prompt whose reply this app still owes the user: [id] is the chat send id or the voice turn id. */
-data class AcceptedTurn(val id: String, val kind: AcceptedKind, val storedSessionId: String, val acceptance: TurnAcceptance, val createdMs: Long, val namespace: String? = null)
+data class AcceptedTurn(val id: String, val kind: AcceptedKind, val storedSessionId: String, val acceptance: TurnAcceptance, val createdMs: Long, val namespace: String? = null, val origin:VoiceOrigin=VoiceOrigin.PHONE, val watchNode:String?=null)
 
 /**
  * The accepted prompts whose final reply has not been delivered yet, kept on the device so a reply that finishes after the
@@ -120,7 +120,7 @@ class AcceptedTurnStore(
                 val acceptance = TurnAcceptance(o.optString("rt"), o.optLong("an", -1L), o.optString("ep"), o.optInt("sk", -1), o.optString("ap"))
                 if (o.optString("id").isEmpty() || acceptance.runtimeId.isEmpty() || acceptance.anchorSeq < 0 || acceptance.skip < 0) return@mapNotNull null
                 val kind = runCatching { AcceptedKind.valueOf(o.optString("kd")) }.getOrNull() ?: return@mapNotNull null
-                AcceptedTurn(o.getString("id"), kind, o.optString("ss"), acceptance, o.optLong("at"), o.optString("ns").ifBlank { null })
+                AcceptedTurn(o.getString("id"), kind, o.optString("ss"), acceptance, o.optLong("at"), o.optString("ns").ifBlank { null },runCatching{VoiceOrigin.valueOf(o.optString("origin"))}.getOrDefault(VoiceOrigin.PHONE),o.optString("watch_node").ifBlank{null})
             }
         } catch (_: org.json.JSONException) {
             emptyList()
@@ -130,7 +130,7 @@ class AcceptedTurnStore(
     private fun encode(turns: List<AcceptedTurn>): String = JSONArray().also { array ->
         turns.forEach { t ->
             array.put(JSONObject().put("id", t.id).put("kd", t.kind.name).put("ss", t.storedSessionId).put("rt", t.acceptance.runtimeId)
-                .put("an", t.acceptance.anchorSeq).put("ep", t.acceptance.epoch).put("sk", t.acceptance.skip).put("ap", t.acceptance.admission).put("at", t.createdMs).put("ns",t.namespace))
+                .put("an", t.acceptance.anchorSeq).put("ep", t.acceptance.epoch).put("sk", t.acceptance.skip).put("ap", t.acceptance.admission).put("at", t.createdMs).put("ns",t.namespace).put("origin",t.origin.name).put("watch_node",t.watchNode))
         }
     }.toString()
 
@@ -213,12 +213,12 @@ class AcceptedTurnReconciler(
     }
 
     private suspend fun handOff(turn: AcceptedTurn, textPart: String, voicePart: String, text: String, noticeTitle: String?, finalRowId:Long?=null): Boolean {
-        val isText = turn.kind == AcceptedKind.TEXT
-        val reply = FinalReply(ReplyAlert.identityOf(turn.id, if (isText) textPart else voicePart), turn.storedSessionId, VoiceOrigin.PHONE,
+        val isText = turn.kind != AcceptedKind.VOICE
+        val reply = FinalReply(ReplyAlert.identityOf(turn.id, if (isText) textPart else voicePart), turn.storedSessionId, turn.origin,
             heard = false, cancelled = false, source = if (isText) FinalReplySource.TEXT else FinalReplySource.OWN,
             // This journal has no original output policy. A current missing headset cannot
             // positively authorize sound for a recovered answer or its recovery notice.
-            text = text, quiet = true, noticeTitle = noticeTitle, canonicalRowId=finalRowId, namespace=turn.namespace)
+            text = text, quiet = true, noticeTitle = noticeTitle, canonicalRowId=finalRowId, namespace=turn.namespace, watchNode=turn.watchNode)
         return try {
             val handler = deliver
             if (handler != null) handler(reply) else { finalReply(reply); true }

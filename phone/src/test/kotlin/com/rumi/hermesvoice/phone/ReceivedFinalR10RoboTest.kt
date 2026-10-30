@@ -24,6 +24,30 @@ import org.robolectric.annotation.*
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 @Config(sdk=[34],qualifiers="w411dp-h1280dp")
 class ReceivedFinalR10RoboTest : PhoneNavRoboBase() {
+    private val ownedNativeTemp = Regex("""\\rvdev\\runs\\mr-r(?:10-20261019-r10(?:c1|b)|11-20261020-r11|12-20261021-r12|9-20261012-hv(?:21|22|23-live|24-pint|25-pint))-""")
+
+    @Test fun ownedNativeTempRejectsUnrelatedRootAndLineage() {
+        val root = "C:\\Users\\dkkim\\rvdev\\runs\\"
+        val current = root + "mr-r9-20261012-hv25-pint-tgate181440-greenp01\\tmp"
+        assertTrue(ownedNativeTemp.containsMatchIn(current.lowercase()))
+        for (legacy in listOf("mr-r10-20261019-r10c1-", "mr-r10-20261019-r10b-",
+                "mr-r11-20261020-r11-", "mr-r12-20261021-r12-",
+                "mr-r9-20261012-hv21-", "mr-r9-20261012-hv22-",
+                "mr-r9-20261012-hv23-live-", "mr-r9-20261012-hv24-pint-")) {
+            assertTrue(legacy, ownedNativeTemp.containsMatchIn(root + legacy + "control\\tmp"))
+        }
+        val refused = listOf(
+            current.replace("\\rvdev\\runs\\", "\\unowned\\runs\\"),
+            current.replace("\\runs\\", "\\other\\"),
+            current.replace("mr-r9-20261012-", "mr-r9-20261013-"),
+            current.replace("hv25-pint-", "hv25-unowned-"),
+            current.replace("hv25-pint-", "hv25-pintother-"),
+            "C:\\Windows\\Temp\\hv25-pint-tgate181440-greenp01\\tmp",
+        )
+        for (path in refused) assertFalse(path, ownedNativeTemp.containsMatchIn(path.lowercase()))
+        println("TGATE_OWNED_TEMP_NEGATIVES=${refused.size}")
+    }
+
     private fun received(id: String,text: String,time: Double,uid: String) {
         fake.injectFinalRow(id,text,time,uid)
     }
@@ -32,6 +56,30 @@ class ReceivedFinalR10RoboTest : PhoneNavRoboBase() {
         val layouts=mutableListOf<TextLayoutResult>()
         rule.runOnUiThread { node.config[SemanticsActions.GetTextLayoutResult].action?.invoke(layouts) }
         return layouts.single().layoutInput.style.fontWeight
+    }
+    /** DIAGNOSTIC ONLY (never the working source): passive fixed categories and counts of the first-send boundary, read before teardown. */
+    private fun n01Status(text: String) = when {
+        text.isEmpty() -> "empty"
+        text == "Opening this conversation…" -> "opening_refusal"
+        text == "Sending…" -> "sending"
+        text.startsWith("Sign in") -> "sign_in"
+        text.startsWith("Couldn't") || text.startsWith("Not sent") -> "send_failed"
+        text.startsWith("Reading the dashboard") -> "list_reading"
+        else -> "other"
+    }
+    private fun n01State(s: PhoneUiState, a: String) = org.json.JSONObject().put("opening", s.opening).put("signed_in", s.signedIn)
+        .put("selected_is_target", s.selected?.storedSessionId == a).put("status", n01Status(s.status))
+        .put("failure", when (val f = s.failure) { null -> "none"; "Not sent: this conversation is still opening" -> "still_opening"; else -> if (f.startsWith("Sign in")) "sign_in" else "other" })
+        .put("draft_retained", s.draft == "exactly one prompt").put("sends_in_flight", s.sendsInFlight).put("pending_sends", s.pendingSends.size)
+        .put("pending_delivered", s.pendingSends.count { it.delivered }).put("failed_sends", s.failedSends.size).put("history_rows", s.history.size)
+    private fun n01Snapshot(vm: PhoneViewModel, a: String, beforeSend: PhoneUiState, afterSend: PhoneUiState): String {
+        val reads = fake.restLog.toList()
+        return org.json.JSONObject().put("before_send", n01State(beforeSend, a)).put("after_send", n01State(afterSend, a)).put("at_failure", n01State(vm.state.value, a))
+            .put("raw_prompts", fake.rawPrompts.size).put("held_turns", fake.heldTurns.size)
+            .put("ws_tickets", reads.count { it.contains("/api/auth/ws-ticket") })
+            .put("target_ui_page_reads", reads.count { !it.startsWith("RECONCILE") && it.contains("/messages") && it.contains(a) })
+            .put("recovery_page_reads", reads.count { it.startsWith("RECONCILE") && it.contains("/messages") })
+            .put("rest_requests", reads.size).toString()
     }
     private fun answers()=app.getSystemService(NotificationManager::class.java).activeNotifications.filter {
         it.notification.channelId in setOf("reply_arrival","reply_arrival_quiet") && !it.tag.endsWith("#notice")
@@ -88,8 +136,12 @@ class ReceivedFinalR10RoboTest : PhoneNavRoboBase() {
         val vm=showWith(a,other);openCard(vm,other);systemBack();openCard(vm,a)
         fake.scripts[a]={listOf(FakeHermesDashboard.complete("retained later final"))}
         fake.turnBehavior={"hold"}
+        val beforeSend = vm.state.value  // passive snapshot reference (diagnostic)
         vm.setDraft("exactly one prompt");vm.send()
-        waitFor("actual accepted first request") { fake.heldTurns.containsKey(a) }
+        val afterSend = vm.state.value  // passive snapshot reference (diagnostic)
+        val accepted = await(20_000) { fake.heldTurns.containsKey(a) }  // = waitFor's own await (same 20 s)
+        if (!accepted) println("DIAG_N01_FIRST_SEND=" + n01Snapshot(vm, a, beforeSend, afterSend))  // failure only, before the assertion and teardown
+        assertTrue("actual accepted first request", accepted)
         fake.replayEpoch="second-epoch";fake.dropGateway()
         waitFor("accepted wait failed honestly") { vm.state.value.status.contains("reply",ignoreCase=true) && vm.state.value.sendsInFlight==0 }
         assertEquals("ONE prompt must be checked even if later alert assertions fail",listOf("exactly one prompt"),fake.rawPrompts.map { it.second })
@@ -160,7 +212,7 @@ class ReceivedFinalR10RoboTest : PhoneNavRoboBase() {
             assertFalse("sendMessage success is not a Watch post receipt",durableRow()!!.getBoolean("watch_done"))
             assertTrue("no prompt is submitted by discovery or reconnect",fake.prompts.isEmpty())
             val temp=java.io.File(System.getenv("TEMP")?:error("owned native TEMP missing"))
-            assertTrue("task-owned serial native slot only",Regex("""\\rvdev\\runs\\mr-r(?:10-20261019-r10(?:c1|b)|11-20261020-r11|12-20261021-r12|9-20261012-hv21)-""").containsMatchIn(temp.canonicalPath.lowercase()))
+            assertTrue("task-owned serial native slot only",ownedNativeTemp.containsMatchIn(temp.canonicalPath.lowercase()))
             java.nio.file.Files.write(java.io.File(temp,"r10-phone-watch-wire.json").toPath(),bytes,
                 java.nio.file.StandardOpenOption.CREATE_NEW,java.nio.file.StandardOpenOption.WRITE)
             println("R10_PHONE_WATCH_WIRE_BASE64="+java.util.Base64.getEncoder().encodeToString(bytes))
