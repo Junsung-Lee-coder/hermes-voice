@@ -61,6 +61,7 @@ class WatchListenerService : WearableListenerService() {
     override fun onMessageReceived(event: MessageEvent) {
         val app = WatchApp.from(this)
         when (event.path) {
+            WatchLinkPaths.LIVE_STATUS -> app.scope.launch { app.live.onStatus(event.sourceNodeId, event.data) }
             "/hv/v1/finals/intake" -> app.onSessionFinals(event.sourceNodeId, event.data)
             "/hv/v1/finals/receipt_ack" -> app.onSessionFinalReceipt(event.sourceNodeId, event.data)
             WatchLinkPaths.STATE -> TurnStateMessage.decode(event.data)?.let { state ->
@@ -89,6 +90,11 @@ class WatchListenerService : WearableListenerService() {
                 val source = event.sourceNodeId
                 val data = event.data
                 app.scope.launch { app.onReaderResponse(source, data) }
+            }
+            WatchLinkPaths.READER_ACCEPTED -> {
+                val source = event.sourceNodeId
+                val data = event.data
+                app.scope.launch { app.onReaderAccepted(source, data) }
             }
         }
     }

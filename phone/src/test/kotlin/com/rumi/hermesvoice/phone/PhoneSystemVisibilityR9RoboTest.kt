@@ -46,7 +46,18 @@ class PhoneSystemVisibilityR9RoboTest : PhoneNavRoboBase() {
         repeat(100) { add(id,"user",notice,"process_complete") }
         seed(id,30,"late")
         val model = showWith(id)
+        assertNull("this fixture starts without an earlier open publication", app.selectedConversationId)
+        val opened = java.util.concurrent.atomic.AtomicInteger()
+        val confirmed = java.util.concurrent.atomic.AtomicInteger()
+        val originalOpened = app.presence.onOpened
+        val originalConfirm = app.replyAlerts.confirmOpened!!
+        app.presence.onOpened = { target -> if (target == id) opened.incrementAndGet(); originalOpened(target) }
+        app.replyAlerts.confirmOpened = { target -> try { originalConfirm(target) } finally { if (target == id) confirmed.incrementAndGet() } }
         openCard(model,id)
+        // Cache/confirmation can publish before the open-owned newest commit. Require both actual readers, not mere first visibility.
+        waitFor("open-owned newest and positive visible-reader confirmation completed") {
+            app.selectedConversationId == id && opened.get() > 0 && opened.get() == confirmed.get()
+        }
         waitFor("latest loaded") { model.state.value.history.any { it.rowId == base+160 } }
         assertEquals((base+131..base+160).toList(),model.state.value.history.map { it.rowId })
         assertTrue(scrollUpUntil(60) { model.state.value.history.size > 30 })

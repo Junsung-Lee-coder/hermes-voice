@@ -34,8 +34,10 @@ class ReplayWiringContractTest {
 
     @Test
     fun `the Phone shows a real Play again for every reply that did not play`() {
-        assertTrue(source("$phone/MainActivity.kt").contains("UnplayedRepliesList(state.unplayed, onPlayAgain)"))
-        assertTrue(source("$phone/MainActivity.kt").contains("onPlayAgain = model::playAgain"))
+        // In the reply's own conversation chat (parent HOLD I1); a reply without a stored conversation is in every chat.
+        assertTrue(source("$phone/MainActivity.kt").contains("UnplayedRepliesList(unplayed, onPlayAgain)"))
+        assertTrue(source("$phone/MainActivity.kt").contains("it.storedSessionId.isEmpty() || it.storedSessionId == conversation.storedSessionId"))
+        assertTrue(source("$phone/MainActivity.kt").contains("ConversationVoiceActions(state, selected, model::stopPending, model::playAgain, onBackgroundAnswers)"))
         assertTrue("the stored conversation of the tapped reply is what the replay is checked against",
             source("$phone/PhoneViewModel.kt").contains("app.replayReply(reply.identity, reply.storedSessionId.takeIf { it.isNotEmpty() }) { heard, detail ->"))
         assertTrue(source("$phone/MainActivity.kt").contains("onClick = { onPlayAgain(reply) }"))

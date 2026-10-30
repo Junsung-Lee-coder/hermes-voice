@@ -42,10 +42,31 @@ class PhoneOlderHistoryRoboTest : PhoneNavRoboBase() {
 
     private fun ids(model: PhoneViewModel) = model.state.value.history.map { it.rowId }
 
+    private fun newestReads(stored: String) = messageRequests(stored).count { offsetOf(it) == 0 }
+
+    /**
+     * [openSettled] can return while the open's own read of the newest page is still in flight: the visible-open confirmation read
+     * finishes first and already clears "opening". The late read lands at its own time, resets the older cursor and would join
+     * whatever the server holds by then. So an open is settled only when both of its newest-page reads were requested and the shown
+     * rows and the cursor then stay unchanged for a moment.
+     */
+    private fun openSettledFully(model: PhoneViewModel, stored: String, readsBefore: Int) {
+        openSettled(model, stored)
+        waitFor("the open's two newest-page reads were requested") { newestReads(stored) >= readsBefore + 2 }
+        var last = ""
+        var since = System.nanoTime()
+        waitFor("the open's requested newest-page reads left rows, cursor and loading state unchanged for 150 ms") {
+            val state = model.state.value
+            val key = "${state.history.map { it.rowId }}/${state.rawLoaded}/${state.olderEpoch}/${state.olderLoading}"
+            if (key != last) { last = key; since = System.nanoTime() }
+            System.nanoTime() - since > 150_000_000L
+        }
+    }
+
     private fun opened(stored: String, rows: Int, prefix: String = "m"): PhoneViewModel {
         seed(stored, rows, prefix)
         val model = showWith(stored)
-        openSettled(model, stored)
+        openSettledFully(model, stored, newestReads(stored))
         waitFor("the latest page is shown") { ids(model).isNotEmpty() && exists("message_${ids(model).max()}") }
         return model
     }
@@ -120,7 +141,7 @@ class PhoneOlderHistoryRoboTest : PhoneNavRoboBase() {
         val early = (base + 1..base + 30).toList()
         val late = (last - 29..last).toList()
         val model = showWith(alpha)
-        openSettled(model, alpha)
+        openSettledFully(model, alpha, newestReads(alpha))
         waitFor("the latest page is shown") { ids(model).isNotEmpty() && exists("message_$last") }
         assertEquals("only the 30 visible rows of the newest raw page", late, ids(model))
         assertTrue("older rows may exist", model.state.value.hasOlder)
@@ -186,7 +207,7 @@ class PhoneOlderHistoryRoboTest : PhoneNavRoboBase() {
         seed(alpha, 120, "A")
         seed(beta, 120, "B")
         val model = showWith(alpha, beta)
-        openSettled(model, alpha)
+        openSettledFully(model, alpha, newestReads(alpha))
         waitFor("alpha's latest page") { ids(model).size == 50 }
         val latch = latchOlder(alpha)
         assertTrue(scrollUpUntil(60) { latch.arrived.count == 0L })
@@ -246,20 +267,23 @@ class PhoneOlderHistoryRoboTest : PhoneNavRoboBase() {
     private fun nextId(stored: String, step: Int): Long? = if (step == 1) null else rowsOf(stored).last().getLong("id") + step
 
     private fun arrive(stored: String, visible: Int, hidden: Int, prefix: String = "new", idStep: Int = 1) {
-        var extra = 0
-        for (i in 1..visible) {
-            val id = nextId(stored, idStep)
-            val n = id ?: (fake.rows.getValue(stored).messages.size + 1).toLong()
-            fake.injectRow(stored, if (n % 2 == 1L) "user" else "assistant", "$prefix-$n", id = id)
-            if (extra < hidden && i % 3 == 0) {
-                extra += 1
-                if (extra % 2 == 0) fake.injectRow(stored, "tool", "tool-$extra", id = nextId(stored, idStep))
-                else fake.injectRow(stored, "assistant", "hidden-$extra", hiddenKind = true, id = nextId(stored, idStep))
+        // The rows arrive together: a page read concurrently (the open's own read can still be in flight here) sees all of them or none.
+        synchronized(fake.rows.getValue(stored).messages) {
+            var extra = 0
+            for (i in 1..visible) {
+                val id = nextId(stored, idStep)
+                val n = id ?: (fake.rows.getValue(stored).messages.size + 1).toLong()
+                fake.injectRow(stored, if (n % 2 == 1L) "user" else "assistant", "$prefix-$n", id = id)
+                if (extra < hidden && i % 3 == 0) {
+                    extra += 1
+                    if (extra % 2 == 0) fake.injectRow(stored, "tool", "tool-$extra", id = nextId(stored, idStep))
+                    else fake.injectRow(stored, "assistant", "hidden-$extra", hiddenKind = true, id = nextId(stored, idStep))
+                }
             }
-        }
-        while (extra < hidden) {
-            extra += 1
-            fake.injectRow(stored, "tool", "tool-$extra", id = nextId(stored, idStep))
+            while (extra < hidden) {
+                extra += 1
+                fake.injectRow(stored, "tool", "tool-$extra", id = nextId(stored, idStep))
+            }
         }
     }
 
@@ -267,7 +291,7 @@ class PhoneOlderHistoryRoboTest : PhoneNavRoboBase() {
     private fun reopen(model: PhoneViewModel, stored: String, newest: Long) {
         rule.onNodeWithTag("back_button").performClick()
         waitFor("the list") { exists("conversation_row_$stored") }
-        openSettled(model, stored)
+        openSettledFully(model, stored, newestReads(stored))
         waitFor("the newest rows are merged in") { ids(model).contains(newest) }
     }
 
@@ -451,7 +475,7 @@ class PhoneOlderHistoryRoboTest : PhoneNavRoboBase() {
     private fun openedStep(stored: String, rows: Int, step: Int, listed: List<String>): PhoneViewModel {
         seedStep(stored, rows, step)
         val model = showWith(stored, *listed.toTypedArray())
-        openSettled(model, stored)
+        openSettledFully(model, stored, newestReads(stored))
         waitFor("the latest page is shown") { ids(model).isNotEmpty() && exists("message_${ids(model).max()}") }
         return model
     }
@@ -600,7 +624,7 @@ class PhoneOlderHistoryRoboTest : PhoneNavRoboBase() {
         seed(alpha, 30, "late")
         val last = rowsOf(alpha).last().getLong("id")
         val model = showWith(alpha)
-        openSettled(model, alpha)
+        openSettledFully(model, alpha, newestReads(alpha))
         waitFor("the latest page is shown") { ids(model).isNotEmpty() && exists("message_$last") }
         val newestShown = ids(model).max()
         arrive(alpha, visible = 40, hidden = 20)
@@ -661,7 +685,7 @@ class PhoneOlderHistoryRoboTest : PhoneNavRoboBase() {
         assertEquals("beta asked for nothing older", emptyList<Int>(), olderOffsets(beta))
         rule.onNodeWithTag("back_button").performClick()
         waitFor("the list") { exists("conversation_row_$alpha") }
-        openSettled(model, alpha)
+        openSettledFully(model, alpha, newestReads(alpha))
         waitFor("alpha's newest rows") { ids(model).contains(visibleIds(alpha).max()) }
         assertTrue("browsing ends at the start or at a stop", browseToTheStart(model))
         assertComplete(model, visibleIds(alpha), alpha)
@@ -714,7 +738,7 @@ class PhoneOlderHistoryRoboTest : PhoneNavRoboBase() {
         seed(alpha, 30, "late")
         val last = rowsOf(alpha).last().getLong("id")
         val model = showWith(alpha)
-        openSettled(model, alpha)
+        openSettledFully(model, alpha, newestReads(alpha))
         waitFor("the latest page is shown") { ids(model).isNotEmpty() && exists("message_$last") }
         val shown = ids(model)
         fake.messagesOffsetOverride = { _, offset -> if (offset >= 50) 50 else offset }

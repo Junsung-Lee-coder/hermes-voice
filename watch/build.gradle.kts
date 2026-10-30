@@ -17,8 +17,8 @@ android {
         applicationId = "com.rumi.hermesvoice"
         minSdk = 30
         targetSdk = 35
-        versionCode = 20
-        versionName = "0.1.19-dev"
+        versionCode = 42
+        versionName = "0.1.41-direct-dev"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -50,6 +50,7 @@ dependencies {
     // Only the pure link contract, settings and silence endpoint are used on the Watch; the Watch
     // never calls Hermes (no dashboard client, no credentials).
     implementation(project(":core"))
+    implementation("io.github.webrtc-sdk:android:144.7559.15")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.8.1")
     implementation("androidx.core:core-ktx:1.13.1")

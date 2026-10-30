@@ -211,6 +211,10 @@ interface HermesConversationPort {
 
     suspend fun submit(storedSessionId: String, text: String, attachments: List<OutgoingAttachment> = emptyList()): SubmittedTurn
 
+    /** Supported Live surface; default refuses rather than silently dropping its context. */
+    suspend fun submitLive(storedSessionId: String, text: String, voiceContext: String): SubmittedTurn =
+        throw UnsupportedOperationException("Live submission is unavailable on this transport")
+
     /**
      * The turn [acceptance] describes, found again on a fresh connection (never sent again): the same runtime session, resumed, and the
      * server's replay of the events after the prompt was accepted. Throws [com.rumi.hermesvoice.core.HermesReplyUnrecoverableException] when
@@ -421,7 +425,13 @@ class GatewayConversationPort(
         }
     }
 
-    override suspend fun submit(storedSessionId: String, text: String, attachments: List<OutgoingAttachment>): SubmittedTurn {
+    override suspend fun submit(storedSessionId: String, text: String, attachments: List<OutgoingAttachment>): SubmittedTurn =
+        submitWith(storedSessionId, text, attachments, null)
+
+    override suspend fun submitLive(storedSessionId: String, text: String, voiceContext: String): SubmittedTurn =
+        submitWith(storedSessionId, text, emptyList(), voiceContext.takeLast(6000))
+
+    private suspend fun submitWith(storedSessionId: String, text: String, attachments: List<OutgoingAttachment>, voiceContext: String?): SubmittedTurn {
         AttachmentPolicy.validate(attachments)
         diagMark(DiagStage.CONNECT)
         val connection = connections()
@@ -457,7 +467,9 @@ class GatewayConversationPort(
                 val prior = order.custody()
                 order.unproven = true
                 val result = try {
-                    connection.call("prompt.submit", params().put("session_id", runtimeId).put("text", prompt))
+                    connection.call("prompt.submit", params().put("session_id", runtimeId).put("text", prompt).apply {
+                        if (voiceContext != null) put("surface", "voice-live").put("voice_context", voiceContext).put("voice_turn", true)
+                    })
                 } catch (notSent: com.rumi.hermesvoice.core.HermesPromptNotSentException) {
                     order.restore(prior)
                     detachQueued(connection, runtimeId, attached.queuedImages)

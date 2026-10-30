@@ -18,8 +18,8 @@ android {
         applicationId = "com.rumi.hermesvoice"
         minSdk = 29
         targetSdk = 35
-        versionCode = 20
-        versionName = "0.1.19-dev"
+        versionCode = 42
+        versionName = "0.1.41-direct-dev"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -52,6 +52,8 @@ android {
 
 dependencies {
     implementation(project(":core"))
+    // Maintained WebRTC SDK; BSD-3-Clause, Android minSdk 21, ARM/x86 ABIs. No native dependency in core.
+    implementation("io.github.webrtc-sdk:android:144.7559.15")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.8.1")
     implementation("androidx.core:core-ktx:1.13.1")

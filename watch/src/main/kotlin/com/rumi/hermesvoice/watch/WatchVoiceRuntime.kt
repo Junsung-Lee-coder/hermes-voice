@@ -85,6 +85,9 @@ class WatchVoiceRuntime(private val app: WatchApp) {
     private var endedTrigger: TurnTrigger? = null
     private var talkPending = false
 
+    /** R37: the user's Stop ([stopBackground]) is under way. */
+    private var stopping = false
+
     private val handoffRunnable: Runnable = Runnable {
         if (!wake.wake.onHandoffDue(captureIdle = captures.activeId == null)) {
             Log.i(TAG, "wake handoff dropped gen=${wake.wake.generation}")
@@ -169,6 +172,7 @@ class WatchVoiceRuntime(private val app: WatchApp) {
         override fun sendRecognized(request: String) = sendRecognized(request, null)
 
         override fun sendRecognized(request: String, claimId: String?) {
+            if (app.settings.value.watchLiveEnabled) { app.live.start(request, wakeTurn = true, wakeClaimId = claimId); return }
             // The recognizer's FINAL result had the request after a leading wake phrase: send it whole.
             val turnId = app.newTurn(TurnTrigger.WAKE_PHRASE)
             if (turnId == null) {
@@ -193,7 +197,10 @@ class WatchVoiceRuntime(private val app: WatchApp) {
             ambient = false,
             permission = hasMic(),
             microphoneMuted = app.getSystemService(AudioManager::class.java)?.isMicrophoneMute == true,
-            talkIdle = app.talk.value.canArmWakePhrase,
+            // R36: a Watch Live call being set up (pending) owns the microphone and audio route as much as an active one, as the
+            // Live-state busy signal and reply playback already treat it: no wake window opens for either, a due gap re-arm included.
+            // R37: nor while the user's Stop is under way.
+            talkIdle = !stopping && app.talk.value.canArmWakePhrase && !app.live.state.value.let { it.active || it.pending },
             phoneReachable = app.phoneReachable.value,
             nowMs = SystemClock.elapsedRealtime(),
             cooldownUntilMs = cooldownUntilMs(),
@@ -379,6 +386,10 @@ class WatchVoiceRuntime(private val app: WatchApp) {
      * end whether visible or hidden. A later explicit foreground PTT is a new operation.
      */
     fun stopBackground() {
+        // R37: Live ends first (its capture settlement, not the wake teardown, settles a claim it may already have sent), which
+        // publishes an idle Live state while the session is still armed: no wake window may open for it until the Stop is done.
+        stopping = true
+        app.live.end()
         chargingObserver.stop()
         wake.wake.onChargingChanged(false)
         // Tombstone old turn/speaker identities before wake/capture teardown can clear talk state.
@@ -392,6 +403,7 @@ class WatchVoiceRuntime(private val app: WatchApp) {
         recognizedClaimId = null
         app.stopPlayback("stopped")
         app.holds.releaseAll()
+        stopping = false
     }
 
     /** The service was started by the platform with the microphone type refused: the session plays replies only. */
@@ -410,7 +422,7 @@ class WatchVoiceRuntime(private val app: WatchApp) {
     // ── activity ─────────────────────────────────────────────────────────────────────────────
 
     /** The activity is on screen. It reads the synced settings next and then calls [onSettingsPulled] with the returned visit. */
-    fun onActivityResumed(): Long = coordinator.onActivityResumed()
+    fun onActivityResumed(): Long = coordinator.onActivityResumed().also { app.live.refresh() }
 
     /**
      * The settings read of [visit] finished. Applied only if that visit is still current: a read
@@ -437,6 +449,10 @@ class WatchVoiceRuntime(private val app: WatchApp) {
 
     /** False when the microphone permission has to be asked for first (the activity does that). */
     fun onTalkPressed(): Boolean {
+        if (captures.activeId == null && (app.live.state.value.active || app.settings.value.watchLiveEnabled)) {
+            if (!app.live.state.value.active && !hasMic()) return false
+            coordinator.onBusy(); app.live.toggle(); return true
+        }
         captures.activeId?.let {
             end(it, CaptureStop.TAP_SEND)
             return true
@@ -470,6 +486,12 @@ class WatchVoiceRuntime(private val app: WatchApp) {
      * trailing silence (the setting when it started) or when the user taps.
      */
     private fun startCapture(trigger: TurnTrigger, silenceMs: Long = 0): Boolean {
+        if (app.settings.value.watchLiveEnabled) {
+            val wakeClaim = if (trigger == TurnTrigger.WAKE_PHRASE) captureClaimId else null
+            captureClaimId = null
+            return app.live.start(wakeTurn = trigger == TurnTrigger.WAKE_PHRASE, wakeClaimId = wakeClaim,
+                captureEnded = if (trigger == TurnTrigger.WAKE_PHRASE) wake.wake.liveCaptureSettlement() else null)
+        }
         val turnId = app.newTurn(trigger) ?: return false
         if (!captures.begin(turnId, trigger)) return false
         val wakeRequest = trigger == TurnTrigger.WAKE_PHRASE
@@ -638,6 +660,7 @@ class WatchVoiceRuntime(private val app: WatchApp) {
         app.scope.launch {
             app.settings.collect { coordinator.onEligibilityChanged() }
         }
+        app.scope.launch { app.live.state.collect { state -> if (state.active || state.pending) coordinator.onBusy() else coordinator.onIdle() } }
     }
 
     companion object {

@@ -285,15 +285,18 @@ class WatchDefaultBackgroundRoboTest {
         assertNoBackgroundControl()
     }
 
-    @Test fun T02() { // opened on a selected chat: same default start; chat and list show no background status/control
+    @Test fun T02() { // opened with a selected chat: same default start; list and chat show no background status/control
+        // Owner's UI contract of 2026-10-27: a launcher open shows the list, the selection kept; the left swipe opens its chat.
         app.seedReaderForQa(6, 6)
+        val selected = app.reader.value.selectedSessionId
         launch()
-        assertEquals(ReaderSurface.CHAT, app.reader.value.surface)
+        assertEquals(ReaderSurface.SESSIONS, app.reader.value.surface)
+        assertEquals(selected, app.reader.value.selectedSessionId)
         assertTrue(deliverService())
         assertTrue(app.voice.backgroundStatus.value.running)
         assertNoBackgroundControl()
         swipeLeft()
-        assertEquals(ReaderSurface.SESSIONS, app.reader.value.surface)
+        assertEquals(ReaderSurface.CHAT, app.reader.value.surface)
         assertEquals("left swipe is navigation only", 0, hides())
         assertNoBackgroundControl()
     }
@@ -322,15 +325,21 @@ class WatchDefaultBackgroundRoboTest {
         assertTrue("$status", status.running && !status.microphone && !app.voice.presence.armed)
     }
 
-    @Test fun T05() { // right swipe from the sessions list and from a chat: hidden, selection kept
+    @Test fun T05() { // right swipe from the sessions list hides; from a chat it is Back to the list; selection kept
+        // Owner's UI contract of 2026-10-27: the chat's back gesture returns to the list; only the list's sends the app to the back.
         app.seedReaderForQa(6, 6)
         launch()
         deliverService()
         val selected = app.reader.value.selectedSessionId
+        assertEquals(ReaderSurface.SESSIONS, app.reader.value.surface)
         swipeRight()
         assertEquals(1, hides())
         platformHides(); userReopens()
+        assertEquals("a launcher reopen shows the list", ReaderSurface.SESSIONS, app.reader.value.surface)
         swipeLeft()
+        assertEquals(ReaderSurface.CHAT, app.reader.value.surface)
+        swipeRight()
+        assertEquals("from a chat the right swipe is Back to the list", 1, hides())
         assertEquals(ReaderSurface.SESSIONS, app.reader.value.surface)
         swipeRight()
         assertEquals(2, hides())

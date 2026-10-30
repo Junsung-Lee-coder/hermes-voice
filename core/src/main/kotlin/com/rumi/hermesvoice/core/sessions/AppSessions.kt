@@ -24,9 +24,17 @@ import com.rumi.hermesvoice.core.voice.RoutingContract
 import com.rumi.hermesvoice.core.voice.TextSanitizer
 import java.security.MessageDigest
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -37,6 +45,10 @@ import org.json.JSONObject
 /** The dashboard session routes the repository needs; [com.rumi.hermesvoice.core.net.HermesDashboardClient] implements them. */
 interface HermesSessionsApi {
     suspend fun listSessions(source: String?, archived: ArchivedFilter, limit: Int = 100, offset: Int = 0, excludeSources: List<String> = emptyList()): StoredSessionPage
+    /** The same rows as [listSessions] without a source filter, newest started first (`order=created`), which the dashboard reads
+     * more cheaply. Only for a complete scan whose outcome does not depend on the order; the default order serves without it. */
+    suspend fun listSessionsByCreation(archived: ArchivedFilter, limit: Int = 100, offset: Int = 0): StoredSessionPage =
+        listSessions(null, archived, limit, offset)
     suspend fun getSession(sessionId: String): StoredSession?
     suspend fun getMessages(sessionId: String, limit: Int = 50, offset: Int = 0): HistoryPage
     /** Same authorized read, distinct caller intent for diagnostics; never changes eligibility or pagination. */
@@ -197,9 +209,16 @@ class OwnedSessionRegistry(internal val store: KeyValueStore) {
         return transform(current).also { require(it.storedSessionId == storedSessionId); put(it) }
     }
 
+    /** How many writes of the list were attempted in this process, saved or not: a reader can tell that the list changed. */
+    @Volatile var writes = 0L
+        private set
+
     /** One durable write of the whole list: either all of [transform]'s changes are saved or none. */
     @Synchronized
-    fun replaceAll(transform: (List<OwnedSession>) -> List<OwnedSession>) = list.write(transform(all()).map { it.toJson() })
+    fun replaceAll(transform: (List<OwnedSession>) -> List<OwnedSession>) {
+        writes++
+        list.write(transform(all()).map { it.toJson() })
+    }
 
     companion object {
         const val KEY = "owned_sessions_v1"
@@ -284,7 +303,8 @@ data class AppConversation(val owned: OwnedSession, val stored: StoredSession, v
  * [inProgress] marks a listing handed over while more pages are still being read; its conversations are already registered and
  * usable. [complete] is false when the scan stopped early (a page failed, or the server's pages stopped advancing) or a check
  * failed, and always while [inProgress]; [scanned] distinct server rows of [total] were read. [notAdopted] counts marked sessions
- * that were seen but not taken in (no free place or alias, an unusable id, or an unverifiable lineage). [error] names a failure by
+ * that were seen but not taken in (no free place or alias, an unusable id, an unverifiable lineage, or a creation-order read that did
+ * not finish). [error] names a failure by
  * class only.
  */
 class ConversationListing(
@@ -334,6 +354,33 @@ class AppSessionRepository(
     private val ineligible = HashSet<String>()
     private val journal = TurnCreateJournal(registry.store)
     private val lock = Mutex()
+
+    /**
+     * The active scan (archived = false, adopting) being read now, if any; a Live catalogue read ([catalogue]) can be joined by another
+     * one ([listOrJoinConversations]). [startWrites] is [OwnedSessionRegistry.writes] when it started and [ownWrites] counts the writes it
+     * made itself (all registry writes are made under [lock], so they are counted exactly). [listing] is null when it ended without one.
+     */
+    private class InFlightScan(val startWrites: Long, val catalogue: Boolean = false) {
+        val listing = CompletableDeferred<ConversationListing?>()
+        @Volatile var ownWrites = 0L
+    }
+    private val inFlightLock = Any()
+    private var inFlight: InFlightScan? = null
+
+    /** Marks the coroutines of a Live catalogue read ([listOrJoinConversations]); see [yieldToCatalogue]. */
+    private class CatalogueRead : AbstractCoroutineContextElement(CatalogueRead) { companion object Key : CoroutineContext.Key<CatalogueRead> }
+    /** Live catalogue reads in progress. */
+    private val catalogueReads = MutableStateFlow(0)
+
+    /**
+     * While a Live call's catalogue is being read, every other complete scan and reconciliation read waits here before its next
+     * dashboard request, so on a dashboard that answers one list read at a time the call is not queued behind them. A request already
+     * sent is never cut off and nothing is dropped: they continue where they were once the catalogue is read. Interactive conversation
+     * reads ([history]) never wait here.
+     */
+    private suspend fun yieldToCatalogue() {
+        if (coroutineContext[CatalogueRead] == null && catalogueReads.value > 0) catalogueReads.first { it == 0 }
+    }
 
     /** What the journal knows about [turnId], if it ever asked for a new conversation. */
     fun turnCreateRecord(turnId: String): TurnCreateRecord? = journal.find(turnId)
@@ -606,7 +653,9 @@ class AppSessionRepository(
      *   arrives, and [onProgress] then receives everything found so far with [ConversationListing.inProgress] set; no lock is held
      *   while a page is being fetched, so what was found is usable (voice destinations, sends, new conversations) while later pages
      *   are still being read. Offset pages of a changing list are not a snapshot: a row can move between pages, so a row seen twice
-     *   is used once, and a full page that brings no new row ends the scan as a failure rather than looping.
+     *   is used once, and a full page that brings no new row ends the scan as a failure rather than looping. The list appends every
+     *   pinned row a page missed, archived or not, to that page: the next page starts after the ordered window ([PAGE_SIZE] rows on),
+     *   a row of the other archive view is ignored, and pinned rows do not count as progress.
      * - A scan that cannot add anything (the Watch reader, a revoke-only synchronization, the archived view) ends once every
      *   registered conversation of its scope was seen. A scan that ended early, or failed, checks the registered conversations it did
      *   not see one by one (at most [MAX_INDIVIDUAL]); those never seen are left as they are, never revoked for being unseen.
@@ -614,26 +663,98 @@ class AppSessionRepository(
      *   when the field is absent), it is not the routing session, and an alias and one of the [DestinationAllowlist.MAX_ENTRIES]
      *   places are free. The adoptions and compression re-keys of one page are ONE durable write; if it fails nothing of that page is
      *   adopted. What earlier pages registered stays registered when a later page fails or the scan is cancelled.
-     * - Archived rows are not adopted, and the Watch reader never adopts.
+     * - Archived rows, pinned ones included, are not adopted, and the Watch reader never adopts.
+     * - While a Live call's catalogue is being read ([listOrJoinConversations]), this scan waits before each next page.
      */
     suspend fun listConversations(
         archived: Boolean,
         adoptMarked: Boolean = true,
         onProgress: (suspend (ConversationListing) -> Unit)? = null,
     ): ConversationListing {
+        if (archived || !adoptMarked) return scanConversations(archived, adoptMarked, onProgress, null)
+        return inFlightScan { scanConversations(false, true, onProgress, it) }
+    }
+
+    /** Runs one active adopting scan as the one being read now ([InFlightScan]). */
+    private suspend fun inFlightScan(catalogue: Boolean = false, scan: suspend (InFlightScan) -> ConversationListing): ConversationListing {
+        val shared = InFlightScan(registry.writes, catalogue)
+        synchronized(inFlightLock) { inFlight = shared }
+        var listing: ConversationListing? = null
+        try {
+            return scan(shared).also { listing = it }
+        } finally {
+            synchronized(inFlightLock) { if (inFlight === shared) inFlight = null }
+            shared.listing.complete(listing)
+        }
+    }
+
+    /**
+     * The active list for a caller that needs it complete and current within a deadline (a Live call). It is read in the dashboard's
+     * cheaper creation order ([HermesSessionsApi.listSessionsByCreation]) to the end, the same rows and checks as [listConversations],
+     * and newly marked sessions are taken in only after the last page, in one write, when the outcome cannot depend on the order: all of
+     * them fit the free places and none of their aliases depends on another's. A conversation the dashboard unarchived would take a place
+     * and an alias in page order, so that read writes no such unarchive. Otherwise the default order's scan decides which are taken in and
+     * unarchived, as it always has, within this same read. Nothing found is presented in the order pages were read.
+     *
+     * A default-order scan already being read (the Phone list's own) is not waited for: on the owner's dashboard it costs about three
+     * times as much per page. While this read runs, that scan and every other complete scan or reconciliation read wait before their
+     * next request ([yieldToCatalogue]). Only another Live catalogue read still being read is joined, never a finished one, and not one
+     * that started before this app changed its registry (a rename, archive, creation) other than by that read itself. A joined read that
+     * ends without a listing is not used: a newer one is joined, or this call reads the list itself. Cancelling this call stops only this
+     * wait. [pages] counts the list pages this call's own read received (a fixed-number diagnostic).
+     */
+    suspend fun listOrJoinConversations(pages: AtomicInteger? = null): ConversationListing {
+        catalogueReads.update { it + 1 }
+        try {
+            return withContext(CatalogueRead()) { readOrJoinCatalogue(pages) }
+        } finally {
+            catalogueReads.update { it - 1 }
+        }
+    }
+
+    private suspend fun readOrJoinCatalogue(pages: AtomicInteger?): ConversationListing {
+        while (true) {
+            val running = synchronized(inFlightLock) { inFlight }
+                ?.takeIf { it.catalogue && !it.listing.isCompleted && registry.writes == it.startWrites + it.ownWrites }
+                ?: return inFlightScan(catalogue = true) { shared ->
+                    try {
+                        scanConversations(false, true, null, shared, byCreation = true, pageCount = pages)
+                    } catch (_: OrderDependentAdoption) {
+                        scanConversations(false, true, null, shared, pageCount = pages)
+                    }
+                }
+            running.listing.await()?.let { return it }
+        }
+    }
+
+    /** Taking in this scan's newly marked sessions would depend on the order they were read in; nothing of them was written. */
+    private class OrderDependentAdoption : Exception()
+
+    private suspend fun scanConversations(
+        archived: Boolean,
+        adoptMarked: Boolean,
+        onProgress: (suspend (ConversationListing) -> Unit)?,
+        shared: InFlightScan?,
+        byCreation: Boolean = false,
+        pageCount: AtomicInteger? = null,
+    ): ConversationListing {
         val adopting = adoptMarked && !archived
         val registered = registry.all()
         if (!adopting && registered.none { it.role == OwnedRole.CONVERSATION }) return ConversationListing(emptyList())
         val filter = if (archived) ArchivedFilter.ONLY else ArchivedFilter.EXCLUDE
-        val scan = ListScan(archived, adopting)
+        val scan = ListScan(archived, adopting, shared, deferAdoption = byCreation && adopting)
         var offset = 0
         var total = 0
         var pages = 0
         var complete = false
         var error: String? = null
         while (true) {
+            yieldToCatalogue()
             val result = try {
-                readWithRetries(ReadOp.LIST) { api.listSessions(null, filter, limit = PAGE_SIZE, offset = offset) }
+                readWithRetries(ReadOp.LIST) {
+                    if (byCreation) api.listSessionsByCreation(filter, limit = PAGE_SIZE, offset = offset)
+                    else api.listSessions(null, filter, limit = PAGE_SIZE, offset = offset)
+                }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (auth: HermesAuthRequiredException) {
@@ -644,11 +765,18 @@ class AppSessionRepository(
                 break
             }
             pages++
-            val fresh = scan.fresh(result.sessions)
-            offset += result.sessions.size
-            total = maxOf(result.total, offset)
+            pageCount?.incrementAndGet()
+            // Every pinned row a window missed, of either archive state, is appended after that window (hermes_state_sessions.py
+            // list_sessions_rich include_pinned), so offset addresses the ordered window only and a row of the other view is no part of
+            // this scan. Pinned rows recur on every page by design: only unpinned ones show whether the window moved.
+            val inView = result.sessions.filter { it.archived == archived }
+            val fresh = scan.fresh(inView)
+            offset += PAGE_SIZE
+            total = maxOf(result.total, scan.rowCount)
             val full = result.sessions.size >= PAGE_SIZE
-            if (full && fresh.isEmpty()) {
+            val freshIds = fresh.mapTo(HashSet()) { it.id }
+            val unpinned = inView.filter { !it.pinned }
+            if (full && unpinned.isNotEmpty() && unpinned.none { it.id in freshIds }) {
                 error = "the list made no progress after ${scan.rowCount} of $total sessions (a full page held only rows already read)"
                 break
             }
@@ -666,6 +794,7 @@ class AppSessionRepository(
                 }
             }
         }
+        scan.adoptDeferred(complete)
         // The default dashboard list may filter out a registered id (for example by delegate
         // classification) even when pagination is complete. Only exact authenticated metadata,
         // not absence from that list, can decide its marker eligibility.
@@ -674,7 +803,18 @@ class AppSessionRepository(
     }
 
     /** The state of one [listConversations] scan: what was read, judged, registered and shown so far. */
-    private inner class ListScan(private val archived: Boolean, private val adopting: Boolean) {
+    private inner class ListScan(private val archived: Boolean, private val adopting: Boolean, private val shared: InFlightScan?,
+                                 private val deferAdoption: Boolean = false) {
+        /** [lock] for this scan's own registry changes, counted for whoever waits for it ([InFlightScan.ownWrites]). */
+        private suspend fun locked(block: suspend () -> Unit) = lock.withLock {
+            val before = registry.writes
+            try {
+                block()
+            } finally {
+                shared?.let { it.ownWrites += registry.writes - before }
+            }
+        }
+
         private val rows = HashSet<String>()
         private val seen = HashSet<String>()
         private val rekeyed = HashSet<String>()
@@ -684,6 +824,11 @@ class AppSessionRepository(
         private var notAdopted = 0
         private var degraded = false
         private var judgeFailures = 0
+        /** Newly marked sessions a [deferAdoption] scan holds back until after its last page ([adoptDeferred]). */
+        private val deferred = ArrayList<StoredSession>()
+        /** While a [deferAdoption] scan reads its pages, an unarchive it meets is held, not written ([sync]); [heldUnarchive] records one. */
+        private var holdingUnarchives = deferAdoption
+        private var heldUnarchive = false
 
         val rowCount: Int get() = rows.size
 
@@ -701,7 +846,7 @@ class AppSessionRepository(
         private suspend fun prejudge(page: List<StoredSession>) {
             val owned = registry.all().filter { it.role == OwnedRole.CONVERSATION }.map { it.storedSessionId }.toSet()
             for (row in page) {
-                if (!isProjected(row) || !directlyEligible(row)) continue
+                if (!isProjected(row) || !directlyEligible(row) || prejudged.containsKey(row.id)) continue
                 if (!adopting && row.id !in owned && row.lineageIds.dropLast(1).none { it in owned }) continue
                 prejudged[row.id] = try {
                     judge(row.id)
@@ -739,15 +884,32 @@ class AppSessionRepository(
             val synced = when {
                 mine.archived == row.archived -> mine
                 !row.archived && (aliasTaken(mine.alias, mine.storedSessionId) || active().size >= DestinationAllowlist.MAX_ENTRIES) -> mine
+                // In page order it would take a place and an alias ahead of newly marked sessions: the default order decides it.
+                holdingUnarchives && !row.archived -> mine.also { heldUnarchive = true }
                 else -> withContext(io) { registry.update(row.id) { it.copy(archived = row.archived) } }
             }
             shown[row.id] = AppConversation(synced, row)
         }
 
-        suspend fun absorb(page: List<StoredSession>) {
+        /**
+         * Takes in what a [deferAdoption] scan held back, as one page, once every page was read. A held unarchive, or a [batch] outcome
+         * that would depend on the order the sessions were read in, ends this scan ([OrderDependentAdoption]) before anything of them is
+         * written. An unfinished scan has not seen every candidate, so it takes in none of them (counted as not taken in).
+         */
+        suspend fun adoptDeferred(complete: Boolean) {
+            if (!deferAdoption) return
+            holdingUnarchives = false
+            val held = deferred.toList()
+            deferred.clear()
+            if (!complete) { notAdopted += held.size; return }
+            if (heldUnarchive) throw OrderDependentAdoption()
+            if (held.isNotEmpty()) absorb(held, batch = true)
+        }
+
+        suspend fun absorb(page: List<StoredSession>, batch: Boolean = false) {
             if (page.isEmpty()) return
             prejudge(page)
-            lock.withLock {
+            locked {
                 val all = registry.all()
                 val ownedById = all.filter { it.role == OwnedRole.CONVERSATION }.associateBy { it.storedSessionId }
                 val registeredIds = all.map { it.storedSessionId }.toSet()
@@ -761,7 +923,7 @@ class AppSessionRepository(
                     val entry = ownedById[row.id] ?: if (projected) row.lineageIds.dropLast(1).firstNotNullOfOrNull { ownedById[it] } else null
                     if (entry == null) {
                         val inRegisteredLineage = projected && row.lineageIds.any { it in registeredIds }
-                        if (adopting && !inRegisteredLineage && row.id !in registeredIds &&
+                        if (adopting && !inRegisteredLineage && row.id !in registeredIds && !row.archived &&
                             row.createdSource == AppSources.CONVERSATION) candidates += row
                         continue
                     }
@@ -780,10 +942,17 @@ class AppSessionRepository(
                         revoked += entry.storedSessionId
                     }
                 }
+                if (deferAdoption && !batch) {
+                    deferred += candidates
+                    candidates.clear()
+                }
                 val slots = (DestinationAllowlist.MAX_ENTRIES - active(all).size).coerceAtLeast(0)
                 val chosen = ArrayList<StoredSession>()
                 for (row in candidates) {
                     if (!DestinationAllowlist.isValidSessionId(row.id) || chosen.size >= slots) {
+                        // Which ones get the free places depends on the order: the default order decides that. With no free place
+                        // none is taken in, in any order.
+                        if (batch && slots > 0 && DestinationAllowlist.isValidSessionId(row.id)) throw OrderDependentAdoption()
                         notAdopted++
                         continue
                     }
@@ -792,14 +961,19 @@ class AppSessionRepository(
                     if (ok) chosen += row else notAdopted++
                 }
                 val taken = active(all).map { it.alias }.toMutableSet()
+                val registeredAliases = taken.toSet()
+                fun alone(row: StoredSession) = runCatching { uniqueAlias(aliasFromTitle(row.title), row.id, registeredAliases) }.getOrNull()
                 val adopted = LinkedHashMap<String, OwnedSession>()
                 for (row in chosen.sortedBy { it.id }) {
                     val alias = try {
                         uniqueAlias(aliasFromTitle(row.title), row.id, taken)
                     } catch (_: RecipientCreateException) {
+                        if (batch && alone(row) != null) throw OrderDependentAdoption()
                         notAdopted++
                         continue
                     }
+                    // An alias that another newly marked session's alias changed would depend on the order: the default order decides.
+                    if (batch && alias != alone(row)) throw OrderDependentAdoption()
                     taken += alias
                     adopted[row.id] = OwnedSession(row.id, OwnedRole.CONVERSATION, TextSanitizer.clean(row.title).take(MAX_TITLE_CHARS).ifEmpty { alias },
                         alias, "", archived = false, createdAtMs = clock())
@@ -834,6 +1008,7 @@ class AppSessionRepository(
                 .take(MAX_INDIVIDUAL)
             val verdicts = ArrayList<Pair<OwnedSession, Verdict>>()
             for (entry in targets) {
+                yieldToCatalogue()
                 val verdict = try {
                     judge(entry.storedSessionId)
                 } catch (cancelled: CancellationException) {
@@ -848,7 +1023,7 @@ class AppSessionRepository(
                 verdicts += entry to verdict
             }
             if (verdicts.isEmpty()) return
-            lock.withLock {
+            locked {
                 val revoked = HashSet<String>()
                 val individual = LinkedHashMap<String, Pair<OwnedSession, StoredSession>>()
                 for ((entry, verdict) in verdicts) {
@@ -874,6 +1049,7 @@ class AppSessionRepository(
         return readWithRetries(ReadOp.HISTORY) { api.getMessages(storedSessionId, limit, offset) }
     }
     suspend fun reconciliationHistory(storedSessionId:String,limit:Int=50,offset:Int=0):HistoryPage {
+        yieldToCatalogue()
         verifyConversation(storedSessionId)
         return readWithRetries(ReadOp.RECONCILIATION) { api.getReconciliationMessages(storedSessionId,limit,offset) }
     }
@@ -905,6 +1081,13 @@ class AppSessionRepository(
         com.rumi.hermesvoice.core.diag.diagMark(com.rumi.hermesvoice.core.diag.DiagStage.VERIFY)
         verifyConversation(storedSessionId)
         return conversations.submit(storedSessionId, text.trim(), attachments)
+    }
+
+    /** Live has no hidden router: validate the explicit binding through the same destination authority. */
+    suspend fun sendLive(storedSessionId: String, text: String, context: String): SubmittedTurn {
+        require(text.isNotBlank())
+        requireDeliverable(storedSessionId)
+        return conversations.submitLive(storedSessionId, com.rumi.hermesvoice.core.voice.VoiceTurnPrompt.compose(text), context.takeLast(6000))
     }
 
     /** The voice router's allowlist: our unarchived conversations (possibly none: the router may then ask for one); no router for a routing-off turn. */

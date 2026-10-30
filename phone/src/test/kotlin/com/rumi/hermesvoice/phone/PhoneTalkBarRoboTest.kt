@@ -1,6 +1,7 @@
 package com.rumi.hermesvoice.phone
 
 import androidx.compose.ui.unit.height
+import androidx.compose.foundation.layout.Column
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.semantics.SemanticsProperties
@@ -28,8 +29,10 @@ import org.robolectric.annotation.GraphicsMode
 import org.robolectric.annotation.LooperMode
 
 /**
- * SCRATCH HARNESS (never packaged). The production TalkBar: no static playback line in any playback state, the recording / routing /
- * pending / hands-free states kept, a 40dp visible button inside a 48dp touch target, and growth with large text.
+ * SCRATCH HARNESS (never packaged). The production TalkBar: no static playback line in any playback state, the recording and
+ * hands-free states kept in the Talk control (no routing or hands-free status line: owner's UI contract of 2026-10-27), a pending
+ * request's own Stop kept but in its conversation's chat, not the Talk bar (parent HOLD I1), a 40dp visible button inside a 48dp touch
+ * target, and growth with large text.
  */
 @RunWith(RobolectricTestRunner::class)
 @LooperMode(LooperMode.Mode.PAUSED)
@@ -47,7 +50,7 @@ class PhoneTalkBarRoboTest {
 
     private fun show() {
         rule.setContent {
-            MaterialTheme { TalkBar(state.value, onStopPending = { stopped = stopped + it }) { talks += 1 } }
+            MaterialTheme { TalkBar(state.value) { talks += 1 } }
         }
         rule.waitForIdle()
     }
@@ -90,21 +93,28 @@ class PhoneTalkBarRoboTest {
         assertEquals(1, textCount("Stop & send"))
         state.value = PhoneUiState(signedIn = true, handsFree = HandsFree.SPEAK_NOW)
         rule.waitForIdle()
-        assertEquals(1, textCount("Send now"))
-        assertEquals("the hands-free line is kept", 1, textCount("Speak now"))
+        assertEquals("the hands-free recording is said by the Talk control", 1, textCount("Send now"))
+        assertEquals("no hands-free status line", 0, textCount("Speak now"))
         assertEquals("still 40dp when recording", 40f, height("talk_visual"), 0.6f)
     }
 
     @Test fun T05_routingOffAndPendingStopAreKept() {
         state.value = PhoneUiState(signedIn = true, routingEnabled = false,
             pending = listOf(PendingTurn("turn-1", VoiceOrigin.PHONE, PendingPhase.AWAITING, "work")))
-        show()
-        rule.onNodeWithTag("routing_target").assertTextContains("Routing off", substring = true)
+        // The Talk bar with the conversation's own pending list (as its chat shows it): the Stop is the list's, once, not the bar's.
+        rule.setContent {
+            MaterialTheme { Column { PendingTurnsList(state.value.pending) { stopped = stopped + it }; TalkBar(state.value) { talks += 1 } } }
+        }
+        rule.waitForIdle()
+        assertEquals("no routing status line", 0, textCount("Routing off"))
+        assertEquals("the Talk bar adds no pending row of its own", 1,
+            rule.onAllNodes(SemanticsMatcher("tag pending_requests") { it.config.getOrNull(SemanticsProperties.TestTag) == "pending_requests" }).fetchSemanticsNodes().size)
         rule.onNodeWithTag("pending_stop_0").assertIsEnabled().performClick()
         assertEquals(listOf("turn-1"), stopped)
-        val routing = rule.onNodeWithTag("routing_target").getBoundsInRoot()
+        assertEquals("the Stop is not Talk", 0, talks)
+        val pending = rule.onNodeWithTag("pending_requests").getBoundsInRoot()
         val talk = rule.onNodeWithTag("talk").getBoundsInRoot()
-        assertTrue("nothing overlaps Talk", routing.bottom.value <= talk.top.value + 0.5f)
+        assertTrue("nothing overlaps Talk", pending.bottom.value <= talk.top.value + 0.5f)
     }
 
     @Test fun T06_theButtonCallsTheTalkHandlerOnce() {

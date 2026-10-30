@@ -28,8 +28,9 @@ fun interface ManualAdmission {
 }
 
 enum class ManualPhase { IDLE, PENDING, ADMITTED, RECORDING, REFUSED }
+/** [failure]: why this Talk did not become a request (refused, failed or discarded), for the screen; null when it was sent or stopped. */
 data class ManualCaptureState(val phase: ManualPhase = ManualPhase.IDLE, val recording: Boolean = false,
-    val voiceStatus: String = "", val micNotice: String? = null)
+    val voiceStatus: String = "", val micNotice: String? = null, val failure: String? = null)
 
 /** One real manual Phone recorder and target, owned by the Application and leased to a microphone foreground service. */
 class PhoneManualCapture(private val app: PhoneApp) : HeadsetRecordingTarget {
@@ -53,13 +54,31 @@ class PhoneManualCapture(private val app: PhoneApp) : HeadsetRecordingTarget {
     private var cue: AutoCloseable? = null
     private var deadline: Runnable? = null
 
-    fun toggle() {
-        if (busy) { stop(); return }
-        start(headset = false)
+    /** The Talk control: stops this capture, ends a Phone Live, or starts one of them. Returns why nothing started, if it was refused here. */
+    fun toggle(): String? {
+        if (busy) { stop(); return null } // Stop this Phone's capture, never reinterpret it as a foreign Watch End.
+        if (app.live.active) {
+            if (app.live.state.value.origin == VoiceOrigin.PHONE) { app.live.end(); return null }
+            val why = "Watch Live is active; end it on Watch before starting Phone audio"
+            mutable.update { it.copy(voiceStatus = why) }
+            return why
+        }
+        if (!busy && app.settings.watchSettings().phoneLiveEnabled) return if (app.live.start()) null else liveRefusal(app.live.state.value)
+        if (busy) { stop(); return null }
+        return if (start(headset = false)) null else mutable.value.failure
     }
 
     override fun onHeadsetCommand(command: RecordingCommand): HeadsetOutcome {
         if (!app.headset.enabled || app.headset.output() == null) return HeadsetOutcome.REFUSED
+        if (!busy && app.live.active && app.live.state.value.origin != VoiceOrigin.PHONE) return HeadsetOutcome.REFUSED
+        if (!busy && (app.live.active || app.settings.watchSettings().phoneLiveEnabled)) {
+            if (app.live.active) {
+                if (command == RecordingCommand.START) return HeadsetOutcome.IGNORED
+                app.live.end(); return HeadsetOutcome.STOPPED
+            }
+            if (command == RecordingCommand.STOP) return HeadsetOutcome.IGNORED
+            return if (app.live.start()) HeadsetOutcome.STARTED else HeadsetOutcome.REFUSED
+        }
         if (busy) {
             if (command == RecordingCommand.START) return HeadsetOutcome.IGNORED
             stop()
@@ -72,15 +91,15 @@ class PhoneManualCapture(private val app: PhoneApp) : HeadsetRecordingTarget {
     private fun start(headset: Boolean): Boolean {
         if (busy) return false
         if (ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            mutable.value = ManualCaptureState(ManualPhase.REFUSED, voiceStatus = HeadsetMediaText.PERMISSION, micNotice = HeadsetMediaText.PERMISSION)
+            mutable.value = ManualCaptureState(ManualPhase.REFUSED, voiceStatus = HeadsetMediaText.PERMISSION, micNotice = HeadsetMediaText.PERMISSION, failure = HeadsetMediaText.PERMISSION)
             return false
         }
         if (app.tokens.load() == null || (!app.settings.routingEnabled && app.selectedConversationId == null)) {
-            mutable.value = ManualCaptureState(ManualPhase.REFUSED, voiceStatus = "Open a conversation and sign in before recording")
+            mutable.value = ManualCaptureState(ManualPhase.REFUSED, voiceStatus = "Open a conversation and sign in before recording", failure = "Open a conversation and sign in before recording")
             return false
         }
         val owned = app.phoneMic.takeManual() ?: run {
-            mutable.value = ManualCaptureState(ManualPhase.REFUSED, voiceStatus = "Phone microphone busy")
+            mutable.value = ManualCaptureState(ManualPhase.REFUSED, voiceStatus = "Phone microphone busy", failure = "Phone microphone busy")
             return false
         }
         app.connectionCue.cancel()
@@ -192,7 +211,8 @@ class PhoneManualCapture(private val app: PhoneApp) : HeadsetRecordingTarget {
         }.onFailure { if (token == generation) cancel("Headset loss monitoring unavailable") }
     }
 
-    fun cancel(message: String = "Stopped", refused: Boolean = false) {
+    /** [failed]: the capture broke off by itself (said on the screen), not by the user's Stop, a sign-out or a connection change. */
+    fun cancel(message: String = "Stopped", refused: Boolean = false, failed: Boolean = message != "Stopped") {
         ++generation
         cancelCue()
         releasePreparation()
@@ -205,7 +225,7 @@ class PhoneManualCapture(private val app: PhoneApp) : HeadsetRecordingTarget {
         microphone?.release()
         microphone = null
         mutable.value = ManualCaptureState(if (refused) ManualPhase.REFUSED else ManualPhase.IDLE, voiceStatus = message,
-            micNotice = if (message == HEADSET_DISCARDED) message else mutable.value.micNotice)
+            micNotice = if (message == HEADSET_DISCARDED) message else mutable.value.micNotice, failure = message.takeIf { failed })
     }
 
     private fun finish(inputLost: Boolean) {
@@ -224,7 +244,8 @@ class PhoneManualCapture(private val app: PhoneApp) : HeadsetRecordingTarget {
         // Stop cue follows physical mic release; retain actual foreground admission until bounded cue ends.
         micLease?.close(); micLease = null
         app.holds.release(HoldReason.CAPTURE)
-        mutable.update { it.copy(phase = ManualPhase.IDLE, recording = false, voiceStatus = if (wav == null) "Too short" else "Sending…", micNotice = if (inputLost) HeadsetText.LOST else it.micNotice) }
+        mutable.update { it.copy(phase = ManualPhase.IDLE, recording = false, voiceStatus = if (wav == null) "Too short" else "Sending…", micNotice = if (inputLost) HeadsetText.LOST else it.micNotice,
+            failure = if (wav == null) "Too short" else null) }
         val token = generation
         if (wav != null && playStop && app.recordingCues.available()) {
             cue = app.recordingCues.play(CueKind.STOP) { if (token == generation) { cue = null; releaseService() } }

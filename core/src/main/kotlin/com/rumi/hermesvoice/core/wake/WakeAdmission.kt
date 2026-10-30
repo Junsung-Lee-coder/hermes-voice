@@ -166,9 +166,16 @@ class WakeAdmission(
      * Admits a turn: null when it may proceed, else the refusal reason. A wake-phrase turn in Both,
      * or carrying a claim, uses up its device's claim and counts as an answered episode; every other turn is admitted untouched.
      */
-    fun admitTurn(wakeTurn: Boolean, origin: VoiceOrigin, nodeId: String, claimId: String?): String? {
+    fun admitTurn(wakeTurn: Boolean, origin: VoiceOrigin, nodeId: String, claimId: String?, expectedSettingsRevision: Long? = null): String? {
         val episode = synchronized(lock) {
             if (!wakeTurn) return null
+            // Live has not accepted the wake until its asynchronous OS admission returns. Legacy
+            // captures retain their existing accepted-before-settings-change contract (null).
+            if (expectedSettingsRevision != null) {
+                val current = settings()
+                if (current.revision != expectedSettingsRevision ||
+                    ((claimId != null || current.arbitrationRequired) && !current.mayListen(origin))) return "wake_settings_changed"
+            }
             if (claimId == null && !required()) return null
             val now = clock()
             expire(now)
@@ -180,6 +187,7 @@ class WakeAdmission(
                 return@synchronized WakeEpisode(answered, "", origin, nodeId).also { lastAnswered = it }
             }
             val held = lease?.takeIf { it.claim.claimId == claimId && sameDevice(it.claim, origin, nodeId) } ?: return "wake_claim_invalid"
+            if (expectedSettingsRevision != null && held.claim.settingsRevision != expectedSettingsRevision) return "wake_settings_changed"
             lease = null
             answered += 1
             epochs?.save(answered)

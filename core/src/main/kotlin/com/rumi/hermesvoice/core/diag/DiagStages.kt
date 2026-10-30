@@ -21,7 +21,11 @@ import kotlinx.coroutines.currentCoroutineContext
 /** Where in a request's life an observed event or failure happened. Fixed words only. */
 enum class DiagStage(val wire: String) {
     PREPARE("prepare"), VERIFY("verify"), CONNECT("connect"), RESUME("resume"), UPLOAD("upload"), SUBMIT("submit"),
-    WAIT("wait"), RECEIVE("receive"), STT("stt"), TTS("tts"), TRANSFER("transfer"), PLAYBACK("playback");
+    WAIT("wait"), RECEIVE("receive"), STT("stt"), TTS("tts"), TRANSFER("transfer"), PLAYBACK("playback"),
+
+    /** Live call setup, in order: audio route, conversation catalog, microphone, local media/offer, provider session request, its answer, Watch relay, start. */
+    LIVE_ROUTE("live_route"), LIVE_CATALOG("live_catalog"), LIVE_INPUT("live_input"), LIVE_MEDIA("live_media"),
+    LIVE_SESSION("live_session"), LIVE_ANSWER("live_answer"), LIVE_RELAY("live_relay"), LIVE_START("live_start");
 
     companion object {
         private val byWire = values().associateBy { it.wire }

@@ -20,6 +20,8 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -158,7 +160,7 @@ fun Modifier.holdToTalk(key: Any?, interrupts: HoldInterrupts, enabled: () -> Bo
     }
 
 /**
- * The Watch's main screen: [content] (browser, chat or home) with the talk gesture over all of
+ * The Watch's main screen: [content] (the conversation list or a conversation's history) with the talk gesture over all of
  * it ([holdToTalk]) and, for accessibility services, the same start/stop as an action, so it
  * needs no on-screen button. [modifier] carries the activity's swipe handling.
  */
@@ -236,6 +238,7 @@ fun readerErrorText(error: String?): String = when (error) {
     ReaderError.SIGN_IN_REQUIRED -> "Sign in on the phone"
     ReaderError.NOT_CONFIGURED -> "Set up Hermes on the phone"
     ReaderError.TIMEOUT -> "Phone did not answer"
+    ReaderError.INCOMPLETE -> "Loading did not finish"
     ReaderError.NOT_OWNED -> "Conversation not available"
     ReaderError.HISTORY_SCAN_LIMIT -> "Too much hidden activity. Open on the phone"
     else -> "Could not load"
@@ -335,7 +338,7 @@ private fun ChatSurfaceContent(
             items(history.messages, key = { it.rowId }) { Bubble(it) }
             item(key = "footer") {
                 when {
-                    history.status == LoadStatus.LOADING && !history.loadingOlder -> StatusText(if (ids.isEmpty()) "Loading…" else "Updating…")
+                    history.status == LoadStatus.LOADING && !history.loadingOlder && ids.isEmpty() -> StatusText("Loading…")
                     history.status == LoadStatus.OFFLINE || history.status == LoadStatus.ERROR -> Column(horizontalAlignment = Alignment.CenterHorizontally,
                         modifier = Modifier.fillMaxWidth()) {
                         StatusText(readerErrorText(history.error), error = true)
@@ -349,7 +352,10 @@ private fun ChatSurfaceContent(
     }
 }
 
-/** App-owned active conversations; tapping one opens it in chat. */
+/**
+ * App-owned active conversations; tapping one opens it in chat. Only the list, its load error with Retry and the empty-list placeholder
+ * are drawn (no refresh or cache prose, no settings or log controls); [talkStatus] is the one status line over its bottom.
+ */
 @Composable
 fun SessionsSurface(
     sessions: ReaderSessionsState,
@@ -358,120 +364,74 @@ fun SessionsSurface(
     onSelect: (String) -> Unit,
     onRefresh: () -> Unit,
     onScrollStep: () -> Unit,
-    onClearLog: (suspend () -> Boolean)? = null,
+    talkStatus: @Composable () -> Unit = {},
 ) {
     val listState = rememberLazyListState()
-    LazyColumn(
-        Modifier.fillMaxSize().rotaryScroll(listState, focusRequester, onScrollStep).testTag("session_list"),
-        state = listState,
-        contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 26.dp, bottom = 40.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        item(key = "header") {
-            Text("Conversations", style = MaterialTheme.typography.title3, color = MaterialTheme.colors.onBackground)
-        }
-        item(key = "status") {
-            when (sessions.status) {
-                LoadStatus.LOADING -> StatusText(if (sessions.rows.isEmpty()) "Loading…" else "Updating…")
-                LoadStatus.OFFLINE, LoadStatus.ERROR -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    StatusText(readerErrorText(sessions.error), error = true)
-                    CompactChip(onClick = onRefresh, label = { Text("Retry") }, colors = ChipDefaults.secondaryChipColors())
+    Box(Modifier.fillMaxSize()) {
+        LazyColumn(
+            Modifier.fillMaxSize().rotaryScroll(listState, focusRequester, onScrollStep).testTag("session_list"),
+            state = listState,
+            contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 26.dp, bottom = 40.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            item(key = "header") {
+                Text("Conversations", style = MaterialTheme.typography.title3, color = MaterialTheme.colors.onBackground)
+            }
+            item(key = "status") {
+                when (sessions.status) {
+                    LoadStatus.LOADING -> if (sessions.rows.isEmpty()) StatusText("Loading…")
+                    LoadStatus.OFFLINE, LoadStatus.ERROR -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        StatusText(readerErrorText(sessions.error), error = true)
+                        CompactChip(onClick = onRefresh, label = { Text("Retry") }, colors = ChipDefaults.secondaryChipColors())
+                    }
+                    LoadStatus.READY -> if (sessions.rows.isEmpty()) StatusText("No conversations. Create one on the phone.")
+                    LoadStatus.IDLE -> Unit
                 }
-                LoadStatus.READY -> when {
-                    sessions.notice != null -> StatusText(sessions.notice.orEmpty())
-                    sessions.rows.isEmpty() -> StatusText("No conversations. Create one on the phone.")
-                }
-                LoadStatus.IDLE -> Unit
+            }
+            sessions.alertNotice?.let { note -> item(key = "alert_pending") { StatusText(note, error = true) } }
+            items(sessions.rows, key = { it.id }) { row ->
+                Chip(
+                    onClick = { onSelect(row.id) },
+                    label = { Text(row.title, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        fontWeight = if (row.unread) androidx.compose.ui.text.font.FontWeight.Bold else androidx.compose.ui.text.font.FontWeight.Normal) },
+                    colors = if (row.id == selectedId) ChipDefaults.primaryChipColors() else ChipDefaults.secondaryChipColors(),
+                    modifier = Modifier.fillMaxWidth().testTag("session_${row.alias}"),
+                )
             }
         }
-        sessions.alertNotice?.let { note -> item(key = "alert_pending") { StatusText(note, error = true) } }
-        items(sessions.rows, key = { it.id }) { row ->
-            Chip(
-                onClick = { onSelect(row.id) },
-                label = { Text(row.title, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                    fontWeight = if (row.unread) androidx.compose.ui.text.font.FontWeight.Bold else androidx.compose.ui.text.font.FontWeight.Normal) },
-                colors = if (row.id == selectedId) ChipDefaults.primaryChipColors() else ChipDefaults.secondaryChipColors(),
-                modifier = Modifier.fillMaxWidth().testTag("session_${row.alias}"),
-            )
-        }
-        if (onClearLog != null) item(key = "clear_log") { ClearWatchLogChip(onClearLog) }
+        Box(Modifier.align(Alignment.BottomCenter).padding(bottom = 8.dp, start = 28.dp, end = 28.dp)) { talkStatus() }
     }
 }
 
-/** Clears only this watch's saved diagnostics: a second tap confirms; conversations, settings and the phone are untouched. */
-@Composable
-private fun ClearWatchLogChip(clear: suspend () -> Boolean) {
-    val scope = androidx.compose.runtime.rememberCoroutineScope()
-    var armed by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
-    var result by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
-    CompactChip(
-        onClick = {
-            if (!armed) {
-                armed = true
-                result = null
-            } else {
-                armed = false
-                scope.launch { result = if (clear()) "This watch's log was cleared" else "Couldn't clear this watch's log" }
-            }
-        },
-        label = { Text(result ?: if (armed) "Tap again to clear" else "Clear this watch's log", maxLines = 2) },
-        colors = ChipDefaults.secondaryChipColors(),
-        modifier = Modifier.testTag("clear_watch_diagnostics"),
-    )
-}
+/** Lines that only report progress or a routine end: never drawn (the request's stages are in the log). */
+private fun routine(line: String): Boolean = line.isBlank() || line == WatchTalkState.PLAYING_OTHER || line == WatchTalkState.REPLAY_REQUESTED ||
+    line == "Stopped" || line.startsWith("Duplicate") || (line.startsWith("Delivered to ") && !line.contains("failed")) ||
+    line.startsWith("Wake phrase unavailable") || line.startsWith("The speech recognizer lacks")
 
-/** What a press does now, or what the voice request is doing: recording, sending, waiting, the wake phrase. */
+/**
+ * The one line the Watch draws over either screen, or "" for none: the recording and how to send it, a request that was not sent or
+ * failed ([failure], an earlier request's [WatchTalkState.notice], the last request's outcome), or a hold that could not start. Progress,
+ * waiting counts, hints and the wake phrase's listening (said by the session's notification) are not drawn. [wakeListening] is unused.
+ */
 fun talkHint(talk: WatchTalkState, wakeListening: Boolean, failure: String? = null): String = when {
     talk.phase == WatchPhase.RECORDING -> "● Recording · hold 1 s to send"
     failure != null -> failure
-    talk.notice.isNotBlank() -> if (talk.line.isNotBlank() && talk.line != talk.notice) "${talk.notice} · ${talk.line}" else talk.notice
-    talk.line.isNotBlank() -> if (talk.waitingCount > 1) "${talk.line} · ${talk.waitingCount} waiting" else talk.line
-    wakeListening -> "Listening for the wake phrase…"
-    talk.waitingCount > 0 -> "${talk.waitingCount} waiting for a reply · hold 1 s to talk"
-    else -> "Hold 1 s to talk"
+    talk.notice.isNotBlank() -> talk.notice
+    talk.line == WatchTalkState.TOO_MANY -> talk.line
+    talk.phase == WatchPhase.IDLE && !routine(talk.line) -> talk.line
+    else -> ""
 }
 
-/** The home screen when no conversation is open: status lines only; the talk gesture covers the whole screen. */
-@Composable
-fun TalkHome(phone: Boolean?, talk: WatchTalkState, wakeEnabled: Boolean, wakeListening: Boolean, wakeUnavailable: Boolean, onReplay: () -> Unit = {},
-             failure: String? = null) {
-    Column(Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 14.dp),
-        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterVertically)) {
-        Text(
-            when (phone) {
-                true -> "Phone connected"
-                false -> "Phone not reachable"
-                null -> "Checking phone…"
-            },
-            color = if (phone == false) MaterialTheme.colors.error else MaterialTheme.colors.onSurfaceVariant,
-            style = MaterialTheme.typography.caption2, textAlign = TextAlign.Center,
-        )
-        val recording = talk.phase == WatchPhase.RECORDING
-        Text(
-            when {
-                recording || failure != null || talk.line.isNotBlank() || talk.notice.isNotBlank() || wakeListening -> talkHint(talk, wakeListening, failure)
-                wakeEnabled && wakeUnavailable -> "Wake phrase unavailable on this watch. Hold 1 s to talk"
-                wakeEnabled -> "Say the wake phrase, or hold 1 s to talk"
-                else -> "Hold anywhere 1 s to talk"
-            },
-            Modifier.testTag("talk_status"),
-            color = if (recording) MaterialTheme.colors.error else MaterialTheme.colors.onBackground,
-            style = MaterialTheme.typography.body2, textAlign = TextAlign.Center, maxLines = 3,
-        )
-        if (talk.replayTurnId != null) PlayAgainChip(onReplay)
-        Text("Swipe left for conversations", color = MaterialTheme.colors.onSurfaceVariant,
-            style = MaterialTheme.typography.caption3, textAlign = TextAlign.Center)
-    }
-}
-
-/** One compact line over the bottom of the chat: recording, the request's progress, or the hold hint. */
+/** The status line over the bottom of either screen, only while there is something to say ([talkHint]) or a reply to play again. */
 @Composable
 fun TalkStatusLine(talk: WatchTalkState, wakeListening: Boolean, onReplay: () -> Unit = {}, failure: String? = null) {
+    val line = talkHint(talk, wakeListening, failure)
+    if (line.isEmpty() && talk.replayTurnId == null) return
     val recording = talk.phase == WatchPhase.RECORDING
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
     if (talk.replayTurnId != null) PlayAgainChip(onReplay)
-    Text(talkHint(talk, wakeListening, failure),
+    if (line.isNotEmpty()) Text(line,
         Modifier.background(Color(0xCC000000), RoundedCornerShape(8.dp)).padding(horizontal = 6.dp, vertical = 2.dp).testTag("talk_status"),
         color = if (recording) MaterialTheme.colors.error else MaterialTheme.colors.onSurfaceVariant,
         style = MaterialTheme.typography.caption3, maxLines = 2, textAlign = TextAlign.Center)

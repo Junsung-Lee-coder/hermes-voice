@@ -94,6 +94,7 @@ class PhoneApp : Application() {
 
     private val settingsStore by lazy { SharedPreferencesKeyValueStore(prefs(AppSettings.PREFERENCES_NAME)) }
     val settings: AppSettings by lazy { AppSettings(settingsStore) }
+    val sharedVoiceSettings = MutableStateFlow<com.rumi.hermesvoice.core.settings.WatchSettings?>(null)
 
     /** This install's own flags (the relay opt-in, notifications asked), excluded from backup and transfer. */
     val localStore by lazy { SharedPreferencesKeyValueStore(prefs(DeviceLocalFlags.PHONE_PREFERENCES)) }
@@ -202,6 +203,21 @@ class PhoneApp : Application() {
     fun bodyScope(): String? = sessionListScope()?.let { stable ->
         MessageDigest.getInstance("SHA-256").digest("$stable|${tokens.displayGeneration()}".toByteArray()).joinToString("") { "%02x".format(it) }
     }
+    /** R33: [bodyScope] for real-time Live audio guards (the pinned ADM callback, the uplink's only pacer, asks it every 10 ms). Exact
+     *  given the Keystore key: bodyScope is a function of the sealed session, its display generation and the dashboard URL and profile
+     *  (and of that session decrypting), so while none of those (in-memory preference reads) changed the last exact value is returned,
+     *  and any change is evaluated exactly. No Keystore decrypt runs per audio frame: a session that stops decrypting under an unchanged
+     *  blob is caught at the next exact [bodyScope] check (a provider event, microphone change or request), not on the next frame. */
+    internal fun liveBodyScope(): String? {
+        val inputs = liveScopeInputs()
+        liveScopeMemo?.let { if (it.inputs == inputs) return it.scope }
+        val scope = bodyScope()
+        if (liveScopeInputs() == inputs) liveScopeMemo = LiveScopeMemo(inputs, scope) // never pairs older inputs with a newer scope
+        return scope
+    }
+    private class LiveScopeMemo(val inputs: List<String?>, val scope: String?)
+    @Volatile private var liveScopeMemo: LiveScopeMemo? = null
+    private fun liveScopeInputs(): List<String?> = tokens.sealedState() + listOf(settings.dashboardUrl, settings.profile)
     val recentBodies by lazy {
         com.rumi.hermesvoice.core.sessions.RecentBodies(localStore, "conversation_bodies_v1", ::bodyScope, appScope) {
             cacheNotice.value = "Recent messages not saved. Check device storage; online messages remain available."
@@ -214,6 +230,8 @@ class PhoneApp : Application() {
 
     /** Immediate in-memory fence, then serialized durable clearing; never waits for disk on the UI thread. */
     fun invalidateSessionTitles() {
+        purgeLiveText()
+        live.end("Sign-in or connection scope changed")
         finalRecovery.invalidate()
         recentBodies.invalidate()
         val version = synchronized(sessionTitlesHintsLock) {
@@ -261,8 +279,12 @@ class PhoneApp : Application() {
     val cueOutput: CueOutput by lazy { AndroidCueOutput(this, actualPlayback = { headsetMedia.cuePlaying(it) }) }
     val recordingCues: RecordingCues by lazy { RecordingCues(headset, cueOutput) }
     val phoneMic = PhoneMicArbiter()
+    val liveAudioGate = com.rumi.hermesvoice.phone.live.PhoneLiveAudioGate()
     val manualAdmission: ManualAdmission by lazy { PhoneManualService.admission(this) }
     val manualCapture: PhoneManualCapture by lazy { PhoneManualCapture(this) }
+    private val liveLazy = lazy { com.rumi.hermesvoice.phone.live.PhoneLiveVoiceController(this) }
+    val live: com.rumi.hermesvoice.phone.live.PhoneLiveVoiceController by liveLazy
+    val liveWatch: com.rumi.hermesvoice.phone.live.PhoneLiveWatchControl by lazy { com.rumi.hermesvoice.phone.live.PhoneLiveWatchControl(this) }
     val headsetMedia: HeadsetMediaControl by lazy {
         HeadsetMediaControl(headset, mediaSessions, { activityVisible }).also { it.attach(manualCapture) }
     }
@@ -277,7 +299,10 @@ class PhoneApp : Application() {
     val privateAudio: PrivateAudioHub by lazy {
         PrivateAudioHub(settings, headset, appScope,
             publish = { snapshot -> WatchSettingsSync.publish(this, snapshot) },
-            onCore = { active -> wiring?.core?.orchestrator?.onPrivateOutputChanged(active) })
+            onCore = { active ->
+                mainScope.launch { liveWatch.privateChanged() }
+                wiring?.core?.orchestrator?.onPrivateOutputChanged(active)
+            })
     }
 
     /**
@@ -408,6 +433,7 @@ class PhoneApp : Application() {
 
     /** The conversation open on this Phone's screen (routing off sends this Phone's voice requests there). */
     @Volatile var selectedConversationId: String? = null
+        set(value) { val changed = field != value; field = value; if (changed && liveLazy.isInitialized()) live.navigationChanged() }
 
     /** The user's switch, from the visible app. */
     fun startRelay(): BackgroundStatus =
@@ -431,6 +457,7 @@ class PhoneApp : Application() {
 
     /** Ends following later replies, and every later reply waiting or playing (a Stop, or the option switched off). */
     fun stopLaterReplies() {
+        live.end("Stopped answer following; Live continuation revoked")
         diagnostics.log.record(DiagCode.STOP_ALL, DiagOrigin.PHONE)
         wiring?.core?.orchestrator?.stopFollowing()
     }
@@ -540,6 +567,8 @@ class PhoneApp : Application() {
      */
     @Synchronized
     fun revokeUnplayedReplies(): Boolean {
+        purgeLiveText()
+        live.end("Sign-in or connection scope changed")
         asyncConnection.incrementAndGet()
         deliveryGeneration.incrementAndGet()
         val current = wiring
@@ -628,7 +657,12 @@ class PhoneApp : Application() {
         job.start()
         return job
     }
-    val tokens: KeystoreTokenStore by lazy { KeystoreTokenStore(this) }
+    private val liveTextHistoryLazy = lazy { com.rumi.hermesvoice.phone.live.LiveTextHistory(noBackupFilesDir) }
+    internal val liveTextHistory get() = liveTextHistoryLazy.value
+    private fun purgeLiveText() {
+        if (!liveTextHistory.invalidate()) cacheNotice.value = "Live text context could not be removed from device storage; old context is disabled. Check device storage."
+    }
+    val tokens: KeystoreTokenStore by lazy { KeystoreTokenStore(this, ::purgeLiveText) }
 
     val http: OkHttpClient by lazy {
         OkHttpClient.Builder()

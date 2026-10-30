@@ -4,6 +4,7 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -46,6 +47,27 @@ class PhoneInternalEventVisibilityRoboTest : PhoneNavRoboBase() {
         it.optString("display_kind") in setOf("internal_notification", "async_delegation_complete")
     }.map { it.getLong("id") }
 
+    private val presenceOpened = AtomicInteger()
+    private val presenceConfirmed = AtomicInteger()
+
+    /**
+     * Counts the visible-open confirmation read (ReplyAlerts.confirmOpened -> refreshVisible -> mergeLatest, which returns only after
+     * the merge). Call before the open. That read can publish the first visible content while the open's own newest-page read
+     * (showNewest, which always resets the older cursor) is still in flight.
+     */
+    private fun countOpenConfirmations() {
+        val innerOpened = app.presence.onOpened
+        app.presence.onOpened = { id -> presenceOpened.incrementAndGet(); innerOpened(id) }
+        val innerConfirm = app.replyAlerts.confirmOpened!!
+        app.replyAlerts.confirmOpened = { id -> try { innerConfirm(id) } finally { presenceConfirmed.incrementAndGet() } }
+    }
+
+    /** Both newest-page reads of an open have been applied: showNewest finished (it selects the conversation last) and so did the confirmation. */
+    private fun awaitOpenReadsApplied(stored: String, model: PhoneViewModel) =
+        waitFor("both newest-page reads of the open were applied") {
+            app.selectedConversationId == stored && presenceOpened.get() >= 1 && presenceConfirmed.get() == presenceOpened.get() && !model.state.value.opening
+        }
+
     private fun opened(stored: String): PhoneViewModel {
         val model = showWith(stored)
         openCard(model, stored)
@@ -84,8 +106,10 @@ class PhoneInternalEventVisibilityRoboTest : PhoneNavRoboBase() {
         val early = (base + 1..base + 30).toList()
         val late = (last - 29..last).toList()
         val model = showWith(alpha)
+        countOpenConfirmations()
         openCard(model, alpha)
         waitFor("the latest page is shown") { ids(model).isNotEmpty() && exists("message_$last") }
+        awaitOpenReadsApplied(alpha, model)
         assertEquals("only the 30 shown rows of the newest raw page", late, ids(model))
         assertTrue("older rows may exist", model.state.value.hasOlder)
         assertTrue("one scroll loads past the all-internal raw page", scrollUpUntil(60) { ids(model).size > 30 })

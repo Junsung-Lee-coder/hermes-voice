@@ -163,7 +163,11 @@ class PhoneWatchFinalFailureRoboTest : PhoneRoboBase() {
         reachable = false
         failFinally(400, SttCode.INPUT_REJECTED)
         uploadFrom(origin, turnId(6))
-        assertTrue(await { storedText().contains(turnId(6)) })
+        val failureStored = await { storedText().contains(turnId(6)) }
+        if (!failureStored) runCatching {
+            F06FailureSnapshot.emit(app, fake, java.io.File(app.dataDir, "shared_prefs"))
+        }
+        assertTrue(failureStored)
         app.settings.profile = "elsewhere"
         app.wiring()
         app.settings.profile = ""

@@ -83,8 +83,14 @@ data class PhoneUiState(
     val dashboardUrl: String = "",
     val profile: String = "",
     val signedIn: Boolean = false,
+    /** The latest progress or outcome, for logic and tests; not drawn (the screen carries no status prose). */
     val status: String = "",
-    val recoveryNotice: String? = null,
+    /** Why the user's last action did not happen (a refused or failed Talk, Live, send, sign-in or list action): the one line the screen
+     *  draws, beside Talk (or on the sign-in card); cleared by the next Talk or navigation. */
+    val failure: String? = null,
+    /** A reply-recovery failure the user must act on (storage, notifications), drawn beside Talk; other recovery notices are only logged. */
+    val recoveryNotice: RecoveryNotice? = null,
+    /** A device-storage failure of the local caches (recent messages, Live text context), drawn beside Talk while it lasts. */
     val cacheNotice: String? = null,
     val showArchived: Boolean = false,
     val conversations: List<AppConversation> = emptyList(),
@@ -124,6 +130,7 @@ data class PhoneUiState(
     val playFirst: Boolean = false,
     val playMiddle: Boolean = false,
     val watch: WatchSettings = WatchSettings(),
+    val live: com.rumi.hermesvoice.phone.live.PhoneLiveState = com.rumi.hermesvoice.phone.live.PhoneLiveState(),
     val themeMode: ThemeMode = ThemeMode.DARK,
     /** This phone's text size as a percent of the Android system font scale (80..140, default 100). */
     val fontScalePercent: Int = PhoneDisplaySettings.DEFAULT,
@@ -241,7 +248,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
             handsFreeMicrophone?.release()
             handsFreeMicrophone = null
             onHandsFreeEnded?.invoke(false)
-            _state.update { it.copy(voiceStatus = message) }
+            _state.update { it.copy(voiceStatus = message, failure = message) }
         }
     })
     private val _state = MutableStateFlow(initialState())
@@ -309,8 +316,10 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
         viewModelScope.launch { app.finalRecovery.revision.collect {
             _state.update { it.copy(conversations = app.finalRecovery.decorate(it.conversations)) }
         } }
-        viewModelScope.launch { app.finalRecovery.notice.collect { note -> _state.update { it.copy(recoveryNotice = note) } } }
-        viewModelScope.launch { app.cacheNotice.collect { note -> _state.update { it.copy(cacheNotice = note) } } }
+        // Only failures the user must act on are drawn beside Talk while they last. FinalRecovery logs its own notices by category; a cache
+        // failure is logged here by a fixed category (never the text).
+        viewModelScope.launch { app.finalRecovery.notices.collect { note -> _state.update { it.copy(recoveryNotice = note?.takeIf { n -> n.kind.actionable }) } } }
+        viewModelScope.launch { app.cacheNotice.collect { note -> if (note != null) Log.w(TAG, "storage notice kind=cache"); _state.update { it.copy(cacheNotice = note) } } }
         viewModelScope.launch { app.playbackDevice.collect { device -> _state.update { it.copy(playbackDevice = device) } } }
         // "Open the routed conversation": only requests made while this screen exists (never a replayed old one).
         viewModelScope.launch { app.routedOpen.collect { storedSessionId -> openRouted(storedSessionId) } }
@@ -338,10 +347,22 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
         refreshWatchStatus()
         app.headsetMedia.refresh()
         app.connectionCue.refresh()
+        viewModelScope.launch { app.sharedVoiceSettings.collect { settings -> if (settings != null) _state.update { it.copy(watch = settings) } } }
+        // A failure is taken from a change seen here, never from the app-wide state this screen found when it was created.
         viewModelScope.launch {
+            var first = true
+            app.live.state.collect { live ->
+                _state.update { it.copy(live = live, failure = (if (first) null else liveFailure(it.live, live)) ?: it.failure) }
+                first = false
+            }
+        }
+        viewModelScope.launch {
+            var first = true
             app.manualCapture.state.collect { capture ->
                 _state.update { it.copy(recording = capture.recording,
-                    voiceStatus = capture.voiceStatus.ifEmpty { it.voiceStatus }, micNotice = capture.micNotice) }
+                    voiceStatus = capture.voiceStatus.ifEmpty { it.voiceStatus }, micNotice = capture.micNotice,
+                    failure = (if (first) null else capture.failure) ?: it.failure) }
+                first = false
             }
         }
     }
@@ -430,7 +451,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
         _state.update { current ->
             if (selection.get() != generation || current.selected?.storedSessionId != sessionId) return@update current
             val prior = current.history.takeIf { current.historyNamespace == origin.namespace }.orEmpty()
-            val merged = HistoryPages.refreshLatest(prior, page.messages)
+            val merged = HistoryPages.refreshLatest(prior, page)
             // The cursor carries on only when the newest page shares a row with what is shown (nothing lies between them); otherwise
             // rows may have arrived in between, so the walk toward older rows starts again from the newest page.
             val shown = prior.mapTo(HashSet()) { it.rowId }
@@ -479,7 +500,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
     private fun wiringOrStatus(): PhoneApp.Wiring? = try {
         app.wiring().also { attachActivity(it.core) }
     } catch (error: IllegalArgumentException) {
-        _state.update { it.copy(status = error.message ?: "Dashboard URL is invalid") }
+        _state.update { it.copy(status = error.message ?: "Dashboard URL is invalid", failure = error.message ?: "Dashboard URL is invalid") }
         null
     }
 
@@ -523,12 +544,12 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
             cancelOlder()
             app.selectedConversationId = null
             _state.update { it.copy(signedIn = false, conversations = emptyList(), selected = null, history = emptyList(),
-                hasOlder = false, rawLoaded = 0, status = "Sign in to Hermes (${error.message})") }
+                hasOlder = false, rawLoaded = 0, status = "Sign in to Hermes (${error.message})", failure = "Sign in to Hermes (${error.message})") }
             return
         }
         val classified = DiagClassify.of(error)
         Log.w(TAG, "action failed cause=${classified.cause.wire}")
-        _state.update { it.copy(status = "Couldn't do that: ${DiagLabels.cause(classified.cause)}") }
+        _state.update { it.copy(status = "Couldn't do that: ${DiagLabels.cause(classified.cause)}", failure = "Couldn't do that: ${DiagLabels.cause(classified.cause)}") }
     }
 
     // ── connection & auth ────────────────────────────────────────────────────────────────────
@@ -543,7 +564,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
         app.settings.dashboardUrl = url
         app.settings.profile = profile
         // A bearer pair belongs to the dashboard that minted it; never replay it elsewhere.
-        if (changed) { closeViewer(); app.invalidateSessionTitles(); app.manualCapture.cancel("Connection changed"); app.connectionCue.cancel(); app.tokens.clear() }
+        if (changed) { closeViewer(); app.invalidateSessionTitles(); app.manualCapture.cancel("Connection changed", failed = false); app.connectionCue.cancel(); app.tokens.clear() }
         displayedListScope = app.sessionListScope()
         selection.incrementAndGet()
         listing.incrementAndGet()
@@ -572,8 +593,9 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
                 _state.update { it.copy(selected=null,history=emptyList(),historyNamespace=null,conversations=emptyList(),
                     draft="",attachments=emptyList(),pendingSends=emptyList(),failedSends=emptyList()) }
             }
-            _state.update { it.copy(status = message, signedIn = app.tokens.load() != null) }
-            if (app.tokens.load() != null) refresh()
+            val signedIn = app.tokens.load() != null
+            _state.update { it.copy(status = message, signedIn = signedIn, failure = if (signedIn) null else message) }
+            if (signedIn) refresh()
         }
     }
 
@@ -586,7 +608,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
         app.invalidateSessionTitles()
         app.tokens.clear()
         displayedListScope = null
-        app.manualCapture.cancel("Signed out")
+        app.manualCapture.cancel("Signed out", failed = false)
         app.connectionCue.cancel()
         app.phoneWake.onSignedOut()
         listing.incrementAndGet()
@@ -666,7 +688,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
                 if (current()) {
                     val classified = DiagClassify.of(error)
                     Log.w(TAG, "action failed cause=${classified.cause.wire}")
-                    _state.update { it.copy(status = "Couldn't do that: ${DiagLabels.cause(classified.cause)}") }
+                    _state.update { it.copy(status = "Couldn't do that: ${DiagLabels.cause(classified.cause)}", failure = "Couldn't do that: ${DiagLabels.cause(classified.cause)}") }
                 }
             }
         }
@@ -754,7 +776,8 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
         }
         if (!actionCurrent(origin)) return
         Log.w(TAG, "open after create failed cause=${DiagClassify.of(error).cause.wire}")
-        _state.update { it.copy(status = "Created '${owned.title}' (voice alias: ${owned.alias}), but couldn't open it. Tap it in the list to try again.") }
+        _state.update { it.copy(status = "Created '${owned.title}' (voice alias: ${owned.alias}), but couldn't open it. Tap it in the list to try again.",
+            failure = "Created '${owned.title}', but couldn't open it. Tap it in the list to try again.") }
     }
 
     private fun endArchiving() {
@@ -817,6 +840,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
         cancelOlder()
         val switching = _state.value.selected?.storedSessionId != session.storedSessionId
         if (switching) {
+            app.live.navigationStarted()
             // The screen is the target's from this moment: its own stashed draft, no history until its own page is known, no viewer of the old one.
             if (_state.value.viewer != null) closeViewer()
             val current = _state.value
@@ -866,7 +890,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
             drafts.remove(session.storedSessionId) ?: ("" to emptyList())
         }
         _state.update {
-            it.copy(selected = session, opening = false, historyNamespace = origin.namespace, history = if (it.selected?.storedSessionId == session.storedSessionId && it.historyNamespace == origin.namespace) HistoryPages.refreshLatest(it.history, page.messages) else page.messages, hasOlder = page.returned >= HISTORY_PAGE,
+            it.copy(selected = session, opening = false, historyNamespace = origin.namespace, history = if (it.selected?.storedSessionId == session.storedSessionId && it.historyNamespace == origin.namespace) HistoryPages.refreshLatest(it.history, page) else page.messages, hasOlder = page.returned >= HISTORY_PAGE,
                 pendingSends = PendingSends.reconcile(it.pendingSends, session.storedSessionId, page.messages),
                 rawLoaded = page.returned, olderEpoch = it.olderEpoch + 1,
                 olderBound = page.rawFloor() ?: Long.MAX_VALUE,
@@ -973,7 +997,10 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
                 return@update current
             }
             // New rows may have landed since the first page; rows already shown win, the others join in row-id order.
-            val known = current.history.mapTo(HashSet()) { it.rowId }
+            val shown = HistoryPages.withoutStale(current.history, page.suppressed, emptyList(), { it.rowId }, { it.messageUid })
+            val reconciled = current.copy(history = shown,
+                pendingSends = PendingSends.reconcile(current.pendingSends, sessionId, shown))
+            val known = shown.mapTo(HashSet()) { it.rowId }
             val fresh = page.messages.filter { it.rowId !in known }
             val floor = page.rawFloor()
             if (fresh.isEmpty() && floor != null && floor >= current.olderBound && page.returned >= HISTORY_PAGE) {
@@ -983,14 +1010,14 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
                 // (A short page of such rows is the end of the transcript: nothing older than the oldest row passed is left.)
                 if (pending != null && page.rawRows().toSet() == pending.rawRows().toSet()) {
                     step = OlderStep.STALLED
-                    return@update current.copy(olderError = true)
+                    return@update reconciled.copy(olderError = true)
                 }
                 step = OlderStep.SUSPECT
-                return@update if (pending == null) current else current.copy(rawLoaded = base + pending.returned)
+                return@update if (pending == null) reconciled else reconciled.copy(rawLoaded = base + pending.returned)
             }
             val more = page.returned >= HISTORY_PAGE
             step = if (fresh.isNotEmpty()) OlderStep.ADDED else if (more) OlderStep.SKIPPED else OlderStep.END
-            val combined = if (fresh.isEmpty()) current.history else (current.history + fresh).sortedBy { it.rowId }
+            val combined = if (fresh.isEmpty()) shown else (shown + fresh).sortedBy { it.rowId }
             current.copy(history = combined, pendingSends = PendingSends.reconcile(current.pendingSends, sessionId, combined),
                 hasOlder = more, rawLoaded = base + (pending?.returned ?: 0) + page.returned,
                 olderBound = minOf(current.olderBound, floor ?: Long.MAX_VALUE))
@@ -999,7 +1026,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
     }
 
     /** The user opened a conversation or changed screens: a routed turn accepted earlier no longer moves the screen. */
-    fun onUserNavigated() = app.routedNavigation.onManualNavigation()
+    fun onUserNavigated() { app.live.navigationStarted(); app.routedNavigation.onManualNavigation(); _state.update { it.copy(failure = null) } }
 
     /** A routed turn's conversation, opened because "Open the routed conversation" is on (see [PhoneApp.routedNavigation]). */
     private fun openRouted(storedSessionId: String) {
@@ -1059,7 +1086,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
                 _state.update { it.copy(attachments = (it.attachments + item).take(AttachmentPolicy.MAX_ATTACHMENTS)) }
             }.onFailure { error ->
                 ComposerDispatch.attachmentNotRead(app.diagnostics.log, error)
-                _state.update { it.copy(status = ComposerDispatch.attachmentNotReadStatus(error)) }
+                _state.update { it.copy(status = ComposerDispatch.attachmentNotReadStatus(error), failure = ComposerDispatch.attachmentNotReadStatus(error)) }
             }
         }
     }
@@ -1077,17 +1104,17 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
         while (true) {
             val current = _state.value
             if (!current.signedIn) {
-                _state.update { it.copy(status = "Sign in to Hermes first") }
+                _state.update { it.copy(status = "Sign in to Hermes first", failure = "Sign in to Hermes first") }
                 return
             }
             if (current.opening) {
-                _state.update { it.copy(status = "Opening this conversation…") }
+                _state.update { it.copy(status = "Opening this conversation…", failure = "Not sent: this conversation is still opening") }
                 return
             }
             val admission = ComposerDispatch.admit(current.selected?.storedSessionId, ComposerDraft(current.draft, current.attachments), app.textSends.ids.incrementAndGet(), app.diagnostics.log)
             when (admission) {
                 is SendAdmission.Refused -> {
-                    admission.reason?.let { reason -> _state.update { it.copy(status = reason) } }
+                    admission.reason?.let { reason -> _state.update { it.copy(status = reason, failure = reason) } }
                     return
                 }
                 is SendAdmission.Admitted -> {
@@ -1125,7 +1152,8 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
                     // Remove only this stale projection; never create another transport attempt.
                     _state.update { it.copy(pendingSends = PendingSends.remove(it.pendingSends, id),
                         sendsInFlight = maxOf(0, it.sendsInFlight - 1),
-                        status = "This request is no longer available for retry. Check the conversation") }
+                        status = "This request is no longer available for retry. Check the conversation",
+                        failure = "This request is no longer available for retry. Check the conversation") }
                 }
                 return
             }
@@ -1160,6 +1188,8 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
             it.copy(
                 sendsInFlight = inFlight,
                 status = if (status.isEmpty() && inFlight > 0) it.status else status,
+                // A send that failed is shown in the chat with its Retry; one that may have reached Hermes, or needs sign-in, is said here.
+                failure = if (result is ChatSendResult.Failed && failed == null) status.ifEmpty { null } ?: it.failure else it.failure,
                 signedIn = if (result is ChatSendResult.Failed && result.authRequired) false else it.signedIn,
                 failedSends = if (failed != null) ComposerDispatch.withFailed(it.failedSends.filterNot { f -> f.send.id == send.id }, failed) else it.failedSends,
                 pendingSends = if (failed != null || (result is ChatSendResult.Failed && result.delivery == com.rumi.hermesvoice.core.SendDelivery.POSSIBLY_SENT))
@@ -1350,9 +1380,11 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
 
     // ── phone push-to-talk ───────────────────────────────────────────────────────────────────
 
+
     fun toggleRecording() {
+        _state.update { it.copy(failure = null) }
         if (captures.tap()) return
-        app.manualCapture.toggle()
+        app.manualCapture.toggle()?.let { why -> _state.update { it.copy(failure = why) } }
     }
 
     override fun onHeadsetCommand(command: RecordingCommand): HeadsetOutcome {
@@ -1418,17 +1450,17 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
             try {
                 val outcome = wiring.core.orchestrator.run(request(turnId))
                 Log.i(TAG, "phone turn ${turnId.take(12)} outcome=${outcome.javaClass.simpleName}")
-                _state.update { it.copy(voiceStatus = VoiceOutcomeText.describe(outcome)) }
+                _state.update { it.copy(voiceStatus = VoiceOutcomeText.describe(outcome), failure = VoiceOutcomeText.describe(outcome).takeIf { outcome.failed() } ?: it.failure) }
                 reloadSelected()
             } catch (error: HermesAuthRequiredException) {
-                _state.update { it.copy(signedIn = false, status = "Sign in to Hermes (${error.message})") }
+                _state.update { it.copy(signedIn = false, status = "Sign in to Hermes (${error.message})", failure = "Sign in to Hermes (${error.message})") }
             } catch (error: kotlinx.coroutines.CancellationException) {
                 _state.update { it.copy(voiceStatus = "Stopped") }
                 throw error
             } catch (error: Exception) {
                 val classified = DiagClassify.of(error)
                 Log.w(TAG, "phone turn failed cause=${classified.cause.wire}")
-                _state.update { it.copy(status = "Couldn't send: ${DiagLabels.cause(classified.cause)}") }
+                _state.update { it.copy(status = "Couldn't send: ${DiagLabels.cause(classified.cause)}", failure = "Couldn't send: ${DiagLabels.cause(classified.cause)}") }
             }
         }
     }
@@ -1438,9 +1470,10 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
     /** Plays one unplayed reply again from its saved text; nothing is sent to Hermes again. */
     fun playAgain(reply: com.rumi.hermesvoice.core.voice.VoiceTurnOrchestrator.UnplayedReply) {
         val started = app.replayReply(reply.identity, reply.storedSessionId.takeIf { it.isNotEmpty() }) { heard, detail ->
-            _state.update { it.copy(voiceStatus = if (heard) "Reply played" else "Reply still not played: ${com.rumi.hermesvoice.core.headset.HeadsetText.fixedNote(detail)?.removePrefix("not played: ") ?: "try again, or read the text"}") }
+            val line = if (heard) "Reply played" else "Reply still not played: ${com.rumi.hermesvoice.core.headset.HeadsetText.fixedNote(detail)?.removePrefix("not played: ") ?: "try again, or read the text"}"
+            _state.update { it.copy(voiceStatus = line, failure = if (heard) it.failure else line) }
         }
-        if (!started) _state.update { it.copy(voiceStatus = "That reply can't be played again now") }
+        if (!started) _state.update { it.copy(voiceStatus = "That reply can't be played again now", failure = "That reply can't be played again now") }
     }
 
     /** Stops ONE pending request (the pending list's Stop); the global Stop (relay, later replies) is separate and unchanged. */
@@ -1457,7 +1490,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
      * Nothing else records or sends on the Phone: an accepted wake phrase may record or send its
      * request. A later reply does not count: the episode owns the microphone, so that reply was stopped.
      */
-    fun captureIdle(): Boolean = !recorder.isRecording && !pushToTalkOpening && captures.activeId == null &&
+    fun captureIdle(): Boolean = !app.live.active && !recorder.isRecording && !pushToTalkOpening && captures.activeId == null &&
         !_state.value.voiceBusy && app.phoneTurns.value == 0
 
     /** A hands-free request is being recorded (a tap on Talk sends it). */
@@ -1479,7 +1512,12 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
      * trailing silence (the setting now; a later change applies to the next request), on no
      * speech, or on a tap; a pause or opt-out cancels it unsent ([cancelHandsFree]).
      */
-    fun startHandsFree(silenceMs: Long, claimId: String? = null, held: MicrophoneClaim? = null): Boolean {
+    fun startHandsFree(silenceMs: Long, claimId: String? = null, held: MicrophoneClaim? = null,
+                       captureEnded: (() -> Unit)? = null): Boolean {
+        if (app.settings.watchSettings().phoneLiveEnabled) {
+            held?.release()
+            return app.live.start(wakeTurn = true, wakeClaimId = claimId, captureEnded = captureEnded)
+        }
         if (recorder.isRecording || pushToTalkOpening || _state.value.voiceBusy || app.phoneTurns.value > 0) {
             held?.release()
             return false
@@ -1563,6 +1601,10 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
 
     /** The recognizer heard the whole request with the wake phrase: one end pulse, then send it as text. */
     fun sendRecognizedRequest(text: String, claimId: String? = null, held: MicrophoneClaim? = null) {
+        if (app.settings.watchSettings().phoneLiveEnabled) {
+            held?.release()
+            app.live.start(recognizedText = text, wakeTurn = true, wakeClaimId = claimId); return // transfer the exact episode, never release before Live admission.
+        }
         if (!captureIdle()) {
             // Something else took the microphone in the meantime: say so instead of dropping it silently.
             Log.i(TAG, "phone recognized request not sent: busy (retry notice)")
@@ -1587,7 +1629,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
             "recognizer_error_12", "recognizer_error_13" -> "The speech recognizer lacks the wake phrase language"
             else -> return
         }
-        _state.update { it.copy(voiceStatus = notice) }
+        _state.update { it.copy(voiceStatus = notice, failure = notice) }
     }
 
     // ── settings ─────────────────────────────────────────────────────────────────────────────
@@ -1670,6 +1712,7 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
      * recording or a playback already on the headset is never changed by toggling it.
      */
     fun setUseHeadset(on: Boolean) {
+        if(app.settings.useHeadset!=on) app.live.headsetPolicyChanging()
         app.settings.useHeadset = on
         app.privateAudio.refresh()
         app.headsetMedia.refresh()
@@ -1736,8 +1779,21 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
     }
 
     /** Saves all shared voice settings as one Phone-owned snapshot (new revision) and publishes it to the Watch. */
+    fun setLiveIdleSeconds(text: String) {
+        val value = text.toIntOrNull()?.takeIf { it in 1..60 }
+        if (value == null) { _state.update { it.copy(status = "Live idle grace must be 1–60 whole seconds", failure = "Live idle grace must be 1–60 whole seconds") }; return }
+        updateWatch(app.settings.watchSettings().copy(liveIdleSeconds = value))
+    }
+
+    fun setLiveMode(device: VoiceOrigin, on: Boolean) {
+        val latest = app.settings.watchSettings()
+        updateWatch(if (device == VoiceOrigin.PHONE) latest.copy(phoneLiveEnabled = on) else latest.copy(watchLiveEnabled = on))
+    }
+
     fun updateWatch(settings: WatchSettings) {
         val saved = app.settings.saveWatchSettings(settings)
+        app.sharedVoiceSettings.value = saved
+        app.live.settingsChanged()
         _state.update { it.copy(watch = saved) }
         // The wake location may now exclude (or include) this Phone: background listening follows at once.
         app.phoneWake.onEligibilityChanged()
@@ -1797,3 +1853,34 @@ class PhoneViewModel(application: Application) : AndroidViewModel(application), 
         internal const val UNPLAYED_NOT_CLEARED = "Saved answers on this phone could not be removed yet. They stay hidden and are not played; removal is tried again."
     }
 }
+
+/** A voice request that did not reach Hermes, may have, or whose reply could not be played: said beside Talk. */
+internal fun com.rumi.hermesvoice.core.voice.VoiceTurnOutcome.failed(): Boolean = when (this) {
+    is com.rumi.hermesvoice.core.voice.VoiceTurnOutcome.NotAdmitted, com.rumi.hermesvoice.core.voice.VoiceTurnOutcome.NoSpeech,
+    is com.rumi.hermesvoice.core.voice.VoiceTurnOutcome.RoutingRejected, is com.rumi.hermesvoice.core.voice.VoiceTurnOutcome.NotDelivered,
+    is com.rumi.hermesvoice.core.voice.VoiceTurnOutcome.DeliveredResponseFailed -> true
+    else -> false
+}
+
+/**
+ * Why the Phone user's own Live did not start or broke off by itself, for the line beside Talk: a Phone call refused before it started,
+ * or one that ended with [com.rumi.hermesvoice.phone.live.PhoneLiveState.endFailed] (Android admission, audio route or focus, the
+ * provider's error, a setup failure). Null while it runs, for a Watch call (its own device says it), for the later finalization updates of
+ * an end, and for every routine end: Talk, the notification's Stop, a Stop from the Watch, Live OFF, idle, sign-out, navigation, the
+ * provider's own close. Only the reason is said, not what follows " · ".
+ */
+internal fun liveFailure(previous: com.rumi.hermesvoice.phone.live.PhoneLiveState, live: com.rumi.hermesvoice.phone.live.PhoneLiveState): String? {
+    if (live.active || live.origin != VoiceOrigin.PHONE) return null
+    val reason = liveReason(live) ?: return null
+    // The same end again (its finalization progress) is not a new failure.
+    if (!previous.active && previous.endReason == live.endReason && liveReason(previous) == reason) return null
+    return reason.takeIf { live.endFailed || live.endReason.isEmpty() }
+}
+
+/** The reason in a Live status, without its finalization progress; null for none. */
+internal fun liveReason(live: com.rumi.hermesvoice.phone.live.PhoneLiveState): String? =
+    live.status.substringBefore(" · ").trim().takeIf { it.isNotEmpty() }
+
+/** Why a Talk's Live start was refused or failed at once: a never-started refusal or a failed end; null for anything else. */
+internal fun liveRefusal(live: com.rumi.hermesvoice.phone.live.PhoneLiveState): String? =
+    liveReason(live)?.takeIf { !live.active && live.origin == VoiceOrigin.PHONE && (live.endReason.isEmpty() || live.endFailed) }

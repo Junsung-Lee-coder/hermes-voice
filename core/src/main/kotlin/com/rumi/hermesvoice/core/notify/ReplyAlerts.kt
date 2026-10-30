@@ -35,6 +35,8 @@ class FinalReply(
     val canonicalRowId: Long? = null,
     val namespace: String? = null,
     val sourceGeneration: Long? = null,
+    /** Exact original Watch notification custody; never inferred from a media/player route. */
+    val watchNode: String? = null,
 )
 
 /** What an alert carries to ANOTHER device (the Watch): identity and the conversation to open, nothing of the answer. */

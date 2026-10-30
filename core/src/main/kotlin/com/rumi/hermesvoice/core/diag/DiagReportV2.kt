@@ -186,6 +186,7 @@ object DiagReportV2 {
         "request_delivered_recorded_by_builds_before_schema_3_only_meant_the_transmission_ended_and_may_follow_a_failure",
         "stt_backend_and_model_are_unknown_to_the_app_the_server_log_has_them",
         "a_missing_field_is_unknown_not_zero",
+        "live_call_counts_are_app_side_observations_never_provider_receipts",
     )
 
     fun build(

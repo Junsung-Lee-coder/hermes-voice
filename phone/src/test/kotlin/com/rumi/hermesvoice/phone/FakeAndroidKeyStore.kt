@@ -24,9 +24,12 @@ import javax.crypto.SecretKey
  */
 object FakeAndroidKeyStore {
     private val keys = ConcurrentHashMap<String, SecretKey>()
+    private val reads = ThreadLocal.withInitial { intArrayOf(0) }
+    /** Key fetches made on the calling thread (on a device each one is a Keystore round trip). */
+    fun keyReadsOnThisThread(): Int = reads.get()[0]
 
     class Store : KeyStoreSpi() {
-        override fun engineGetKey(alias: String?, password: CharArray?): Key? = alias?.let { keys[it] }
+        override fun engineGetKey(alias: String?, password: CharArray?): Key? { reads.get()[0]++; return alias?.let { keys[it] } }
         override fun engineGetCertificateChain(alias: String?): Array<Certificate>? = null
         override fun engineGetCertificate(alias: String?): Certificate? = null
         override fun engineGetCreationDate(alias: String?): Date? = null

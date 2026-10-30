@@ -30,7 +30,7 @@ class HeadsetMediaWiringContractTest {
             assertFalse("HeadsetMedia.kt must not use $forbidden", media.contains(forbidden))
         }
         val manifest = source("phone/src/main/AndroidManifest.xml")
-        assertEquals("one on-demand microphone service was added", 4, Regex("<service\\s").findAll(manifest).count())
+        assertApprovedPhoneServiceCohort(manifest)
         assertFalse(manifest.contains("MEDIA_BUTTON"))
         assertFalse(manifest.contains("BIND_ACCESSIBILITY_SERVICE"))
     }

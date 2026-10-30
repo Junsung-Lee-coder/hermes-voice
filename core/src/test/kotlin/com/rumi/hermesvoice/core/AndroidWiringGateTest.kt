@@ -24,6 +24,53 @@ class AndroidWiringGateTest {
     private val watch = "watch/src/main/kotlin/com/rumi/hermesvoice/watch"
     private val phone = "phone/src/main/kotlin/com/rumi/hermesvoice/phone"
 
+    // Exact adapter expressions, not an optional trailing-argument regex: the foreground
+    // Live handoff must settle its matching wake owner, while legacy background stays intact.
+    private fun phoneCaptureWiring(port: String, foreground: Boolean): Boolean {
+        val call = port.substringAfter(
+            "override fun startRequestCapture(silenceMs: Long, claimId: String?): Boolean =", "")
+            .substringBefore("override fun cancelRequestCapture").trim().replace(Regex("\\s+"), " ")
+        val expected = if (foreground)
+            "hasMic() && model.startHandsFree(silenceMs, claimId, episodeMicrophone.take(), " +
+                "captureEnded = phoneWake.wake.liveCaptureSettlement())"
+        else "hasMic() && startCapture(silenceMs, claimId, episodeMicrophone.take())"
+        return call == expected
+    }
+
+    @Test
+    fun phoneCaptureWiringRejectsLostDuplicatedOrSubstitutedAuthority() {
+        var rejected = 0
+        for ((file, foreground) in listOf("$phone/MainActivity.kt" to true,
+                "$phone/PhoneBackgroundRuntime.kt" to false)) {
+            val port = source(file)
+            assertTrue(file, phoneCaptureWiring(port, foreground))
+            val changes = listOf(
+                "hasMic() && " to "",
+                "hasMic()" to "true",
+                "silenceMs, claimId," to "0L, claimId,",
+                "silenceMs, claimId," to "silenceMs, null,",
+                "silenceMs, claimId," to "silenceMs,",
+                "silenceMs, claimId," to "silenceMs, claimId, claimId,",
+                "episodeMicrophone.take()" to "null",
+                "episodeMicrophone.take()" to "otherMicrophone.take()",
+                "episodeMicrophone.take()" to "episodeMicrophone.take(), episodeMicrophone.take()",
+            ) + if (foreground) listOf(
+                ",\n                captureEnded = phoneWake.wake.liveCaptureSettlement()" to "",
+                "phoneWake.wake.liveCaptureSettlement()" to "otherWake.liveCaptureSettlement()",
+                "captureEnded = phoneWake.wake.liveCaptureSettlement()" to
+                    "captureEnded = phoneWake.wake.liveCaptureSettlement(), captureEnded = {}",
+            ) else emptyList()
+            for ((before, after) in changes) {
+                assertTrue("eligible mutation: $file $before", port.contains(before))
+                assertFalse("reject: $file $before -> $after",
+                    phoneCaptureWiring(port.replace(before, after), foreground))
+                rejected++
+            }
+        }
+        assertEquals(21, rejected)
+        println("TGATE_CAPTURE_WIRING_NEGATIVES=$rejected")
+    }
+
     @Test
     fun `right swipe and Back background the task and the system swipe-to-dismiss cannot finish it instead`() {
         val activity = source("$watch/WatchActivity.kt")
@@ -126,7 +173,7 @@ class AndroidWiringGateTest {
             watchActivity.substringAfter("override fun onPause()").substringBefore("voice.onActivityPaused()").contains("settingsPull?.cancel()"))
         val phoneActivity = source("$phone/MainActivity.kt")
         assertTrue(phoneActivity.contains("collect { phoneWake.wake.onSettings(it) }"))
-        assertTrue("the Phone recorder gets the snapshot", phoneActivity.contains("model.startHandsFree(silenceMs, claimId, episodeMicrophone.take())"))
+        assertTrue("the Phone recorder gets the snapshot", phoneCaptureWiring(phoneActivity, foreground = true))
         val model = source("$phone/PhoneViewModel.kt")
         assertTrue(model.contains("SilenceEndpoint(sampleRate = PhoneCapture.SAMPLE_RATE, silenceMs = silenceMs)"))
         assertTrue("the same capture lifecycle as the Watch", model.contains("private val captures = CaptureCoordinator(") &&
@@ -143,7 +190,7 @@ class AndroidWiringGateTest {
         assertTrue(bridge.contains("WakeClaimService.handle(wiring.core.wakeAdmission, nodeId, data)"))
         assertTrue(source("phone/src/main/AndroidManifest.xml").contains("android:path=\"/hv/v1/wake/claim\""))
         val phoneActivity = source("$phone/MainActivity.kt")
-        assertTrue(phoneActivity.contains("model.startHandsFree(silenceMs, claimId, episodeMicrophone.take())") &&
+        assertTrue(phoneCaptureWiring(phoneActivity, foreground = true) &&
             phoneActivity.contains("model.sendRecognizedRequest(request, claimId, episodeMicrophone.take())"))
         assertTrue(phoneActivity.contains("admission()?.claim(WakeClaim(claimId, VoiceOrigin.PHONE, \"\", settingsRevision, generation, epoch))"))
         val model = source("$phone/PhoneViewModel.kt")
@@ -224,7 +271,7 @@ class AndroidWiringGateTest {
         assertEquals(listOf("INTERNET", "RECORD_AUDIO", "VIBRATE", "FOREGROUND_SERVICE", "FOREGROUND_SERVICE_CONNECTED_DEVICE",
             "FOREGROUND_SERVICE_MICROPHONE", "FOREGROUND_SERVICE_MEDIA_PLAYBACK", "ACCESS_NETWORK_STATE", "CHANGE_NETWORK_STATE", "POST_NOTIFICATIONS", "WAKE_LOCK", "MODIFY_AUDIO_SETTINGS", "BLUETOOTH_CONNECT"),
             permissions(phoneManifest))
-        assertEquals(listOf("RECORD_AUDIO", "VIBRATE", "FOREGROUND_SERVICE", "FOREGROUND_SERVICE_MICROPHONE", "FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+        assertEquals(listOf("RECORD_AUDIO", "INTERNET", "ACCESS_NETWORK_STATE", "MODIFY_AUDIO_SETTINGS", "VIBRATE", "FOREGROUND_SERVICE", "FOREGROUND_SERVICE_MICROPHONE", "FOREGROUND_SERVICE_MEDIA_PLAYBACK",
             "POST_NOTIFICATIONS", "WAKE_LOCK"), permissions(watchManifest))
         for (manifest in listOf(phoneManifest, watchManifest)) {
             assertTrue(manifest.contains("<action android:name=\"android.speech.RecognitionService\" />"))
@@ -251,6 +298,8 @@ class AndroidWiringGateTest {
         assertTrue(watchService.contains("android:exported=\"false\"") && watchService.contains("android:foregroundServiceType=\"microphone|mediaPlayback\""))
         assertEquals("only the Data Layer listeners are exported", 1, Regex("<service[^>]*android:exported=\"true\"").findAll(phoneManifest).count())
         assertEquals(1, Regex("<service[^>]*android:exported=\"true\"").findAll(watchManifest).count())
+        val watchLiveService = watchManifest.substringAfter("android:name=\".WatchLiveVoiceService\"").substringBefore("/>")
+        assertTrue(watchLiveService.contains("android:exported=\"false\"") && watchLiveService.contains("android:foregroundServiceType=\"microphone|mediaPlayback\""))
         val relay = source("$phone/PhoneRelayService.kt")
         assertFalse(relay.substringBefore("class AndroidWakeLocks").let { it.contains("MICROPHONE") || it.contains("AudioRecord") || it.contains("SpeechRecognizer") })
     }
@@ -610,8 +659,7 @@ class AndroidWiringGateTest {
         for ((file, where) in listOf("$phone/MainActivity.kt" to "foreground", "$phone/PhoneBackgroundRuntime.kt" to "background")) {
             val port = source(file)
             assertTrue(where, port.contains("override fun holdMicrophone(held: Boolean) = episodeMicrophone.hold(held)"))
-            assertTrue(where, Regex("startRequestCapture\\(silenceMs: Long, claimId: String\\?\\): Boolean =\\s+hasMic\\(\\) && \\w+\\.?\\w*\\(silenceMs, claimId, episodeMicrophone\\.take\\(\\)\\)")
-                .containsMatchIn(port))
+            assertTrue(where, phoneCaptureWiring(port, foreground = where == "foreground"))
             assertTrue(where, port.contains("episodeMicrophone.take()") && Regex("episodeMicrophone\\.take\\(\\)").findAll(port).count() == 2)
         }
     }

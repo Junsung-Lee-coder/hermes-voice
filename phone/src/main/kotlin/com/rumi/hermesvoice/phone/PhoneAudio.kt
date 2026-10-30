@@ -177,6 +177,13 @@ class PhoneSpeakerSink(
      * is still waiting for it, and before this call resumes: never after a stop, an error or a lost focus.
      */
     override suspend fun playConfirmed(audio: SpokenAudio, cue: PlaybackCue, finished: () -> Unit) {
+        val gate = (context.applicationContext as? PhoneApp)?.liveAudioGate
+        val lease = gate?.playback()
+        if (gate != null && lease == null) throw com.rumi.hermesvoice.core.HermesPlaybackBusyException("Phone audio is owned by Live")
+        try { playOwned(audio, cue, finished) } finally { lease?.close() }
+    }
+
+    private suspend fun playOwned(audio: SpokenAudio, cue: PlaybackCue, finished: () -> Unit) {
         val extension = when {
             audio.mimeType.contains("ogg") -> "ogg"
             audio.mimeType.contains("wav") -> "wav"

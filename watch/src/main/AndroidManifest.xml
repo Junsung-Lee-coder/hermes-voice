@@ -3,6 +3,9 @@
 
     <uses-feature android:name="android.hardware.type.watch" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.VIBRATE" />
 
     <!-- The optional background session (WatchVoiceService), started only by the user from the
@@ -60,6 +63,10 @@
             android:name=".WatchListenerService"
             android:exported="true">
             <intent-filter>
+                <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
+                <data android:scheme="wear" android:host="*" android:path="/hv/v1/live/status" />
+            </intent-filter>
+            <intent-filter>
                 <action android:name="com.google.android.gms.wearable.CHANNEL_EVENT" />
                 <data android:scheme="wear" android:host="*" android:pathPrefix="/hv/v1/play/" />
             </intent-filter>
@@ -76,5 +83,6 @@
                 <data android:scheme="wear" android:host="*" android:path="/hv/v1/wake/epoch" />
             </intent-filter>
         </service>
+        <service android:name=".WatchLiveVoiceService" android:exported="false" android:foregroundServiceType="microphone|mediaPlayback" />
     </application>
 </manifest>

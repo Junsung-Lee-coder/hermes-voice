@@ -213,7 +213,8 @@ class MainActivity : ComponentActivity() {
         }
         override fun startRequestCapture(silenceMs: Long): Boolean = startRequestCapture(silenceMs, null)
         override fun startRequestCapture(silenceMs: Long, claimId: String?): Boolean =
-            hasMic() && model.startHandsFree(silenceMs, claimId, episodeMicrophone.take())
+            hasMic() && model.startHandsFree(silenceMs, claimId, episodeMicrophone.take(),
+                captureEnded = phoneWake.wake.liveCaptureSettlement())
         override fun cancelRequestCapture(reason: String) = model.cancelHandsFree(reason)
         override fun sendRecognized(request: String) = sendRecognized(request, null)
         override fun sendRecognized(request: String, claimId: String?) = model.sendRecognizedRequest(request, claimId, episodeMicrophone.take())
@@ -352,7 +353,7 @@ class MainActivity : ComponentActivity() {
         // this Phone's speaker closes an open window only (an episode under way owns the microphone). Idle
         // again may re-arm (once per visibility generation).
         lifecycleScope.launch {
-            combine(model.state.map { it.recording || it.voiceBusy }, PhoneApp.from(this@MainActivity).speakingLater) { busy, later ->
+            combine(model.state.map { it.recording || it.voiceBusy || it.live.active }, PhoneApp.from(this@MainActivity).speakingLater) { busy, later ->
                 if (busy) WakeBusy.VOICE else if (later) WakeBusy.SPEAKER else WakeBusy.IDLE
             }.distinctUntilChanged().collect { busy ->
                 when (busy) {
@@ -564,9 +565,8 @@ private fun PhoneScreen(model: PhoneViewModel, recognizerAvailable: Boolean, onT
         title = state.selected?.title?.takeIf { tab == Tab.CHAT } ?: "Hermes Voice",
         tab = tab,
         onBack = goBack,
-        statusLines = listOf(state.status, state.voiceStatus, state.micNotice.orEmpty(), state.recoveryNotice.orEmpty(), state.cacheNotice.orEmpty()),
         talkBar = if (!state.signedIn) null else ({
-            TalkBar(state, onStopPending = model::stopPending, onPlayAgain = model::playAgain, onBackgroundAnswers = requestBackgroundAnswers) {
+            TalkBar(state) {
                 val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
                     PackageManager.PERMISSION_GRANTED
                 if (granted) onTalk() else micPermission.launch(Manifest.permission.RECORD_AUDIO)
@@ -584,7 +584,7 @@ private fun PhoneScreen(model: PhoneViewModel, recognizerAvailable: Boolean, onT
                 model.openOrResume(it.owned)
                 tab = Tab.CHAT
             })
-            Tab.CHAT -> ChatTab(state, model, chatList, chatFollow, goBack)
+            Tab.CHAT -> ChatTab(state, model, chatList, chatFollow, goBack, requestBackgroundAnswers)
             Tab.SETTINGS -> SettingsTab(state, model, recognizerAvailable)
         }
     }
@@ -599,8 +599,9 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
 
 /**
  * The Phone's frame: title bar (a back arrow on Chat and Settings; on the list the New conversation plus and the Settings gear at the
- * far right), content, and at the bottom the one Talk bar (when signed in). The keyboard lifts the content (e.g. the chat composer)
- * by exactly what the bottom bar doesn't already cover: the bar's height is consumed as insets, so nothing is padded twice.
+ * far right), content, and at the bottom the one Talk bar (when signed in). No status prose: progress stays in the state and the
+ * log. The keyboard lifts the content (e.g. the chat composer) by exactly what the bottom bar doesn't already cover: the bar's
+ * height is consumed as insets, so nothing is padded twice.
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
@@ -608,7 +609,6 @@ internal fun PhoneChrome(
     title: String,
     tab: Tab,
     onBack: () -> Unit,
-    statusLines: List<String>,
     talkBar: (@Composable () -> Unit)?,
     onSettings: (() -> Unit)? = null,
     onNewConversation: (() -> Unit)? = null,
@@ -649,22 +649,20 @@ internal fun PhoneChrome(
         },
     ) { padding ->
         Column(Modifier.padding(padding).consumeWindowInsets(padding).imePadding().fillMaxSize()) {
-            statusLines.filter { it.isNotBlank() }.forEach {
-                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
-            }
             content()
         }
     }
 }
 
-/** Full-width push-to-talk (a 40dp button inside a 48dp touch target), within the horizontal safe area and above the navigation inset. */
+/**
+ * Full-width push-to-talk (a 40dp button inside a 48dp touch target), within the horizontal safe area and above the navigation inset.
+ * Above it only what needs the user: why the last action did not happen, and a failure the user must act on while it lasts (device
+ * storage, or reply alerts that could not be posted). A request's own Stop and a reply's Play again are in their conversation's chat
+ * ([ConversationVoiceActions]). The one stateful control also ends a preparing or active Phone Live; there is no Live panel.
+ */
 @Composable
 internal fun TalkBar(
     state: PhoneUiState,
-    onStopPending: (String) -> Unit = {},
-    onPlayAgain: (com.rumi.hermesvoice.core.voice.VoiceTurnOrchestrator.UnplayedReply) -> Unit = {},
-    onBackgroundAnswers: () -> Unit = {},
     onTalk: () -> Unit,
 ) {
     Surface(color = MaterialTheme.colorScheme.surfaceContainerLow) {
@@ -675,30 +673,17 @@ internal fun TalkBar(
                 .padding(horizontal = 16.dp, vertical = 4.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            PendingTurnsList(state.pending, onStopPending)
-            UnplayedRepliesList(state.unplayed, onPlayAgain)
-            if (state.unplayed.isNotEmpty()) BackgroundAnswersStatus(state, tag = "unplayed_background", onlyWhenNeeded = true, onTurnOn = onBackgroundAnswers)
-            if (!state.routingEnabled) {
-                // Routing off: where this phone's voice requests go, or that one has to be chosen first.
-                val target = state.selected
-                Text(target?.let { "Routing off: voice requests go to ${it.title.ifBlank { it.alias }}" }
-                    ?: "Routing off: open a conversation to send voice requests",
-                    style = MaterialTheme.typography.labelMedium, textAlign = TextAlign.Center,
-                    color = if (target == null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(bottom = 6.dp).testTag("routing_target"))
-            }
-            val handsFreeLine = when (state.handsFree) {
-                HandsFree.LISTENING -> "Listening for the wake phrase…"
-                HandsFree.GET_READY -> "Get ready…"
-                HandsFree.SPEAK_NOW -> "Speak now. It sends when you stop, or tap to send"
-                HandsFree.IDLE -> null
-            }
-            if (handsFreeLine != null) {
-                Text(handsFreeLine, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary,
-                    textAlign = TextAlign.Center, modifier = Modifier.padding(bottom = 6.dp).testTag("hands_free"))
+            state.failure?.let { ActionFailure(it) }
+            val recovery = state.recoveryNotice
+            when {
+                recovery != null -> ActionFailure(recovery.text, tag = if (recovery.kind == RecoveryNoticeKind.NOTIFICATIONS) "notification_failure" else "storage_failure")
+                state.cacheNotice != null -> ActionFailure(state.cacheNotice, tag = "storage_failure")
             }
             val capturing = state.handsFree == HandsFree.GET_READY || state.handsFree == HandsFree.SPEAK_NOW
-            val urgent = state.recording || capturing
+            val phoneLive = state.live.active && state.live.origin == VoiceOrigin.PHONE
+            // A Phone Live says on its own control whether speech can reach the provider yet; the microphone's colour only once it can.
+            val listening = phoneLive && state.live.listening
+            val urgent = state.recording || capturing || listening
             // The whole 48dp row is the touch target; the visible button inside it is 40dp (taller only when the text size needs it).
             Box(
                 Modifier.fillMaxWidth().heightIn(min = 48.dp).clip(RoundedCornerShape(24.dp))
@@ -712,12 +697,46 @@ internal fun TalkBar(
                     modifier = Modifier.fillMaxWidth().heightIn(min = 40.dp).testTag("talk_visual"),
                 ) {
                     Box(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), contentAlignment = Alignment.Center) {
-                        Text(if (state.recording) "Stop & send" else if (capturing) "Send now" else "Talk",
+                        if (phoneLive) Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(if (listening) "Listening" else if (state.live.started && state.live.muted) "Muted" else "Connecting…",
+                                fontSize = 14.sp, lineHeight = 18.sp, modifier = Modifier.padding(end = 12.dp).testTag("talk_live_state"))
+                            Text("End Live", fontSize = 20.sp, lineHeight = 24.sp, fontWeight = FontWeight.SemiBold)
+                        } else Text(if (state.recording) "Stop & send" else if (capturing) "Send now" else "Talk",
                             fontSize = 20.sp, lineHeight = 24.sp, fontWeight = FontWeight.SemiBold)
                     }
                 }
             }
         }
+    }
+}
+
+/** Why the user's last action did not happen (or a failure the user must act on), said once where the user acts next. */
+@Composable
+internal fun ActionFailure(text: String, tag: String = "action_failure") {
+    Text(text, style = MaterialTheme.typography.labelMedium, textAlign = TextAlign.Center, color = MaterialTheme.colorScheme.error,
+        modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp).testTag(tag))
+}
+
+/**
+ * One conversation's own voice actions, in its chat: each pending request routed to it, and any not yet routed (it may still go here),
+ * with its own Stop; each of its replies whose audio did not play, with Play again and the background-answers action. Drawing them
+ * stops, plays, records or sends nothing.
+ */
+@Composable
+internal fun ConversationVoiceActions(
+    state: PhoneUiState,
+    conversation: com.rumi.hermesvoice.core.sessions.OwnedSession,
+    onStopPending: (String) -> Unit,
+    onPlayAgain: (com.rumi.hermesvoice.core.voice.VoiceTurnOrchestrator.UnplayedReply) -> Unit,
+    onBackgroundAnswers: () -> Unit,
+) {
+    val pending = state.pending.filter { it.alias == null || it.alias.equals(conversation.alias, ignoreCase = true) }
+    val unplayed = state.unplayed.filter { it.storedSessionId.isEmpty() || it.storedSessionId == conversation.storedSessionId }
+    if (pending.isEmpty() && unplayed.isEmpty()) return
+    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+        PendingTurnsList(pending, onStopPending)
+        UnplayedRepliesList(unplayed, onPlayAgain)
+        if (unplayed.isNotEmpty()) BackgroundAnswersStatus(state, tag = "unplayed_background", onlyWhenNeeded = true, onTurnOn = onBackgroundAnswers)
     }
 }
 
@@ -955,6 +974,7 @@ private fun SignInScreen(state: PhoneUiState, model: PhoneViewModel) {
                 Text("Sign in to Hermes", style = MaterialTheme.typography.headlineSmall)
                 Text("Enter your Hermes dashboard address. Sign-in finishes in the browser and returns here.",
                     style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                state.failure?.let { ActionFailure(it) }
                 ConnectionFields(state, model, primaryAction = "Sign in")
             }
         }
@@ -990,7 +1010,8 @@ private fun ConnectionFields(state: PhoneUiState, model: PhoneViewModel, primary
 }
 
 @Composable
-private fun ChatTab(state: PhoneUiState, model: PhoneViewModel, listState: LazyListState, follow: ChatFollow, onBack: () -> Unit) {
+private fun ChatTab(state: PhoneUiState, model: PhoneViewModel, listState: LazyListState, follow: ChatFollow, onBack: () -> Unit,
+                    onBackgroundAnswers: () -> Unit) {
     val selected = state.selected
     if (selected == null) {
         Text("Open a conversation first.", Modifier.padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1047,6 +1068,7 @@ private fun ChatTab(state: PhoneUiState, model: PhoneViewModel, listState: LazyL
         onPreviewAttachment = model::previewAttachment,
         onOpenLink = { url -> LinkOpener.open(appContext, url)?.let(model::reportStatus) },
         onOpenMessageAttachment = openMessageAttachment,
+        voiceActions = { ConversationVoiceActions(state, selected, model::stopPending, model::playAgain, onBackgroundAnswers) },
     )
     AttachmentViewerHost(state.viewer, model)
 }
@@ -1172,6 +1194,8 @@ internal fun ChatPane(
     onBack: (() -> Unit)? = null,
     listState: LazyListState = remember(sessionKey) { LazyListState() },
     follow: ChatFollow = remember(sessionKey) { ChatFollow() },
+    /** This conversation's own pending-request Stop and Play again rows ([ConversationVoiceActions]), above its composer. */
+    voiceActions: @Composable () -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
     LaunchedEffect(listState) { follow.track(listState) }
@@ -1267,6 +1291,7 @@ internal fun ChatPane(
                 TextButton(onClick = { onDismissFailed(failed.send.id) }, modifier = Modifier.heightIn(min = 48.dp).testTag("dismiss_${failed.send.id}")) { Text("Dismiss") }
             }
         }
+        voiceActions()
         attachments.forEachIndexed { index, attachment ->
             Row(Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = { onPreviewAttachment(index) }, modifier = Modifier.weight(1f).heightIn(min = 48.dp).testTag("attachment_$index")) {
@@ -1331,6 +1356,11 @@ internal fun SettingsTab(state: PhoneUiState, model: PhoneViewModel, recognizerA
         }
 
         HorizontalDivider()
+        SwitchRow("Phone Live", state.watch.phoneLiveEnabled, tag = "phone_live_enabled", help = SettingsHelp.live("Phone"),
+            onChange = { model.setLiveMode(VoiceOrigin.PHONE, it) })
+        SwitchRow("Watch Live", state.watch.watchLiveEnabled, tag = "watch_live_enabled", help = SettingsHelp.live("Watch"),
+            onChange = { model.setLiveMode(VoiceOrigin.WATCH, it) })
+        LiveIdleRow(state.watch.liveIdleSeconds, model::setLiveIdleSeconds)
         SectionTitle("Spoken replies", SettingsHelp.spokenReplies())
         SwitchRow("Play first response", state.playFirst, onChange = model::setPlayFirst)
         SwitchRow("Play middle responses", state.playMiddle, onChange = model::setPlayMiddle)

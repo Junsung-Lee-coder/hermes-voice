@@ -166,7 +166,7 @@ object DiagReport {
 
     /** What a report is made of; the consent dialog lists exactly these. */
     val CONTENT_LINES = listOf(
-        "Events of this phone from the last 24 hours (at most 256), kept on the phone until you clear them: which step of a request ran (preparing, uploading, sending, waiting for or receiving the reply, speech, transfer to the Watch), failures as fixed categories such as timeout, no network or sign-in, counts, durations and how long ago each happened.",
+        "Events of this phone from the last 24 hours (at most 256), kept on the phone until you clear them: which step of a request ran (preparing, uploading, sending, waiting for or receiving the reply, speech, transfer to the Watch) or at which setup step a Live call failed, failures as fixed categories such as timeout, no network or sign-in, counts, durations and how long ago each happened.",
         "The same from the Watch, if it can be reached now (otherwise only a note that it is offline); the Watch keeps its own copy.",
         "App version, a hash of the installed app file, the export time, the network type (Wi-Fi, mobile, VPN) and whether Android has validated it, and which Settings switches are on.",
         "Request references are one-time pseudonyms that are only valid inside this file.",

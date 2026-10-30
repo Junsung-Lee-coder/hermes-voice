@@ -19,6 +19,7 @@ import com.rumi.hermesvoice.core.wake.WakeClaimService
 import com.rumi.hermesvoice.core.wake.WakeEpochItem
 import com.rumi.hermesvoice.core.watchlink.BoundedRead
 import com.rumi.hermesvoice.core.watchlink.PhoneReaderService
+import com.rumi.hermesvoice.core.watchlink.ReaderAccepted
 import com.rumi.hermesvoice.core.watchlink.ReaderError
 import com.rumi.hermesvoice.core.watchlink.ReaderRequest
 import com.rumi.hermesvoice.core.watchlink.ReaderResponse
@@ -27,9 +28,12 @@ import com.rumi.hermesvoice.core.watchlink.TurnStateMessage
 import com.rumi.hermesvoice.core.watchlink.WatchLinkPaths
 import com.rumi.hermesvoice.core.watchlink.WatchTransport
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Data Layer sends to the single Watch node a turn came from. Holds only the application
@@ -66,6 +70,9 @@ class DataLayerWatchTransport(context: Context, override val nodeId: String) : W
 class PhoneWatchListenerService : WearableListenerService() {
     override fun onChannelOpened(channel: ChannelClient.Channel) {
         val path = channel.path
+        if(path.startsWith(com.rumi.hermesvoice.core.live.WatchRelayAudio.PREFIX)||path.startsWith(com.rumi.hermesvoice.core.live.WatchLivePcm.PREFIX)){
+            PhoneApp.from(applicationContext).liveWatch.audioChannel(channel);return
+        }
         val turnId = WatchLinkPaths.turnIdFromPath(path) ?: return
         val context = applicationContext
         val app = PhoneApp.from(context)
@@ -103,6 +110,7 @@ class PhoneWatchListenerService : WearableListenerService() {
 
     override fun onMessageReceived(event: MessageEvent) {
         when (event.path) {
+            WatchLinkPaths.LIVE_CONTROL -> PhoneApp.from(this).liveWatch.receive(event.sourceNodeId, event.data)
             FinalRecovery.RECEIPT -> PhoneApp.from(this).finalRecovery.onReceipt(event.sourceNodeId, event.data)
             WatchLinkPaths.PLAYED -> {
                 val accepted = runCatching { PhoneApp.from(this).wiring().core.watchAcks.onPlayedMessage(event.sourceNodeId, event.data) }
@@ -185,24 +193,41 @@ class PhoneWatchListenerService : WearableListenerService() {
         val requestedNamespace = app.bodyScope()
         val url = app.settings.dashboardUrl
         val profile = app.settings.profile
+        // Tell the asking Watch, at once, that this app holds this exact request (also a repeat that is still being served): its own
+        // sendMessage succeeding says only that the message left the Watch. Best effort; the answer below is unchanged.
+        runCatching { Wearable.getMessageClient(context).sendMessage(nodeId, WatchLinkPaths.READER_ACCEPTED, ReaderAccepted.of(request).encode()) }
         val carriedRetries = app.readerLedger.admit(nodeId, request) ?: return
         var retriesSpent: Int? = null
+        var recovery = false
+        var recoveryScope: String? = null
         app.appScope.launch {
           try {
             if(app.bodyScope()!=requestedNamespace || app.settings.dashboardUrl!=url || app.settings.profile!=profile) return@launch
             val wiring = runCatching { app.wiring() }.getOrNull()
             val origin = wiring?.let(app::asyncActionOrigin)
+            fun current() = app.bodyScope() == requestedNamespace && app.settings.dashboardUrl == url && app.settings.profile == profile &&
+                origin != null && app.asyncActionCurrent(origin)
+            // A list part goes to the asking Watch at once, under the same account, connection and scope fences as the answer, without
+            // finals and without waiting for the Data Layer task: the answer below still settles the read.
+            val sendPart: suspend (ByteArray) -> Unit = part@{ bytes ->
+                val part = ReaderResponse.decode(bytes) ?: return@part
+                val currentScope = app.sessionListScope()
+                if (origin == null || currentScope == null || scope != currentScope || !current()) return@part
+                val scoped = app.finalRecovery.reader(nodeId, part.copy(scope = currentScope, bodyScope = origin.namespace)).copy(finals = emptyList())
+                if (scoped.ok && scoped.part > 0) runCatching { Wearable.getMessageClient(context).sendMessage(nodeId, WatchLinkPaths.READER_RESPONSE, scoped.encode()) }
+            }
             val response = when {
                 wiring == null -> ReaderResponse(request.reqId, request.kind, ok = false, error = ReaderError.NOT_CONFIGURED,
                     sessionId = request.sessionId).encode()
                 app.tokens.load() == null -> ReaderResponse(request.reqId, request.kind, ok = false, error = ReaderError.SIGN_IN_REQUIRED,
                     sessionId = request.sessionId).encode()
                 else -> {
-                    app.finalRecovery.requestReconcile(origin?.namespace)
-                    PhoneReaderService(wiring.core.sessions, readLog = { Log.i(TAG, it) }, stillCurrent = {
-                        app.bodyScope() == requestedNamespace && app.settings.dashboardUrl == url && app.settings.profile == profile &&
-                            origin != null && app.asyncActionCurrent(origin)
-                    }).handle(data, carriedRetries) { retriesSpent = it }
+                    // App-owned recovery is requested once this read was answered, not here, where its own list and history reads
+                    // would compete with the Watch's read on the same dashboard.
+                    recovery = true
+                    recoveryScope = origin?.namespace
+                    PhoneReaderService(wiring.core.sessions, readLog = { Log.i(TAG, it) }, stillCurrent = ::current)
+                        .handle(data, carriedRetries, onPart = sendPart) { retriesSpent = it }
                 }
             } ?: return@launch
             val currentScope = app.sessionListScope()
@@ -218,19 +243,31 @@ class PhoneWatchListenerService : WearableListenerService() {
                 ReaderResponse(request.reqId, request.kind, ok = false, error = ReaderError.UNAVAILABLE,
                     sessionId = request.sessionId, scope = currentScope)
             val scopedBytes = if (scoped.ok && scoped.scope != null) app.finalRecovery.reader(nodeId, scoped).encode() else scoped.encode()
-            val sent = runCatching {
-                Wearable.getMessageClient(context).sendMessage(nodeId, WatchLinkPaths.READER_RESPONSE, scopedBytes).await()
+            // The LOCAL wait for this answer's Data Layer task is bounded (as FinalRecovery.send): when it ends unresolved the delivery is
+            // UNKNOWN. The task is neither cancelled nor sent again, and the read is released below either way; no outcome is a receipt.
+            val sent: Boolean? = try {
+                withTimeoutOrNull(ANSWER_SEND_WAIT_MS) {
+                    Wearable.getMessageClient(context).sendMessage(nodeId, WatchLinkPaths.READER_RESPONSE, scopedBytes).await()
+                    true
+                }
+            } catch (error: Exception) {
+                currentCoroutineContext().ensureActive()
+                false
             }
             Log.i(TAG, "reader ${request.kind.wire} req=${request.reqId.take(12)} to=${nodeId.take(8)} bytes=${response.size} " +
-                "sent=${sent.isSuccess}")
+                "sent=${sent ?: "unknown"}")
           } finally {
             app.readerLedger.finish(nodeId, request.reqId, retriesSpent)
+            if (recovery) app.finalRecovery.requestReconcile(recoveryScope)
           }
         }
     }
 
     companion object {
         private const val TAG = "HermesVoiceWatch"
+
+        /** The local wait for a reader answer's Data Layer task; its delivery is unknown after it. */
+        private const val ANSWER_SEND_WAIT_MS = 5_000L
     }
 }
 

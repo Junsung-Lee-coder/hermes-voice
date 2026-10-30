@@ -93,4 +93,62 @@ class DiagWireFallbackTest {
         assertTrue(three.getJSONArray("reading").toString().contains("request_transmission_ended_is_bookkeeping_and_never_proof_of_delivery"))
         assertFalse(two.getJSONArray("reading").toString().contains("bookkeeping"))
     }
+
+    /** Looked up by wire word: a Live setup failure is a schema 3 kind of fixed words that older readers never get and the journal keeps. */
+    @Test
+    fun liveSetupFailureIsASchema3KindOfFixedWordsThatOlderReadersNeverSeeAndTheJournalKeeps() {
+        val code = DiagCode.fromWire("live_setup_failed")
+        val session = DiagStage.fromWire("live_session")
+        assertNotNull("a Live setup failure is a whitelisted kind", code)
+        assertNotNull("its setup step is a fixed word", session)
+        assertFalse("never in a schema 1 answer", code!!.legacy)
+        assertTrue("introduced with schema 3", code.v3)
+        val wall = 1_800_000_000_000L
+        val log = DiagLog(clock = { 9_000L }, wallClock = { wall })
+        val secret = "SENTINEL-provider-body sk-live-SECRET https://hermes.example/api/audio/voice-live/session"
+        log.recordFailure(code, HermesHttpException(502, "/api/audio/voice-live/session failed (502): $secret"), DiagOrigin.WATCH, stage = session)
+        val event = log.snapshot().single()
+        assertEquals(DiagFail.REFUSED, event.fail)
+        assertEquals(DiagCause.REJECTED, event.cause)
+        assertEquals(502, event.status)
+        assertEquals(null, event.ref)
+        val r = responder(log)
+        val one = DiagWire.decodeResponse(r.answer(DiagWire.encodeRequest(salt))!!, salt)
+        val two = DiagWireV2.decodeResponse(r.answer(DiagWire.encodeRequestV2(salt))!!, salt)
+        val three = DiagWireV2.decodeResponse(r.answer(DiagWire.encodeRequestV3(salt))!!, salt, DiagWireV2.SCHEMA_3)
+        assertEquals(WatchDiagStatus.REACHABLE, one.status)
+        assertEquals(WatchDiagStatus.REACHABLE, two.status)
+        assertEquals(WatchDiagStatus.REACHABLE, three.status)
+        assertTrue("older readers are never handed the newer kind", one.events.isEmpty() && two.events.isEmpty())
+        val wire = three.events.single()
+        assertEquals(code, wire.code)
+        assertEquals(session, wire.stage)
+        assertEquals(502, wire.status)
+        assertEquals(DiagCause.REJECTED, wire.cause)
+        assertEquals(null, wire.ref)
+        val coverage = WireCoverage.of(log.coverage(), DiagPersistStatus.NOT_ENABLED)
+        val report3 = DiagReportV2.build(0L, app, log.snapshot(), 9_000L, salt, coverage, DiagNetwork.UNKNOWN,
+            WatchDiag(WatchDiagStatus.OFFLINE), emptyMap(), DiagWireV2.SCHEMA_3)
+        val report2 = DiagReportV2.build(0L, app, log.snapshot(), 9_000L, salt, coverage, DiagNetwork.UNKNOWN,
+            WatchDiag(WatchDiagStatus.OFFLINE), emptyMap(), DiagWireV2.SCHEMA)
+        assertTrue(report3.contains("\"live_setup_failed\"") && report3.contains("\"live_session\""))
+        assertFalse(report2.contains("live_setup_failed") || report2.contains("live_session"))
+        var stored: ByteArray? = null
+        val storage = object : DiagJournalStorage {
+            override fun read(maxBytes: Int): ByteArray? = stored
+            override fun write(bytes: ByteArray) { stored = bytes }
+            override fun delete() { stored = null }
+        }
+        DiagJournal(log, storage, java.util.concurrent.Executor { it.run() }).flushNow()
+        val restarted = DiagLog(clock = { 20_000L }, wallClock = { wall + 1_000L })
+        DiagJournal(restarted, storage, java.util.concurrent.Executor { it.run() }).restoreNow()
+        val restored = restarted.snapshot().single()
+        assertEquals(code, restored.code)
+        assertEquals(session, restored.stage)
+        assertEquals(502, restored.status)
+        assertEquals(DiagOrigin.WATCH, restored.origin)
+        for (text in listOf(report3, report2, String(stored!!, Charsets.UTF_8))) {
+            assertFalse(text, text.contains("SENTINEL") || text.contains("sk-live") || text.contains("hermes.example") || text.contains("voice-live"))
+        }
+    }
 }

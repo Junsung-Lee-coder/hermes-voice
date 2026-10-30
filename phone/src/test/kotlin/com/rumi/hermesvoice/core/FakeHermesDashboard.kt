@@ -241,6 +241,8 @@ class FakeHermesDashboard : AutoCloseable {
         var endReason: String? = null
         var endedAt: Double? = null
         var startedAt: Double = 1_700_000_000.0
+        /** sessions.pinned: the list back-fills every pinned row a page window missed (see the list route). */
+        var pinned: Boolean = false
     }
     /** Script for sessions created with a given source (e.g. the router), set before they exist. */
     val sourceScripts = HashMap<String, (String) -> List<Pair<String, JSONObject?>>>()
@@ -288,6 +290,10 @@ class FakeHermesDashboard : AutoCloseable {
 
     /** Called with the offset and the archived filter of every `GET /api/sessions`, before the page is built (a test latches the page or changes the rows here). */
     @Volatile var listPageHook: ((Int, String) -> Unit)? = null
+
+    /** Called first for every sessions read with a fixed label: "list:" plus its order ("recent" when none is asked), "detail",
+     * "messages" or "reconciliation". A test can serve them one at a time here, as a dashboard that answers one read at a time does. */
+    @Volatile var sessionsReadHook: ((String) -> Unit)? = null
 
     /** Called with the session id and the requested archived flag of every `PATCH /api/sessions/{id}`, before it is answered (a test latches the request here). */
     @Volatile var archiveHook: ((String, Boolean) -> Unit)? = null
@@ -550,6 +556,7 @@ class FakeHermesDashboard : AutoCloseable {
             if (kind != null) {
                 val at = url.queryParameter("offset")?.toIntOrNull() ?: 0
                 readArrivals += Triple(kind, at, System.nanoTime() / 1_000_000)
+                sessionsReadHook?.invoke(if (kind == "list") "list:" + (url.queryParameter("order") ?: "recent") else kind)
                 readFault?.invoke(kind, at)?.let { return it }
             }
         }
@@ -559,7 +566,7 @@ class FakeHermesDashboard : AutoCloseable {
             val source = url.queryParameter("source")
             val sources = csv(url, "sources")
             val excluded = csv(url, "exclude_sources")
-            val matching = synchronized(rows) { rows.values.toList() }.filter { row ->
+            val admitted = synchronized(rows) { rows.values.toList() }.filter { row ->
                 !isCompressionChild(row) && !row.hidden && (source == null || row.source == source) && (sources.isEmpty() || row.source in sources) &&
                     row.source !in excluded && when (archived) {
                     "only" -> row.archived
@@ -567,12 +574,22 @@ class FakeHermesDashboard : AutoCloseable {
                     else -> !row.archived
                 }
             }.reversed()
+            // order=created is `ORDER BY s.started_at DESC` (same rows); rows sharing a start keep the default order here.
+            val matching = if (url.queryParameter("order") == "created") admitted.sortedByDescending { it.startedAt } else admitted
             val limit = url.queryParameter("limit")?.toInt() ?: 20
             val offset = url.queryParameter("offset")?.toInt() ?: 0
             if (listDelayMs > 0) Thread.sleep(listDelayMs)
             if (failListFromOffset in 0..offset) return json(503, JSONObject().put("detail", "database is busy"))
             val page = matching.drop(offset).take(limit)
-            return json(200, JSONObject().put("sessions", org.json.JSONArray().apply { page.forEach { put(listRowJson(it)) } })
+            // hermes_state_sessions.list_sessions_rich include_pinned (both orders): every pinned row of the other filters that this window
+            // missed, archived or not (hidden only in the archived view), is appended after the window, newest started first. total counts
+            // the listed view only.
+            val inPage = page.map { it.id }.toSet()
+            val pins = synchronized(rows) { rows.values.toList() }.filter { row ->
+                row.pinned && row.id !in inPage && !isCompressionChild(row) && (archived == "only" || !row.hidden) &&
+                    (source == null || row.source == source) && (sources.isEmpty() || row.source in sources) && row.source !in excluded
+            }.reversed().sortedByDescending { it.startedAt }
+            return json(200, JSONObject().put("sessions", org.json.JSONArray().apply { (page + pins).forEach { put(listRowJson(it)) } })
                 .put("total", matching.size).put("limit", limit).put("offset", offset))
         }
         if (segments == listOf("search") && request.method == "GET") {
@@ -624,7 +641,7 @@ class FakeHermesDashboard : AutoCloseable {
         url.queryParameter(name)?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }?.toSet().orEmpty()
 
     private fun rowJson(row: Row) = JSONObject().put("id", row.id).put("source", row.source).put("title", row.title)
-        .put("archived", row.archived).put("started_at", row.startedAt).put("last_active", 1_700_000_100.0)
+        .put("archived", row.archived).put("pinned", row.pinned).put("started_at", row.startedAt).put("last_active", 1_700_000_100.0)
         .put("message_count", row.messages.size).put("preview", row.messages.lastOrNull()?.optString("content").orEmpty())
         .put("parent_session_id", row.parentId ?: JSONObject.NULL).put("end_reason", row.endReason ?: JSONObject.NULL)
         .put("ended_at", row.endedAt ?: JSONObject.NULL)

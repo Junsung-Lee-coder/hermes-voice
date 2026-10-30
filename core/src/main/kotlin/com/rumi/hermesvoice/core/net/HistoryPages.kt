@@ -12,4 +12,27 @@ object HistoryPages {
         val pageIds = latestPage.mapTo(HashSet()) { it.rowId }
         return current.filter { it.rowId < oldestNew && it.rowId !in pageIds } + latestPage
     }
+
+    /** As above, and a stale copy the page positively identifies (a row it hides, or a stable uid now at another row id) goes too. */
+    fun refreshLatest(current: List<HistoryMessage>, page: HistoryPage): List<HistoryMessage> {
+        val kept = withoutStale(current, page.suppressed, page.messages.map { SuppressedRow(it.rowId, it.messageUid) }, { it.rowId }, { it.messageUid })
+        return if (page.messages.isEmpty()) kept else refreshLatest(kept, page.messages)
+    }
+
+    /**
+     * Drops from [current] only what the page names: a [hidden] row by row id (unless both uids are known and differ) or by uid, and a
+     * [shown] uid that now sits at another row id. Nothing else is touched, whatever its words.
+     */
+    fun <T> withoutStale(current: List<T>, hidden: List<SuppressedRow>, shown: List<SuppressedRow>, rowId: (T) -> Long, uid: (T) -> String): List<T> {
+        if (hidden.isEmpty() && shown.none { it.uid.isNotEmpty() }) return current
+        val hiddenById = hidden.groupBy { it.rowId }
+        val hiddenUids = hidden.mapNotNullTo(HashSet()) { it.uid.takeIf(String::isNotEmpty) }
+        val shownUids = shown.filter { it.uid.isNotEmpty() }.groupBy { it.uid }
+        return current.filterNot { row ->
+            val id = rowId(row)
+            val u = uid(row)
+            hiddenById[id]?.any { it.uid.isEmpty() || u.isEmpty() || it.uid == u } == true ||
+                (u.isNotEmpty() && (u in hiddenUids || shownUids[u]?.any { it.rowId != id } == true))
+        }
+    }
 }

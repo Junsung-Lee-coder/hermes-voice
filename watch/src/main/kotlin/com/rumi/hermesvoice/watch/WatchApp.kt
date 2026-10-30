@@ -45,6 +45,7 @@ import com.rumi.hermesvoice.core.watchlink.PlayProgress
 import com.rumi.hermesvoice.core.watchlink.PlayRequest
 import com.rumi.hermesvoice.core.watchlink.PlayedAck
 import com.rumi.hermesvoice.core.watchlink.PrivateAudioReceipt
+import com.rumi.hermesvoice.core.watchlink.ReaderAccepted
 import com.rumi.hermesvoice.core.watchlink.ReaderKind
 import com.rumi.hermesvoice.core.watchlink.ReaderMessageRow
 import com.rumi.hermesvoice.core.watchlink.ReaderRequest
@@ -143,13 +144,24 @@ class WatchApp : Application() {
     val talk: StateFlow<WatchTalkState> = _talk
     private val _settings = MutableStateFlow(WatchSettings())
     val settings: StateFlow<WatchSettings> = _settings
-    private val _reader = MutableStateFlow(WatchReaderState())
+    val live: WatchLiveVoiceRuntime by lazy { WatchLiveVoiceRuntime(this, ::phoneNode) }
+    private val _reader = MutableStateFlow(WatchReaderState(surface = ReaderSurface.SESSIONS))
 
-    /** Conversation reader: session browser and the selected conversation's cached history. */
+    /** Conversation reader: session browser and the selected conversation's cached history. The Watch starts on the browser (no home screen). */
     val reader: StateFlow<WatchReaderState> = _reader
 
     /** The Phone node each pending reader request went to; a response from any other node is ignored. */
     private val readerTargets = ConcurrentHashMap<String, String>()
+
+    /** How long one request ([dispatch]) waits for its answer: the first window, or the accepted one once [node] itself accepted it inside it. */
+    private class ReaderWindow(val request: ReaderRequest, val startedAt: Long) {
+        @Volatile var acceptedBy: String? = null
+        fun endsAt(node: String): Long = startedAt +
+            if (acceptedBy == node) WatchReaderLimits.ACCEPTED_REQUEST_TIMEOUT_MS else WatchReaderLimits.REQUEST_TIMEOUT_MS
+    }
+
+    /** The window of each request being sent or waited for; [onReaderAccepted] can change only one it finds here. */
+    private val readerWindows = ConcurrentHashMap<String, ReaderWindow>()
 
     private val readerTitleWrites = Mutex()
     private val readerTitleEpoch = java.util.concurrent.atomic.AtomicLong()
@@ -213,6 +225,7 @@ class WatchApp : Application() {
         val epoch = readerTitleEpoch.incrementAndGet()
         if (clearState) {
             readerTargets.clear()
+            readerWindows.clear()
             updateReader { WatchReaderState(surface = ReaderSurface.SESSIONS) }
         }
         this.scope.launch(Dispatchers.IO) {
@@ -336,6 +349,7 @@ class WatchApp : Application() {
         if (result == ReplicaUpdate.APPLIED) {
             getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_SETTINGS, current.toJson()).apply()
             _settings.value = current
+            live.settingsChanged()
             // The Phone's headset is the only output now: what plays here stops (the Phone is told it was not played).
             if (current.privateAudio) stopPlayback(PRIVATE_HEADSET)
         }
@@ -436,6 +450,14 @@ class WatchApp : Application() {
         currentCoroutineContext().ensureActive()
         Result.failure(error)
     }
+
+    /**
+     * One reader Data Layer call ([dataLayerCall]) whose LOCAL wait ends with what is left of the request's first window ([leftMs]); null
+     * when it ended unresolved. That is neither a failure nor a success of the call: the handed-off Task is not cancelled and may still
+     * complete, unobserved.
+     */
+    private suspend fun <T> readerCall(leftMs: Long, call: suspend () -> T): Result<T>? =
+        if (leftMs <= 0) null else withTimeoutOrNull(leftMs) { dataLayerCall(call) }
 
     fun newTurn(trigger: TurnTrigger): String? {
         val turnId = UUID.randomUUID().toString()
@@ -783,7 +805,7 @@ class WatchApp : Application() {
     fun loadSessions() {
         val reqId = newRequestId()
         updateReader { it.requestSessions(reqId) }
-        dispatch(ReaderRequest(reqId, ReaderKind.SESSIONS))
+        dispatch(ReaderRequest(reqId, ReaderKind.SESSIONS, progress = true))
     }
 
     /**
@@ -827,7 +849,7 @@ class WatchApp : Application() {
         if (_reader.value.selectedSessionId != sessionId || !presence.isVisible(sessionId)) return false
         if (_reader.value.historyFor(sessionId)?.pendingReqId == null) refreshSelected()
         if (_reader.value.historyFor(sessionId)?.pendingReqId != null) {
-            withTimeoutOrNull(WatchReaderLimits.REQUEST_TIMEOUT_MS + READ_WAIT_SLACK_MS) {
+            withTimeoutOrNull(WatchReaderLimits.ACCEPTED_REQUEST_TIMEOUT_MS + READ_WAIT_SLACK_MS) {
                 _reader.first { it.selectedSessionId != sessionId || it.historyFor(sessionId)?.pendingReqId == null }
             } ?: return false
         }
@@ -893,6 +915,7 @@ class WatchApp : Application() {
     fun openFromReplyAlert(sessionId: String) = selectSession(sessionId)
 
     fun selectSession(sessionId: String) {
+        live.navigationChanged()
         navigationGuard.onUserNavigation()
         val alreadyVisible = presence.isVisible(sessionId)
         openConversation(sessionId)
@@ -953,10 +976,23 @@ class WatchApp : Application() {
         request?.let(::dispatch)
     }
 
+    /**
+     * The left swipe, and Back or the right swipe from a history (WatchActivity): browser <-> the selected conversation's history.
+     * With nothing selected on the browser nothing changes, so it returns before any side effect: an active Watch Live goes on. Any
+     * real switch is reader navigation and, like selecting a conversation, ends the Watch Live locally first (accepted Hermes work goes on).
+     */
     fun toggleReaderSurface() {
+        // Only the browser and a selected conversation's history exist: with nothing selected the browser stays.
+        if (_reader.value.surface == ReaderSurface.SESSIONS && _reader.value.selectedHistory == null) return
+        live.navigationChanged()
         navigationGuard.onUserNavigation()
         updateReader { it.toggleSurface() }
         if (_reader.value.surface == ReaderSurface.SESSIONS) loadSessions()
+    }
+
+    /** A fresh launcher open shows the browser; the selection, its cached history and the voice session are kept (the resume re-reads the list). */
+    fun openSelector() {
+        if (_reader.value.surface != ReaderSurface.SESSIONS) updateReader { it.showSurface(ReaderSurface.SESSIONS) }
     }
 
     fun onReaderResponse(sourceNodeId: String, bytes: ByteArray) {
@@ -966,6 +1002,7 @@ class WatchApp : Application() {
             Log.w(TAG, "reader response ignored req=${response.reqId.take(12)} (not pending from this node)")
             return
         }
+        if (response.part > 0) return onReaderPart(sourceNodeId, response)
         // Do not consume transport custody for a valid node's wrong kind/session/page. The
         // reducer ignores these too, but retaining the target lets the real reply or timeout settle.
         val pending = _reader.value
@@ -1026,6 +1063,40 @@ class WatchApp : Application() {
             "sessions=${response.sessions.size} messages=${response.messages.size} has_older=${response.hasOlder}")
     }
 
+    /**
+     * The Phone app says it holds exactly the request it names ([ReaderAccepted]). Only from the node that request went to, only for the
+     * same id, kind, conversation and page while it is still the pending one, and only inside its first window: that request may then be
+     * answered until [WatchReaderLimits.ACCEPTED_REQUEST_TIMEOUT_MS] after its first try. Anything else changes nothing.
+     */
+    fun onReaderAccepted(sourceNodeId: String, bytes: ByteArray) {
+        val accepted = ReaderAccepted.decode(bytes) ?: return
+        val window = readerWindows[accepted.reqId] ?: return
+        val elapsed = SystemClock.elapsedRealtime() - window.startedAt
+        if (readerTargets[accepted.reqId] != sourceNodeId || !accepted.matches(window.request) || !readerRequestPending(window.request) ||
+            elapsed >= WatchReaderLimits.REQUEST_TIMEOUT_MS) return
+        window.acceptedBy = sourceNodeId
+        Log.i(TAG, "reader accepted kind=${accepted.kind.wire} elapsed_ms=$elapsed")
+    }
+
+    /**
+     * A list part of the pending read from the node it went to ([ReaderResponse.part]): shown at once, the read stays open and its
+     * transport custody stays. Only for the account the Watch already shows (a different one waits for the settling answer, which
+     * invalidates); it is not saved here, though another display-saving callback ([saveReaderTitles]) may persist the merged same-account
+     * rows, display-only. It counts as the Phone app answering inside the first window.
+     */
+    private fun onReaderPart(sourceNodeId: String, response: ReaderResponse) {
+        val bodyNamespace = response.bodyScope ?: response.scope
+        if (response.kind != ReaderKind.SESSIONS || !response.ok || response.scope == null || _reader.value.sessions.pendingReqId != response.reqId) return
+        if ((readerTitleScope != null && readerTitleScope != response.scope) || (readerBodyScope != null && readerBodyScope != bodyNamespace)) return
+        readerWindows[response.reqId]?.let { window ->
+            if (window.acceptedBy == null && SystemClock.elapsedRealtime() - window.startedAt < WatchReaderLimits.REQUEST_TIMEOUT_MS) window.acceptedBy = sourceNodeId
+        }
+        readerTitleScope = response.scope
+        readerBodyScope = bodyNamespace
+        updateReader { it.onPart(response) }
+        Log.i(TAG, "reader part kind=${response.kind.wire} part=${response.part} rows=${response.sessions.size}")
+    }
+
     private fun readerRequestPending(request: ReaderRequest): Boolean {
         val pending = _reader.value
         if (request.kind == ReaderKind.SESSIONS) return pending.sessions.pendingReqId == request.reqId
@@ -1039,15 +1110,26 @@ class WatchApp : Application() {
      * it is still the pending request and the ONE original 15 s window (counted from the first try, lookups and sends included) has not
      * closed. A final failure (sign-in, access, security, protocol, size, cancellation, anything unrecognised) is shown at once. The retries
      * already spent travel with the request so the Phone continues the same allowance and the whole refresh makes at most two. A request
-     * the Phone received is never sent again here: the Phone owns its dashboard retries and coalesces a repeated id.
+     * the Phone received is never sent again here: the Phone owns its dashboard retries and coalesces a repeated id. A sent request waits
+     * for its answer until the window closes; when the Phone app accepted it inside that window ([onReaderAccepted]) the wait runs to the
+     * bounded accepted window instead, and a stalled accepted read still ends as timed out. The local waits for the lookup and the send
+     * themselves end with the first window ([readerCall]): a lookup still unresolved then is a read not sent; a send still unresolved has
+     * an unknown delivery and is never sent again.
      */
     private fun dispatch(request: ReaderRequest) {
         scope.launch {
             val startedAt = SystemClock.elapsedRealtime()
             val elapsedMs = { SystemClock.elapsedRealtime() - startedAt }
+            val window = ReaderWindow(request, startedAt)
+            currentCoroutineContext()[Job]?.invokeOnCompletion { readerWindows.remove(request.reqId, window) }
             var retries = 0
             while (true) {
-                val lookup = dataLayerCall { lookUpPhone() }
+                val lookup = readerCall(WatchReaderLimits.REQUEST_TIMEOUT_MS - elapsedMs()) { lookUpPhone() }
+                if (lookup == null) {
+                    // No Phone was found inside the first window: nothing was sent.
+                    updateReader { it.onSendFailed(request.reqId) }
+                    return@launch
+                }
                 val node = lookup.getOrNull()
                 var failure = "no_phone"
                 if (node == null) {
@@ -1069,14 +1151,26 @@ class WatchApp : Application() {
                         updateReader { it.requestSessions(request.reqId) }
                     }
                     readerTargets[request.reqId] = node
+                    readerWindows[request.reqId] = window
                     val wire = request.copy(retriesUsed = retries).encode()
-                    val sent = dataLayerCall {
+                    val sent = readerCall(WatchReaderLimits.REQUEST_TIMEOUT_MS - elapsedMs()) {
                         Wearable.getMessageClient(this@WatchApp).sendMessage(node, WatchLinkPaths.READER_REQUEST, wire).await()
                     }
-                    Log.i(TAG, "reader request ${request.kind.wire} req=${request.reqId.take(12)} offset=${request.offset} sent=${sent.isSuccess}")
-                    if (sent.isSuccess) {
-                        delay((WatchReaderLimits.REQUEST_TIMEOUT_MS - elapsedMs()).coerceAtLeast(0L))
-                        if (readerTargets.remove(request.reqId) != null) updateReader { it.onTimeout(request.reqId) }
+                    Log.i(TAG, "reader request ${request.kind.wire} req=${request.reqId.take(12)} offset=${request.offset} sent=${sent?.isSuccess ?: "unknown"}")
+                    // A send whose local wait ended unresolved has an unknown delivery, and one the Phone app already accepted or answered
+                    // needs none: neither is sent again, and the read waits out its own window keeping whatever the Phone sent.
+                    if (sent == null || sent.isSuccess || window.acceptedBy == node) {
+                        while (true) {
+                            val left = window.endsAt(node) - SystemClock.elapsedRealtime()
+                            if (left <= 0) break
+                            delay(left)
+                        }
+                        if (readerTargets.remove(request.reqId) != null) {
+                            // The Phone app accepted (or partly answered) this read: a data read that did not finish is not a missing Phone.
+                            val accepted = window.acceptedBy == node
+                            Log.i(TAG, "reader timeout kind=${request.kind.wire} accepted=$accepted elapsed_ms=${elapsedMs()}")
+                            updateReader { if (accepted) it.onIncomplete(request.reqId) else it.onTimeout(request.reqId) }
+                        }
                         return@launch
                     }
                     readerTargets.remove(request.reqId)
@@ -1144,6 +1238,7 @@ class WatchApp : Application() {
      */
     fun play(request: PlayRequest, nodeId: String) {
         // Reject cancelled authority before touching an unrelated player, focus, speaker or hold.
+        if (live.state.value.active || live.state.value.pending) return refusePlayback(request, nodeId, "Watch Live owns audio")
         if (request.turnId in stoppedTurns) return refusePlayback(request, nodeId, "stopped on the watch")
         // The Phone's headset is the only output: nothing is played here, whoever asked and whatever the reply is.
         if (replica.current.privateAudio) return refusePlayback(request, nodeId, PRIVATE_HEADSET)

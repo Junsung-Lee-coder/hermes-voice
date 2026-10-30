@@ -22,6 +22,16 @@ class WatchFinalIntake(private val app:WatchApp, private val binding:()->Pair<St
     @Volatile private var blocked=false
     private val revoked=java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private var hint:JSONObject?=null
+    // Same-process privacy knowledge, NOT a committed row/post/read/receipt snapshot.
+    // Only identities in the saved hint enter this set (at most its 512 rows).
+    // Pair + epoch fence invalidation/rebinding; failed storage cannot promise process-death survival.
+    private data class QuietPending(val pair:Pair<String,String>,val version:Long,val keys:MutableSet<String> = HashSet())
+    private var quietPending:QuietPending?=null
+    private fun pendingQuiet(pair:Pair<String,String>,version:Long):MutableSet<String> {
+        val state=quietPending?.takeIf { it.pair==pair && it.version==version }
+            ?:QuietPending(pair,version).also { quietPending=it }
+        return state.keys
+    }
     private fun current(pair:Pair<String,String>,version:Long)=!blocked && binding()==pair && epoch.get()==version
     private fun map(root:JSONObject,key:String):JSONObject = root.optJSONObject(key)?:JSONObject().also { root.put(key,it) }
     private fun load(pair:Pair<String,String>):JSONObject {
@@ -34,8 +44,12 @@ class WatchFinalIntake(private val app:WatchApp, private val binding:()->Pair<St
         hint=JSONObject(result.toString());return result
     }
     private fun save(pair:Pair<String,String>,version:Long,root:JSONObject):Boolean {
+        if(!current(pair,version)) return false
+        val pending=pendingQuiet(pair,version)
+        // Overlay only privacy onto this transaction; never publish failed general row mutations.
+        for(k in pending) root.optJSONObject("rows")?.optJSONObject(k)?.put("quiet",true)
         if(!current(pair,version) || root.toString().toByteArray().size>1_048_576 || !app.localStore.commitString(KEY,root.toString()) || !current(pair,version)) return false
-        hint=JSONObject(root.toString());return true
+        hint=JSONObject(root.toString());pending.clear();return true
     }
     fun invalidate() {
         blocked=true;val version=epoch.incrementAndGet();hint=null;revoked.clear()
@@ -70,7 +84,15 @@ class WatchFinalIntake(private val app:WatchApp, private val binding:()->Pair<St
                         continue
                     }
                     if(map(root,"cancelled_rows").has(address)) continue
-                    if(rows.has(key)) continue
+                    if(rows.has(key)) {
+                        // The same authenticated final may return with stricter Phone privacy.
+                        // Keep original body/node and every posted/read/ACK bit; only tighten.
+                        if(row.optBoolean("quiet",true) || row.optBoolean("private_origin")) {
+                            if(hint?.optJSONObject("rows")?.has(key)==true) pendingQuiet(pair,version).add(key)
+                            rows.getJSONObject(key).put("quiet",true)
+                        }
+                        continue
+                    }
                     if(rows.length()>=512) {
                         val spent=rows.keys().asSequence().firstOrNull { rows.getJSONObject(it).let { r -> r.optBoolean("posted")&&r.optBoolean("read")&&r.optBoolean("posted_ack") } }
                         check(spent!=null);rows.remove(spent)
@@ -125,6 +147,10 @@ class WatchFinalIntake(private val app:WatchApp, private val binding:()->Pair<St
         } }
     }
     private suspend fun drain(pair:Pair<String,String>,version:Long,root:JSONObject) {
+        if(!current(pair,version)) return
+        // Foreground/reconnect recovery must recommit observed tightening BEFORE any OS post.
+        // A false/throw may have written something, but is never positive durability authority.
+        if(pendingQuiet(pair,version).isNotEmpty()) check(save(pair,version,root))
         val rows=root.getJSONObject("rows");var denied=false
         for(k in rows.keys()) {
             if(!current(pair,version)) return

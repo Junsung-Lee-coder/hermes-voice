@@ -1,5 +1,6 @@
 package com.rumi.hermesvoice.phone
 
+import androidx.compose.foundation.layout.Column
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -142,9 +143,14 @@ class R5PhoneBackgroundAnswersTest : PhoneRoboBase() {
         app.onActivityStarted()
         val settingsBefore = app.settings.watchSettings()
         val state = PhoneUiState(signedIn = true, useHeadset = true, androidSdk = 35, unplayed = listOf(anUnplayed()))
+        // The unplayed reply with its banner as its conversation's chat shows them (parent HOLD I1), beside the Talk bar, which adds none.
         rule.setContent {
             val request = rememberBackgroundRelayRequest(model)
-            MaterialTheme { TalkBar(state, onBackgroundAnswers = request) {} }
+            MaterialTheme { Column {
+                UnplayedRepliesList(state.unplayed) {}
+                BackgroundAnswersStatus(state, tag = "unplayed_background", onlyWhenNeeded = true, onTurnOn = request)
+                TalkBar(state) {}
+            } }
         }
         rule.onNodeWithTag("unplayed_background_status").assertExists()
         rule.onNodeWithTag("unplayed_background_action").performClick()
@@ -158,7 +164,10 @@ class R5PhoneBackgroundAnswersTest : PhoneRoboBase() {
         val model = PhoneViewModel(app)
         val before35 = PhoneUiState(signedIn = true, useHeadset = true, androidSdk = 34, unplayed = listOf(anUnplayed()))
         val shown = androidx.compose.runtime.mutableStateOf(before35)
-        rule.setContent { MaterialTheme { TalkBar(shown.value, onBackgroundAnswers = {}) {} } }
+        rule.setContent { MaterialTheme { Column {
+            UnplayedRepliesList(shown.value.unplayed) {}
+            BackgroundAnswersStatus(shown.value, tag = "unplayed_background", onlyWhenNeeded = true, onTurnOn = {})
+        } } }
         rule.onNodeWithTag("unplayed_0").assertExists()
         rule.onNodeWithTag("unplayed_background_status").assertDoesNotExist()
         rule.onNodeWithTag("unplayed_background_action").assertDoesNotExist()
@@ -175,7 +184,7 @@ class R5PhoneBackgroundAnswersTest : PhoneRoboBase() {
 
     @Test fun aReplyThatCannotPlayHereShowsAnHonestReasonInsteadOfAPlayButton() {
         val state = PhoneUiState(signedIn = true, unplayed = listOf(anUnplayed(playable = false)))
-        rule.setContent { MaterialTheme { TalkBar(state) {} } }
+        rule.setContent { MaterialTheme { UnplayedRepliesList(state.unplayed) {} } }
         rule.onNodeWithTag("unplayed_unavailable_0").assertExists()
         rule.onNodeWithTag("unplayed_play_0").assertDoesNotExist()
     }
@@ -184,7 +193,7 @@ class R5PhoneBackgroundAnswersTest : PhoneRoboBase() {
         val tapped = mutableListOf<UnplayedReply>()
         val reply = anUnplayed(session = "stored-conversation")
         val state = PhoneUiState(signedIn = true, unplayed = listOf(reply))
-        rule.setContent { MaterialTheme { TalkBar(state, onPlayAgain = { tapped += it }) {} } }
+        rule.setContent { MaterialTheme { UnplayedRepliesList(state.unplayed) { tapped += it } } }
         rule.onNodeWithTag("unplayed_play_0").performClick()
         assertEquals(listOf(reply), tapped)
     }

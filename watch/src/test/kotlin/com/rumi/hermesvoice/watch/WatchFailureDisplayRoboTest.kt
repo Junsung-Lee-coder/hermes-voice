@@ -281,7 +281,8 @@ class WatchFailureDisplayRoboTest {
         assertTrue(store.inner.getString(WatchFailureInbox.KEY).orEmpty().contains(id))
     }
 
-    @Test fun F6_aFailureOnTheSessionListIsNotShownYetAndNotAcknowledged() {
+    @Test fun F6_aFailureOnTheSessionListIsShownThereAndAcknowledged() {
+        // Owner's UI contract of 2026-10-27: the list is one of the Watch's two screens; it draws the "not sent" line too.
         val id = "watch-list-0006"
         launch()
         app.selectSession(work)
@@ -290,9 +291,8 @@ class WatchFailureDisplayRoboTest {
         idle(200)
         assertEquals(com.rumi.hermesvoice.core.watchlink.ReaderSurface.SESSIONS, app.reader.value.surface)
         phoneSays(id)
-        assertTrue("the list is on screen, not the status line", holdsFor(1_200) { acks(id).isEmpty() })
-        app.toggleReaderSurface()
-        assertTrue(await { acks(id).isNotEmpty() })
+        assertTrue("shown on the list and acknowledged there", await { acks(id).isNotEmpty() })
+        assertNull(app.owedFailure.value)
     }
 
     @Test fun F7_theStatusTextForTheOwedFailureIsTheExactDetail() {
